@@ -1,0 +1,7 @@
+# REAPER MCP Server Dependencies
+
+# MCP protocol implementation
+mcp>=1.0.0
+
+# Async HTTP client for communicating with REAPER
+httpx>=0.25.0

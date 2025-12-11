@@ -1,0 +1,83 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "twelvetake-reaper-mcp"
+version = "1.0.0"
+description = "MCP server for controlling REAPER DAW - mixing, mastering, MIDI composition, and full music production"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.8"
+authors = [
+    { name = "TwelveTake Studios LLC", email = "contact@twelvetake.com" }
+]
+keywords = [
+    "reaper",
+    "daw",
+    "mcp",
+    "model-context-protocol",
+    "music-production",
+    "mixing",
+    "mastering",
+    "midi",
+    "audio",
+    "claude",
+    "ai"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "Intended Audience :: End Users/Desktop",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Topic :: Multimedia :: Sound/Audio :: Editors",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "httpx>=0.25.0",
+]
+
+[project.urls]
+Homepage = "https://twelvetake.com"
+Repository = "https://github.com/TwelveTake-Studios/reaper-mcp"
+Issues = "https://github.com/TwelveTake-Studios/reaper-mcp/issues"
+Funding = "https://buymeacoffee.com/twelvetake"
+
+[project.scripts]
+twelvetake-reaper-mcp = "reaper_mcp_server:main"
+
+[tool.hatch.build.targets.wheel]
+only-include = [
+    "reaper_mcp_server.py",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "reaper_mcp_server.py",
+    "reaper_mcp_bridge.lua",
+    "reaper_web_server.py",
+    "reaper_web_server.lua",
+    "README.md",
+    "LICENSE",
+    "requirements.txt",
+    "test_connection.py",
+]
+exclude = [
+    ".claude/",
+    ".github/",
+    "docs/",
+    "assets/",
+    "__pycache__/",
+    "*.md",
+    "!README.md",
+]
