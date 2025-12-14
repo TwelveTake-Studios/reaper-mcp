@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "twelvetake-reaper-mcp"
-version = "1.0.0"
+version = "1.1.0"
 description = "MCP server for controlling REAPER DAW - mixing, mastering, MIDI composition, and full music production"
 readme = "README.md"
 license = "MIT"
