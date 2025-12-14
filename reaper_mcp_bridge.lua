@@ -20,7 +20,8 @@ local function encode_json(v)
     elseif type(v) == "number" then
         return tostring(v)
     elseif type(v) == "string" then
-        return string.format('"%s"', v:gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'))
+        -- Escape backslashes first, then other special chars
+        return string.format('"%s"', v:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'))
     elseif type(v) == "table" then
         local parts = {}
         local is_array = #v > 0
@@ -691,6 +692,121 @@ local function GetTimeSignature()
     return {ok = true, numerator = numerator, denominator = denominator, tempo = bpm}
 end
 
+-- Get comprehensive project summary for Claude context
+local function GetProjectSummary()
+    -- Helper to convert linear volume to dB
+    local function linear_to_db(vol)
+        if vol <= 0 then return -150 end
+        return 20 * math.log(vol) / math.log(10)
+    end
+
+    -- Get project name and path
+    local retval, project_path = reaper.EnumProjects(-1, "")
+    local project_name = ""
+    if project_path and project_path ~= "" then
+        project_name = project_path:match("([^/\\]+)%.rpp$") or project_path:match("([^/\\]+)$") or ""
+    end
+
+    -- Get tempo and time signature
+    local bpm, bpi = reaper.GetProjectTimeSignature2(0)
+
+    -- Get project length
+    local project_length = reaper.GetProjectLength(0)
+
+    -- Get track count
+    local track_count = reaper.CountTracks(0)
+
+    -- Get all tracks info
+    local tracks = {}
+    for i = 0, track_count - 1 do
+        local track = reaper.GetTrack(0, i)
+        if track then
+            local retval, name = reaper.GetTrackName(track)
+            local vol = reaper.GetMediaTrackInfo_Value(track, "D_VOL")
+            local pan = reaper.GetMediaTrackInfo_Value(track, "D_PAN")
+            local mute = reaper.GetMediaTrackInfo_Value(track, "B_MUTE") == 1
+            local solo = reaper.GetMediaTrackInfo_Value(track, "I_SOLO") > 0
+
+            -- Get FX info
+            local fx_count = reaper.TrackFX_GetCount(track)
+            local fx_names = {}
+            for j = 0, fx_count - 1 do
+                local retval, fx_name = reaper.TrackFX_GetFXName(track, j, "")
+                if retval then
+                    table.insert(fx_names, fx_name)
+                end
+            end
+
+            table.insert(tracks, {
+                index = i,
+                name = name,
+                volume_db = linear_to_db(vol),
+                pan = pan,
+                mute = mute,
+                solo = solo,
+                fx_count = fx_count,
+                fx_names = fx_names
+            })
+        end
+    end
+
+    -- Get master track info
+    local master = reaper.GetMasterTrack(0)
+    local master_vol = reaper.GetMediaTrackInfo_Value(master, "D_VOL")
+    local master_fx_count = reaper.TrackFX_GetCount(master)
+    local master_fx_names = {}
+    for j = 0, master_fx_count - 1 do
+        local retval, fx_name = reaper.TrackFX_GetFXName(master, j, "")
+        if retval then
+            table.insert(master_fx_names, fx_name)
+        end
+    end
+
+    local master_info = {
+        volume_db = linear_to_db(master_vol),
+        fx_count = master_fx_count,
+        fx_names = master_fx_names
+    }
+
+    -- Get markers and regions
+    local markers = {}
+    local regions = {}
+    local ret, num_markers, num_regions = reaper.CountProjectMarkers(0)
+    for i = 0, num_markers + num_regions - 1 do
+        local retval, isrgn, pos, rgnend, name, markrgnindexnumber = reaper.EnumProjectMarkers(i)
+        if retval then
+            if isrgn then
+                table.insert(regions, {
+                    index = markrgnindexnumber,
+                    start = pos,
+                    ["end"] = rgnend,
+                    name = name
+                })
+            else
+                table.insert(markers, {
+                    index = markrgnindexnumber,
+                    position = pos,
+                    name = name
+                })
+            end
+        end
+    end
+
+    return {
+        ok = true,
+        project_name = project_name,
+        project_path = project_path,
+        tempo = bpm,
+        time_signature = {numerator = bpi, denominator = 4},
+        project_length = project_length,
+        track_count = track_count,
+        tracks = tracks,
+        master = master_info,
+        markers = markers,
+        regions = regions
+    }
+end
+
 -- Export function table for DSL
 DSL_FUNCTIONS = {
     -- Track info
@@ -731,7 +847,10 @@ DSL_FUNCTIONS = {
     Stop = Stop,
     GetTempo = GetTempo,
     SetTempo = SetTempo,
-    GetTimeSignature = GetTimeSignature
+    GetTimeSignature = GetTimeSignature,
+
+    -- Project summary
+    GetProjectSummary = GetProjectSummary
 }
 
 -- Main processing function

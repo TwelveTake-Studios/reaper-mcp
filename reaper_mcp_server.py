@@ -9,10 +9,10 @@ A TwelveTake Studios project - https://twelvetake.com
 
 Author: TwelveTake Studios LLC
 License: MIT
-Version: 1.0.0
+Version: 1.1.0
 """
 
-__version__ = "1.0.0"
+__version__ = "1.1.0"
 __name__ = "twelvetake-reaper-mcp"
 
 import os
@@ -2059,6 +2059,38 @@ async def get_project_length() -> dict:
         Object with project length in seconds.
     """
     return await reaper_call("GetProjectLength", 0)
+
+
+@mcp.tool()
+async def get_project_summary() -> dict:
+    """
+    Get a comprehensive summary of the current REAPER project.
+
+    Returns everything needed to understand the project state and give
+    useful mixing/production advice in a single call.
+
+    Returns:
+        Object with:
+        - project_name: Name of the project file
+        - project_path: Full path to the project
+        - tempo: Project tempo in BPM
+        - time_signature: {numerator, denominator}
+        - project_length: Length in seconds
+        - track_count: Total number of tracks
+        - tracks: List of track info objects, each containing:
+            - index: Track index (0-based)
+            - name: Track name
+            - volume_db: Volume in decibels
+            - pan: Pan position (-1 to 1)
+            - mute: Boolean mute state
+            - solo: Boolean solo state
+            - fx_count: Number of FX plugins
+            - fx_names: List of FX plugin names
+        - master: Master track info {volume_db, fx_count, fx_names}
+        - markers: List of {index, position, name}
+        - regions: List of {index, start, end, name}
+    """
+    return await reaper_call("GetProjectSummary")
 
 
 @mcp.tool()

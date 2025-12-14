@@ -2,37 +2,50 @@
 
 A [TwelveTake Studios](https://twelvetake.com) project.
 
+[![Tools](https://img.shields.io/badge/tools-130-blue)](https://github.com/TwelveTake/reaper-mcp)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow)](https://buymeacoffee.com/twelvetake)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-ff5e5b)](https://ko-fi.com/twelvetake)
 
 A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control REAPER DAW for mixing, mastering, MIDI composition, and full music production workflows.
 
-**Version:** 1.0.0
+Built by a working producer with 7+ albums released. These aren't theoretical tools—they're battle-tested in real sessions.
 
-## Features
+**Version:** 1.1.0
 
-- **129 MCP tools** for complete DAW control
-- **File-based communication** - reliable, no network dependencies
-- **Python and Lua bridge scripts** - choose your preference
-- **Full mixing workflow** - tracks, FX, routing, automation
-- **MIDI composition** - create items, add notes, batch operations
-- **Audio editing** - split, duplicate, fade, position items
-- **Mastering helpers** - one-click mastering chain, parallel compression
+## Why This Server
 
-## Highlights
+### Workflow Automation, Not Just API Wrappers
 
-- **Zero configuration** - File-based communication works out of the box, no network setup or external libraries required
-- **Stock REAPER only** - Bridge script uses built-in Lua, nothing extra to install in REAPER
-- **Production-ready** - Comprehensive tool coverage for real-world mixing and mastering workflows
-- **Full FX control** - Get/set any plugin parameter, manage presets, bypass, reorder
-- **Complete routing** - Sends, receives, sidechain compression with one command
-- **Automation support** - Create and edit envelope points, set automation modes
+Most MCP servers just wrap REAPER's API and call it a day. This one includes **production workflow helpers** that handle multi-step operations in a single call:
+
+| Tool | What it does for you |
+|------|---------------------|
+| `setup_sidechain_compression()` | Creates send, routes to channels 3-4, configures ReaComp's detector input — complete sidechain setup in one call |
+| `add_mastering_chain()` | Adds ReaEQ → ReaComp → ReaEQ → ReaLimit to master track with proper signal flow |
+| `add_parallel_compression()` | Creates a bus track, sets up the send, adds compressor — NY-style compression ready to blend |
+| `create_bus()` | Creates a submix track and routes your specified tracks to it |
+| `get_project_summary()` | Returns track count, all track names/volumes/pans/FX, markers, regions, tempo, time signature — everything your AI needs in one call |
+
+### Zero Configuration
+
+- **File-based communication** works immediately — no network setup, no ports to configure
+- **Stock REAPER Lua only** — the bridge script has no dependencies, nothing extra to install in REAPER
+- Copy the script, run it, connect your AI assistant
+
+### 130 Tools Covering Real Production Needs
+
+- **Full FX control** — add/remove plugins, get/set any parameter by index, manage presets, bypass
+- **Complete routing** — sends, receives, sidechain routing to specific channel pairs
+- **Automation** — create envelopes, add/edit points, set automation modes
+- **MIDI** — create items, add notes individually or in batches, edit velocities
+- **Audio items** — import, split, duplicate, fade, position, mute
+- **Markers & regions** — create, edit, navigate, render by region
 
 ## Requirements
 
 - REAPER (any recent version)
 - Python 3.8+ (for the MCP server)
-- An MCP-compatible AI assistant (Claude Code, etc.)
+- An MCP-compatible AI assistant (Claude, ChatGPT, etc.)
 
 ## Installation
 
@@ -238,10 +251,11 @@ REAPER_COMM_MODE=http python reaper_mcp_server.py
 | `toggle_repeat()` | Toggle loop mode |
 | `get_repeat_state()` | Check if looping |
 
-### Project (14 tools)
+### Project (15 tools)
 
 | Tool | Description |
 |------|-------------|
+| `get_project_summary()` | Get comprehensive project state in one call |
 | `save_project()` | Save current project |
 | `create_project(name)` | Create new project |
 | `open_project(path)` | Open project file |
