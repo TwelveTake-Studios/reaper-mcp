@@ -47,6 +47,10 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
 - Python 3.8+ (for the MCP server)
 - An MCP-compatible AI assistant (Claude, ChatGPT, etc.)
 
+## Hosted deployment
+
+A hosted deployment is available on [Fronteir AI](https://fronteir.ai/mcp/twelvetake-studios-reaper-mcp).
+
 ## Installation
 
 ### 1. Install the Bridge Script in REAPER
