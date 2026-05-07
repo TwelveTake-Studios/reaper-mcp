@@ -343,7 +343,7 @@ async def track_fx_get_list(track_index: int) -> dict:
 
 
 @mcp.tool()
-async def track_fx_add_by_name(track_index: int, fx_name: str) -> dict:
+async def track_fx_add_by_name(track_index: int, fx_name: str, position: int = None) -> dict:
     """
     Add an FX plugin to a track by name.
 
@@ -351,13 +351,21 @@ async def track_fx_add_by_name(track_index: int, fx_name: str) -> dict:
         track_index: Track index (0-based) or -1 for master track.
         fx_name: Name of the FX plugin to add (e.g., "ReaEQ", "ReaComp", "ReaLimit").
                  Use the exact plugin name as it appears in REAPER's FX browser.
+        position: Optional insertion position (0-based) in the FX chain.
+                  If not specified, adds at end of chain.
+                  Use 0 to insert at the beginning.
 
     Returns:
         Info about the added FX including its index.
     """
     # TrackFX_AddByName(track, fxname, recFX, instantiate)
     # -1 for instantiate means add to end of chain
-    return await reaper_call("TrackFX_AddByName", track_index, fx_name, False, -1)
+    # <= -1000 means insert at specific position (-1000 = first, -1001 = second, etc.)
+    if position is not None:
+        instantiate = -1000 - position
+    else:
+        instantiate = -1
+    return await reaper_call("TrackFX_AddByName", track_index, fx_name, False, instantiate)
 
 
 @mcp.tool()
@@ -370,6 +378,27 @@ async def track_fx_delete(track_index: int, fx_index: int) -> dict:
         fx_index: FX index (0-based) in the FX chain.
     """
     return await reaper_call("TrackFX_Delete", track_index, fx_index)
+
+
+@mcp.tool()
+async def track_fx_move(track_index: int, fx_index: int, new_position: int) -> dict:
+    """
+    Move an FX plugin to a new position within the same track's FX chain.
+
+    Args:
+        track_index: Track index (0-based) or -1 for master track.
+        fx_index: Current FX index (0-based) in the FX chain.
+        new_position: Target position (0-based) in the FX chain.
+                      Use 0 to move to the beginning of the chain.
+
+    Returns:
+        Object with success status and the new FX index.
+
+    Example:
+        To move the 3rd FX (index 2) to the first position:
+        track_fx_move(0, 2, 0)
+    """
+    return await reaper_call("TrackFX_CopyToTrack", track_index, fx_index, track_index, new_position, True)
 
 
 @mcp.tool()

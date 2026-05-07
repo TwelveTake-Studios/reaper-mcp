@@ -226,6 +226,16 @@ def handle_function_call(func_name, args):
         RPR_TrackFX_Delete(track, args[1])
         return {"ok": True}
 
+    elif func_name == "TrackFX_CopyToTrack":
+        src_track = get_track(args[0])
+        if not src_track:
+            return {"ok": False, "error": "Source track not found"}
+        dest_track = get_track(args[2])
+        if not dest_track:
+            return {"ok": False, "error": "Destination track not found"}
+        RPR_TrackFX_CopyToTrack(src_track, args[1], dest_track, args[3], args[4])
+        return {"ok": True}
+
     elif func_name == "TrackFX_GetFXName":
         track = get_track(args[0])
         if not track:
