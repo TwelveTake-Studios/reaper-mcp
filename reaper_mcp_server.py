@@ -9,10 +9,10 @@ A TwelveTake Studios project - https://twelvetake.com
 
 Author: TwelveTake Studios LLC
 License: MIT
-Version: 1.1.0
+Version: 1.2.0
 """
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 __name__ = "twelvetake-reaper-mcp"
 
 import os
@@ -51,7 +51,16 @@ FILE_POLL_INTERVAL = 0.02
 COMM_MODE = os.getenv("REAPER_COMM_MODE", "file").lower()
 
 # Create MCP server
-mcp = FastMCP("twelvetake-reaper-mcp")
+mcp = FastMCP(
+    "twelvetake-reaper-mcp",
+    instructions="""TwelveTake REAPER MCP Server - Controls REAPER DAW for mixing, mastering, and music production.
+
+IMPORTANT: This server uses FILE-BASED communication by default. The REAPER bridge script must be running in REAPER for tools to work. If a tool returns a timeout error, ensure:
+1. REAPER is running
+2. The reaper_mcp_bridge.lua script is loaded and running in REAPER
+
+Use get_project_summary() first to get complete project context in one call."""
+)
 
 # Request counter for file-based fallback
 request_counter = 0
@@ -1612,6 +1621,107 @@ async def arm_track_envelope(track_index: int, envelope_name: str, arm: bool = T
         Object with success status.
     """
     return await reaper_call("SetEnvelopeArm", track_index, envelope_name, arm)
+
+
+# --- FX PARAMETER AUTOMATION ---
+
+@mcp.tool()
+async def get_fx_envelope(track_index: int, fx_index: int, param_index: int) -> dict:
+    """
+    Get or create an automation envelope for an FX parameter.
+
+    This enables automation of any FX parameter (e.g., a flanger knob in Guitar Rig).
+    The envelope is created if it doesn't exist.
+
+    Args:
+        track_index: Track index (0-based) or -1 for master track.
+        fx_index: FX index (0-based) in the FX chain.
+        param_index: Parameter index (0-based). Use track_fx_get_num_params() to find available parameters.
+
+    Returns:
+        Object with envelope_name, param_name, point_count, and indices.
+    """
+    return await reaper_call("GetFXEnvelope", track_index, fx_index, param_index)
+
+
+@mcp.tool()
+async def add_fx_envelope_point(
+    track_index: int,
+    fx_index: int,
+    param_index: int,
+    time: float,
+    value: float,
+    shape: int = 0
+) -> dict:
+    """
+    Add an automation point to an FX parameter envelope.
+
+    Args:
+        track_index: Track index (0-based) or -1 for master track.
+        fx_index: FX index (0-based) in the FX chain.
+        param_index: Parameter index (0-based).
+        time: Time position in seconds.
+        value: Parameter value (typically 0.0-1.0, normalized).
+        shape: Point shape (0=linear, 1=square, 2=slow start/end, 3=fast start, 4=fast end, 5=bezier).
+
+    Returns:
+        Object with point_index and confirmation.
+    """
+    return await reaper_call("AddFXEnvelopePoint", track_index, fx_index, param_index, time, value, shape)
+
+
+@mcp.tool()
+async def get_fx_envelope_points(track_index: int, fx_index: int, param_index: int) -> dict:
+    """
+    Get all automation points from an FX parameter envelope.
+
+    Args:
+        track_index: Track index (0-based) or -1 for master track.
+        fx_index: FX index (0-based) in the FX chain.
+        param_index: Parameter index (0-based).
+
+    Returns:
+        Object with list of points (time, value, shape, tension, selected).
+    """
+    return await reaper_call("GetFXEnvelopePoints", track_index, fx_index, param_index)
+
+
+@mcp.tool()
+async def delete_fx_envelope_point(
+    track_index: int,
+    fx_index: int,
+    param_index: int,
+    point_index: int
+) -> dict:
+    """
+    Delete an automation point from an FX parameter envelope.
+
+    Args:
+        track_index: Track index (0-based) or -1 for master track.
+        fx_index: FX index (0-based) in the FX chain.
+        param_index: Parameter index (0-based).
+        point_index: Point index (0-based) to delete.
+
+    Returns:
+        Object with success status.
+    """
+    return await reaper_call("DeleteFXEnvelopePoint", track_index, fx_index, param_index, point_index)
+
+
+@mcp.tool()
+async def clear_fx_envelope(track_index: int, fx_index: int, param_index: int) -> dict:
+    """
+    Clear all automation points from an FX parameter envelope.
+
+    Args:
+        track_index: Track index (0-based) or -1 for master track.
+        fx_index: FX index (0-based) in the FX chain.
+        param_index: Parameter index (0-based).
+
+    Returns:
+        Object with deleted_count.
+    """
+    return await reaper_call("ClearFXEnvelope", track_index, fx_index, param_index)
 
 
 # --- SELECTION AND EDITING ---

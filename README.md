@@ -2,7 +2,7 @@
 
 A [TwelveTake Studios](https://twelvetake.com) project.
 
-[![Tools](https://img.shields.io/badge/tools-130-blue)](https://github.com/TwelveTake/reaper-mcp)
+[![Tools](https://img.shields.io/badge/tools-135-blue)](https://github.com/TwelveTake/reaper-mcp)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow)](https://buymeacoffee.com/twelvetake)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-ff5e5b)](https://ko-fi.com/twelvetake)
 
@@ -10,7 +10,7 @@ A comprehensive Model Context Protocol (MCP) server that enables AI assistants t
 
 Built by a working producer with 7+ albums released. These aren't theoretical tools—they're battle-tested in real sessions.
 
-**Version:** 1.1.0
+**Version:** 1.2.0
 
 ## Why This Server
 
@@ -32,9 +32,10 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
 - **Stock REAPER Lua only** — the bridge script has no dependencies, nothing extra to install in REAPER
 - Copy the script, run it, connect your AI assistant
 
-### 130 Tools Covering Real Production Needs
+### 135 Tools Covering Real Production Needs
 
 - **Full FX control** — add/remove plugins, get/set any parameter by index, manage presets, bypass
+- **FX parameter automation** — automate any plugin knob (flanger depth, filter cutoff, etc.)
 - **Complete routing** — sends, receives, sidechain routing to specific channel pairs
 - **Automation** — create envelopes, add/edit points, set automation modes
 - **MIDI** — create items, add notes individually or in batches, edit velocities
@@ -45,7 +46,7 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
 
 - REAPER (any recent version)
 - Python 3.8+ (for the MCP server)
-- An MCP-compatible AI assistant (Claude, ChatGPT, etc.)
+- An MCP-compatible AI assistant
 
 ## Installation
 
@@ -75,7 +76,7 @@ pip install mcp httpx
 
 ### 3. Configure Your AI Assistant
 
-Add to your MCP configuration (e.g., `~/.claude.json` or `.mcp.json`):
+Add to your MCP client's configuration (e.g., `.mcp.json`):
 
 ```json
 {
@@ -331,6 +332,16 @@ REAPER_COMM_MODE=http python reaper_mcp_server.py
 | `clear_envelope(track, name)` | Clear all points |
 | `set_track_automation_mode(track, mode)` | Set automation mode |
 | `arm_track_envelope(track, name, arm)` | Arm envelope for recording |
+
+### FX Parameter Automation (5 tools)
+
+| Tool | Description |
+|------|-------------|
+| `get_fx_envelope(track, fx, param)` | Get/create envelope for any FX parameter |
+| `add_fx_envelope_point(track, fx, param, time, value, shape)` | Add automation point to FX parameter |
+| `get_fx_envelope_points(track, fx, param)` | Get all points from FX envelope |
+| `delete_fx_envelope_point(track, fx, param, point)` | Delete point from FX envelope |
+| `clear_fx_envelope(track, fx, param)` | Clear all points from FX envelope |
 
 ### Selection & Editing (11 tools)
 

@@ -36,3 +36,7 @@ ENV/
 # OS
 .DS_Store
 Thumbs.db
+
+# Claude Code / AI tooling (dev-only, never published)
+.claude/
+nul

@@ -692,6 +692,162 @@ local function GetTimeSignature()
     return {ok = true, numerator = numerator, denominator = denominator, tempo = bpm}
 end
 
+-- Get or create an FX parameter envelope
+local function GetFXEnvelope(track_index, fx_index, param_index)
+    local track
+    if track_index == -1 then
+        track = reaper.GetMasterTrack(0)
+    else
+        track = reaper.GetTrack(0, track_index)
+    end
+
+    if not track then
+        return {ok = false, error = "Track not found"}
+    end
+
+    -- GetFXEnvelope creates the envelope if it doesn't exist
+    local envelope = reaper.GetFXEnvelope(track, fx_index, param_index, true)
+    if not envelope then
+        return {ok = false, error = "Could not get/create FX envelope"}
+    end
+
+    -- Get envelope info
+    local retval, env_name = reaper.GetEnvelopeName(envelope)
+    local point_count = reaper.CountEnvelopePoints(envelope)
+
+    -- Get the parameter name for context
+    local param_retval, param_name = reaper.TrackFX_GetParamName(track, fx_index, param_index, "")
+
+    return {
+        ok = true,
+        envelope_name = env_name,
+        param_name = param_name,
+        point_count = point_count,
+        track_index = track_index,
+        fx_index = fx_index,
+        param_index = param_index
+    }
+end
+
+-- Add a point to an FX parameter envelope
+local function AddFXEnvelopePoint(track_index, fx_index, param_index, time, value, shape)
+    local track
+    if track_index == -1 then
+        track = reaper.GetMasterTrack(0)
+    else
+        track = reaper.GetTrack(0, track_index)
+    end
+
+    if not track then
+        return {ok = false, error = "Track not found"}
+    end
+
+    -- Get or create the envelope
+    local envelope = reaper.GetFXEnvelope(track, fx_index, param_index, true)
+    if not envelope then
+        return {ok = false, error = "Could not get/create FX envelope"}
+    end
+
+    -- Add the point (shape: 0=linear, 1=square, 2=slow start/end, 3=fast start, 4=fast end, 5=bezier)
+    local point_index = reaper.InsertEnvelopePoint(envelope, time, value, shape or 0, 0, false, true)
+    reaper.Envelope_SortPoints(envelope)
+
+    return {
+        ok = true,
+        point_index = point_index,
+        time = time,
+        value = value,
+        shape = shape or 0
+    }
+end
+
+-- Get all points from an FX parameter envelope
+local function GetFXEnvelopePoints(track_index, fx_index, param_index)
+    local track
+    if track_index == -1 then
+        track = reaper.GetMasterTrack(0)
+    else
+        track = reaper.GetTrack(0, track_index)
+    end
+
+    if not track then
+        return {ok = false, error = "Track not found"}
+    end
+
+    local envelope = reaper.GetFXEnvelope(track, fx_index, param_index, false)
+    if not envelope then
+        return {ok = false, error = "FX envelope not found (not created yet)"}
+    end
+
+    local points = {}
+    local count = reaper.CountEnvelopePoints(envelope)
+
+    for i = 0, count - 1 do
+        local retval, time, value, shape, tension, selected = reaper.GetEnvelopePoint(envelope, i)
+        if retval then
+            table.insert(points, {
+                index = i,
+                time = time,
+                value = value,
+                shape = shape,
+                tension = tension,
+                selected = selected
+            })
+        end
+    end
+
+    return {ok = true, points = points, count = count}
+end
+
+-- Delete a point from an FX parameter envelope
+local function DeleteFXEnvelopePoint(track_index, fx_index, param_index, point_index)
+    local track
+    if track_index == -1 then
+        track = reaper.GetMasterTrack(0)
+    else
+        track = reaper.GetTrack(0, track_index)
+    end
+
+    if not track then
+        return {ok = false, error = "Track not found"}
+    end
+
+    local envelope = reaper.GetFXEnvelope(track, fx_index, param_index, false)
+    if not envelope then
+        return {ok = false, error = "FX envelope not found"}
+    end
+
+    local retval = reaper.DeleteEnvelopePointEx(envelope, -1, point_index)
+    return {ok = retval}
+end
+
+-- Clear all points from an FX parameter envelope
+local function ClearFXEnvelope(track_index, fx_index, param_index)
+    local track
+    if track_index == -1 then
+        track = reaper.GetMasterTrack(0)
+    else
+        track = reaper.GetTrack(0, track_index)
+    end
+
+    if not track then
+        return {ok = false, error = "Track not found"}
+    end
+
+    local envelope = reaper.GetFXEnvelope(track, fx_index, param_index, false)
+    if not envelope then
+        return {ok = false, error = "FX envelope not found"}
+    end
+
+    -- Delete all points
+    local count = reaper.CountEnvelopePoints(envelope)
+    for i = count - 1, 0, -1 do
+        reaper.DeleteEnvelopePointEx(envelope, -1, i)
+    end
+
+    return {ok = true, deleted_count = count}
+end
+
 -- Get comprehensive project summary for Claude context
 local function GetProjectSummary()
     -- Helper to convert linear volume to dB
@@ -850,7 +1006,14 @@ DSL_FUNCTIONS = {
     GetTimeSignature = GetTimeSignature,
 
     -- Project summary
-    GetProjectSummary = GetProjectSummary
+    GetProjectSummary = GetProjectSummary,
+
+    -- FX parameter automation
+    GetFXEnvelope = GetFXEnvelope,
+    AddFXEnvelopePoint = AddFXEnvelopePoint,
+    GetFXEnvelopePoints = GetFXEnvelopePoints,
+    DeleteFXEnvelopePoint = DeleteFXEnvelopePoint,
+    ClearFXEnvelope = ClearFXEnvelope
 }
 
 -- Main processing function
