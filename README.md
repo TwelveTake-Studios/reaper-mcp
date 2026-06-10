@@ -10,7 +10,7 @@ A comprehensive Model Context Protocol (MCP) server that enables AI assistants t
 
 Built by a working producer with 7+ albums released. These aren't theoretical tools—they're battle-tested in real sessions.
 
-**Version:** 1.2.0
+**Version:** 1.2.1
 
 ## Why This Server
 
