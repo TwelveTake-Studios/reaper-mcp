@@ -9,10 +9,10 @@ A TwelveTake Studios project - https://twelvetake.com
 
 Author: TwelveTake Studios LLC
 License: MIT
-Version: 1.2.1
+Version: 1.3.0
 """
 
-__version__ = "1.2.1"
+__version__ = "1.3.0"
 __name__ = "twelvetake-reaper-mcp"
 
 import os
@@ -20,7 +20,9 @@ import asyncio
 import json
 import time
 from pathlib import Path
+from typing import Optional
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 try:
     import httpx
@@ -32,6 +34,19 @@ except ImportError:
 def db_to_linear(db: float) -> float:
     """Convert decibels to linear amplitude."""
     return 10 ** (db / 20) if db > -150 else 0
+
+
+def _validate_indices(**named) -> Optional[dict]:
+    """Return a bridge-style error dict if any named index is negative, else None.
+
+    Convention (from v1.3.0): tools validate their index arguments before reaching the
+    bridge, turning bad calls into a clean ``{"ok": False, "error": ...}`` instead of an
+    opaque bridge failure.
+    """
+    for name, value in named.items():
+        if value < 0:
+            return {"ok": False, "error": f"{name} must be >= 0 (got {value})"}
+    return None
 
 
 # Configuration
@@ -475,6 +490,383 @@ async def track_fx_set_param(track_index: int, fx_index: int, param_index: int, 
         value: New value for the parameter (typically normalized 0-1, check min/max).
     """
     return await reaper_call("TrackFX_SetParam", track_index, fx_index, param_index, value)
+
+
+# --- TAKE FX OPERATIONS ---
+# Per-take (item) FX, mirroring the track_fx_* tools using REAPER's TakeFX_* API.
+# Every take is addressed by (track_index, item_index, take_index); the bridge resolves the
+# take pointer via resolve_take(). Added in v1.3.0.
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def take_fx_get_count(track_index: int, item_index: int, take_index: int) -> dict:
+    """
+    Get the number of FX plugins on a take.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+        take_index: Take index within the item (0-based).
+
+    Returns:
+        Object with 'ret' field containing the FX count.
+    """
+    err = _validate_indices(track_index=track_index, item_index=item_index, take_index=take_index)
+    if err:
+        return err
+    return await reaper_call("TakeFX_GetCount", track_index, item_index, take_index)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def take_fx_get_list(track_index: int, item_index: int, take_index: int) -> dict:
+    """
+    Get a list of all FX plugins on a take.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+        take_index: Take index within the item (0-based).
+
+    Returns:
+        Object with 'fx' array, each entry having index, name, and enabled state.
+    """
+    err = _validate_indices(track_index=track_index, item_index=item_index, take_index=take_index)
+    if err:
+        return err
+    return await reaper_call("TakeFX_GetList", track_index, item_index, take_index)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
+async def take_fx_add_by_name(
+    track_index: int, item_index: int, take_index: int, fx_name: str
+) -> dict:
+    """
+    Add an FX plugin to a take by name.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+        take_index: Take index within the item (0-based).
+        fx_name: Name of the FX plugin to add (e.g., "ReaEQ", "ReaComp"). Use the exact
+                 plugin name as it appears in REAPER's FX browser.
+
+    Returns:
+        Object with 'ret' field containing the new FX index (or -1 if it could not be added).
+    """
+    err = _validate_indices(track_index=track_index, item_index=item_index, take_index=take_index)
+    if err:
+        return err
+    return await reaper_call("TakeFX_AddByName", track_index, item_index, take_index, fx_name)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
+async def take_fx_delete(
+    track_index: int, item_index: int, take_index: int, fx_index: int
+) -> dict:
+    """
+    Remove an FX plugin from a take.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+        take_index: Take index within the item (0-based).
+        fx_index: FX index (0-based) in the take's FX chain.
+    """
+    err = _validate_indices(
+        track_index=track_index, item_index=item_index, take_index=take_index, fx_index=fx_index
+    )
+    if err:
+        return err
+    return await reaper_call("TakeFX_Delete", track_index, item_index, take_index, fx_index)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def take_fx_get_name(
+    track_index: int, item_index: int, take_index: int, fx_index: int
+) -> dict:
+    """
+    Get the name of an FX plugin on a take.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+        take_index: Take index within the item (0-based).
+        fx_index: FX index (0-based) in the take's FX chain.
+    """
+    err = _validate_indices(
+        track_index=track_index, item_index=item_index, take_index=take_index, fx_index=fx_index
+    )
+    if err:
+        return err
+    return await reaper_call("TakeFX_GetFXName", track_index, item_index, take_index, fx_index)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def take_fx_get_enabled(
+    track_index: int, item_index: int, take_index: int, fx_index: int
+) -> dict:
+    """
+    Get the enabled (not bypassed) state of an FX plugin on a take.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+        take_index: Take index within the item (0-based).
+        fx_index: FX index (0-based) in the take's FX chain.
+
+    Returns:
+        Object with 'ret' field (boolean).
+    """
+    err = _validate_indices(
+        track_index=track_index, item_index=item_index, take_index=take_index, fx_index=fx_index
+    )
+    if err:
+        return err
+    return await reaper_call("TakeFX_GetEnabled", track_index, item_index, take_index, fx_index)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+async def take_fx_set_enabled(
+    track_index: int, item_index: int, take_index: int, fx_index: int, enabled: bool
+) -> dict:
+    """
+    Enable or bypass an FX plugin on a take.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+        take_index: Take index within the item (0-based).
+        fx_index: FX index (0-based) in the take's FX chain.
+        enabled: True to enable, False to bypass.
+    """
+    err = _validate_indices(
+        track_index=track_index, item_index=item_index, take_index=take_index, fx_index=fx_index
+    )
+    if err:
+        return err
+    return await reaper_call(
+        "TakeFX_SetEnabled", track_index, item_index, take_index, fx_index, enabled
+    )
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def take_fx_get_num_params(
+    track_index: int, item_index: int, take_index: int, fx_index: int
+) -> dict:
+    """
+    Get the number of parameters for an FX plugin on a take.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+        take_index: Take index within the item (0-based).
+        fx_index: FX index (0-based) in the take's FX chain.
+    """
+    err = _validate_indices(
+        track_index=track_index, item_index=item_index, take_index=take_index, fx_index=fx_index
+    )
+    if err:
+        return err
+    return await reaper_call("TakeFX_GetNumParams", track_index, item_index, take_index, fx_index)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def take_fx_get_param_name(
+    track_index: int, item_index: int, take_index: int, fx_index: int, param_index: int
+) -> dict:
+    """
+    Get the name of a parameter on a take's FX plugin.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+        take_index: Take index within the item (0-based).
+        fx_index: FX index (0-based) in the take's FX chain.
+        param_index: Parameter index (0-based).
+    """
+    err = _validate_indices(
+        track_index=track_index, item_index=item_index, take_index=take_index,
+        fx_index=fx_index, param_index=param_index,
+    )
+    if err:
+        return err
+    return await reaper_call(
+        "TakeFX_GetParamName", track_index, item_index, take_index, fx_index, param_index
+    )
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def take_fx_get_param(
+    track_index: int, item_index: int, take_index: int, fx_index: int, param_index: int
+) -> dict:
+    """
+    Get a parameter value on a take's FX plugin.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+        take_index: Take index within the item (0-based).
+        fx_index: FX index (0-based) in the take's FX chain.
+        param_index: Parameter index (0-based).
+
+    Returns:
+        Object with 'value', 'min', and 'max' for the parameter.
+    """
+    err = _validate_indices(
+        track_index=track_index, item_index=item_index, take_index=take_index,
+        fx_index=fx_index, param_index=param_index,
+    )
+    if err:
+        return err
+    return await reaper_call(
+        "TakeFX_GetParam", track_index, item_index, take_index, fx_index, param_index
+    )
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+async def take_fx_set_param(
+    track_index: int, item_index: int, take_index: int,
+    fx_index: int, param_index: int, value: float,
+) -> dict:
+    """
+    Set a parameter value on a take's FX plugin.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+        take_index: Take index within the item (0-based).
+        fx_index: FX index (0-based) in the take's FX chain.
+        param_index: Parameter index (0-based).
+        value: New value (typically normalized 0-1; check min/max via take_fx_get_param).
+    """
+    err = _validate_indices(
+        track_index=track_index, item_index=item_index, take_index=take_index,
+        fx_index=fx_index, param_index=param_index,
+    )
+    if err:
+        return err
+    return await reaper_call(
+        "TakeFX_SetParam", track_index, item_index, take_index, fx_index, param_index, value
+    )
+
+
+# --- TAKE MANAGEMENT & COMPING ---
+# Multi-take workflows: list/switch/delete takes, explode/crop, fixed-lane comping.
+# Added in v1.3.0 (Phase B). Action IDs verified against REAPER 7.74.
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_takes(track_index: int, item_index: int) -> dict:
+    """
+    List all takes of a media item.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+
+    Returns:
+        Object with 'takes' array (each entry: index, name, is_active) and 'ret' = take count.
+    """
+    err = _validate_indices(track_index=track_index, item_index=item_index)
+    if err:
+        return err
+    return await reaper_call("GetTakes", track_index, item_index)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_active_take(track_index: int, item_index: int) -> dict:
+    """
+    Get the index of the active take of a media item.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+
+    Returns:
+        Object with 'ret' = active take index (-1 if the item has no active take).
+    """
+    err = _validate_indices(track_index=track_index, item_index=item_index)
+    if err:
+        return err
+    return await reaper_call("GetActiveTakeIndex", track_index, item_index)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+async def set_active_take(track_index: int, item_index: int, take_index: int) -> dict:
+    """
+    Set the active take of a media item (which take plays).
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+        take_index: Take index to activate (0-based).
+    """
+    err = _validate_indices(track_index=track_index, item_index=item_index, take_index=take_index)
+    if err:
+        return err
+    return await reaper_call("SetActiveTakeByIndex", track_index, item_index, take_index)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
+async def explode_takes(track_index: int, item_index: int) -> dict:
+    """
+    Explode all takes of a media item in place (each take becomes its own overlapping item).
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+    """
+    err = _validate_indices(track_index=track_index, item_index=item_index)
+    if err:
+        return err
+    return await reaper_call("ExplodeTakes", track_index, item_index)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
+async def crop_to_active_take(track_index: int, item_index: int) -> dict:
+    """
+    Crop a media item to its active take, discarding all other takes.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+    """
+    err = _validate_indices(track_index=track_index, item_index=item_index)
+    if err:
+        return err
+    return await reaper_call("CropToActiveTake", track_index, item_index)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
+async def delete_take(track_index: int, item_index: int, take_index: int) -> dict:
+    """
+    Delete a specific take from a media item.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Media item index on that track (0-based).
+        take_index: Take index to delete (0-based). The take is activated first, then removed.
+    """
+    err = _validate_indices(track_index=track_index, item_index=item_index, take_index=take_index)
+    if err:
+        return err
+    return await reaper_call("DeleteTakeByIndex", track_index, item_index, take_index)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+async def select_comp_lane(track_index: int, lane_index: int) -> dict:
+    """
+    Make a fixed lane play exclusively on a track (REAPER 7 lane-based comping).
+
+    The track must be in fixed-lane mode (right-click track -> Track lanes). Returns a clear
+    error if it is not, or if the lane index is out of range.
+
+    Args:
+        track_index: Track index (0-based).
+        lane_index: Fixed lane index to play exclusively (0-based).
+    """
+    err = _validate_indices(track_index=track_index, lane_index=lane_index)
+    if err:
+        return err
+    return await reaper_call("SelectCompLane", track_index, lane_index)
 
 
 # --- ROUTING OPERATIONS ---

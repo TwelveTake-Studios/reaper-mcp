@@ -10,7 +10,7 @@ A comprehensive Model Context Protocol (MCP) server that enables AI assistants t
 
 Built by a working producer with 7+ albums released. These aren't theoretical tools—they're battle-tested in real sessions.
 
-**Version:** 1.2.1
+**Version:** 1.3.0
 
 ## Why This Server
 
@@ -32,7 +32,7 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
 - **Stock REAPER Lua only** — the bridge script has no dependencies, nothing extra to install in REAPER
 - Copy the script, run it, connect your AI assistant
 
-### 135 Tools Covering Real Production Needs
+### 153 Tools Covering Real Production Needs
 
 - **Full FX control** — add/remove plugins, get/set any parameter by index, manage presets, bypass
 - **FX parameter automation** — automate any plugin knob (flanger depth, filter cutoff, etc.)
@@ -228,6 +228,39 @@ REAPER_COMM_MODE=http python reaper_mcp_server.py
 | `get_fx_preset(index, fx_index)` | Get current preset |
 | `set_fx_preset(index, fx_index, name)` | Load preset |
 | `save_fx_preset(index, fx_index, name)` | Save current settings as preset |
+
+### Take FX Operations (11 tools)
+
+Per-take (per-item) FX, mirroring the track FX tools. Every take is addressed by
+`(track_index, item_index, take_index)`.
+
+| Tool | Description |
+|------|-------------|
+| `take_fx_get_count(track, item, take)` | Count FX on a take |
+| `take_fx_get_list(track, item, take)` | List all take FX with details |
+| `take_fx_add_by_name(track, item, take, name)` | Add FX plugin to a take |
+| `take_fx_delete(track, item, take, fx)` | Remove FX from a take |
+| `take_fx_get_name(track, item, take, fx)` | Get take FX name |
+| `take_fx_get_enabled(track, item, take, fx)` | Check if enabled |
+| `take_fx_set_enabled(track, item, take, fx, enabled)` | Enable/bypass take FX |
+| `take_fx_get_num_params(track, item, take, fx)` | Count parameters |
+| `take_fx_get_param_name(track, item, take, fx, param)` | Get parameter name |
+| `take_fx_get_param(track, item, take, fx, param)` | Get parameter value |
+| `take_fx_set_param(track, item, take, fx, param, value)` | Set parameter value |
+
+### Take Management & Comping (7 tools)
+
+Multi-take workflows: list/switch/delete takes, explode/crop, REAPER 7 fixed-lane comping.
+
+| Tool | Description |
+|------|-------------|
+| `get_takes(track, item)` | List all takes (name + active flag) |
+| `get_active_take(track, item)` | Get the active take index |
+| `set_active_take(track, item, take)` | Switch which take plays |
+| `explode_takes(track, item)` | Explode takes to overlapping items (in place) |
+| `crop_to_active_take(track, item)` | Keep only the active take |
+| `delete_take(track, item, take)` | Delete a specific take |
+| `select_comp_lane(track, lane)` | Play one fixed lane exclusively (lane comping) |
 
 ### Routing (9 tools)
 

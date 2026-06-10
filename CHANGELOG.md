@@ -5,6 +5,32 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.0] - 2026-06-10
+
+**Takes & Take FX** — 18 new tools (135 → 153), fully backward compatible. The multi-take
+release: per-take FX control and take management/comping. All tools live-verified against
+REAPER 7.74.
+
+### Added — Takes & comping (Phase B, 7 tools)
+- `get_takes`, `get_active_take`, `set_active_take` — list and switch takes by
+  `(track_index, item_index, take_index)`.
+- `explode_takes` (action 40642, in place), `crop_to_active_take` (40131),
+  `delete_take` (40129) — action IDs verified against live REAPER 7.74.
+- `select_comp_lane` — REAPER 7 fixed-lane comping via the `C_LANEPLAYS` track attribute
+  (no mouse-dependent actions); errors clearly if the track is not in fixed-lane mode.
+
+### Added — Take FX (Phase A, 11 tools)
+- Per-take (per-item) FX control mirroring the `track_fx_*` tools, using REAPER's `TakeFX_*`
+  API. Every take is addressed by `(track_index, item_index, take_index)`:
+  `take_fx_get_count`, `take_fx_get_list`, `take_fx_add_by_name`, `take_fx_delete`,
+  `take_fx_get_name`, `take_fx_get_enabled`, `take_fx_set_enabled`, `take_fx_get_num_params`,
+  `take_fx_get_param_name`, `take_fx_get_param`, `take_fx_set_param`.
+- New conventions for new tools (from v1.3.0 onward): tool annotations
+  (read-only / destructive / idempotent hints) and input validation on index arguments.
+
+### Changed
+- `pyproject.toml`: bumped `mcp` floor to `>=1.2.0` (guarantees the `ToolAnnotations` API).
+
 ## [1.2.1] - 2026-06-09
 
 Infrastructure release — no tool contract changes.
@@ -56,6 +82,7 @@ Total tools: **130**.
 - File-based communication bridge (default) plus optional HTTP mode
   (Lua and Python in-REAPER servers).
 
+[1.3.0]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.3.0
 [1.2.1]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.2.1
 [1.2.0]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.2.0
 [1.1.0]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.1.0

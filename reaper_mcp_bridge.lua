@@ -1016,6 +1016,56 @@ DSL_FUNCTIONS = {
     ClearFXEnvelope = ClearFXEnvelope
 }
 
+-- Resolve a take from (track_index, item_index, take_index).
+-- Returns take, nil on success, or nil, errmsg on any out-of-range index.
+-- Used by the Take FX handlers (TakeFX_* needs a MediaItem_Take*, not indices).
+local function resolve_take(track_index, item_index, take_index)
+    local track = reaper.GetTrack(0, track_index)
+    if not track then
+        return nil, "Track not found at index " .. tostring(track_index)
+    end
+    local item = reaper.GetTrackMediaItem(track, item_index)
+    if not item then
+        return nil, "Media item not found at index " .. tostring(item_index)
+            .. " on track " .. tostring(track_index)
+    end
+    local take = reaper.GetTake(item, take_index)
+    if not take then
+        return nil, "Take not found at index " .. tostring(take_index)
+    end
+    return take, nil
+end
+
+-- Run a Main_OnCommand action against exactly one item: save the current item selection,
+-- select only the target, fire the action, then restore whatever saved items still exist
+-- (destructive actions like explode can invalidate item pointers; ValidatePtr2 guards that).
+local function run_item_action(track_index, item_index, cmd_id)
+    local track = reaper.GetTrack(0, track_index)
+    if not track then
+        return false, "Track not found at index " .. tostring(track_index)
+    end
+    local item = reaper.GetTrackMediaItem(track, item_index)
+    if not item then
+        return false, "Media item not found at index " .. tostring(item_index)
+            .. " on track " .. tostring(track_index)
+    end
+    local saved = {}
+    for i = 0, reaper.CountSelectedMediaItems(0) - 1 do
+        saved[#saved + 1] = reaper.GetSelectedMediaItem(0, i)
+    end
+    reaper.SelectAllMediaItems(0, false)
+    reaper.SetMediaItemSelected(item, true)
+    reaper.Main_OnCommand(cmd_id, 0)
+    reaper.SelectAllMediaItems(0, false)
+    for _, it in ipairs(saved) do
+        if reaper.ValidatePtr2(0, it, "MediaItem*") then
+            reaper.SetMediaItemSelected(it, true)
+        end
+    end
+    reaper.UpdateArrange()
+    return true, nil
+end
+
 -- Main processing function
 local function process_request()
     -- Look for any request files with numbered pattern
@@ -3275,7 +3325,359 @@ local function process_request()
                             response.error = "GetTake requires 2 arguments"
                             response.ok = false
                         end
-                    
+
+                    -- ===== Take FX (v1.3.0) =====
+                    -- All take-addressed by (track_index, item_index, take_index) via resolve_take.
+                    elseif fname == "TakeFX_GetCount" then
+                        if #args >= 3 then
+                            local take, err = resolve_take(args[1], args[2], args[3])
+                            if take then
+                                response.ret = reaper.TakeFX_GetCount(take)
+                                response.ok = true
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TakeFX_GetCount requires 3 arguments (track, item, take)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TakeFX_GetList" then
+                        -- List all FX on a take: index, name, enabled
+                        if #args >= 3 then
+                            local take, err = resolve_take(args[1], args[2], args[3])
+                            if take then
+                                local fx = {}
+                                local count = reaper.TakeFX_GetCount(take)
+                                for f = 0, count - 1 do
+                                    local _, fx_name = reaper.TakeFX_GetFXName(take, f, "")
+                                    fx[#fx + 1] = {
+                                        index = f,
+                                        name = fx_name,
+                                        enabled = reaper.TakeFX_GetEnabled(take, f)
+                                    }
+                                end
+                                response.fx = fx
+                                response.ret = count
+                                response.ok = true
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TakeFX_GetList requires 3 arguments (track, item, take)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TakeFX_AddByName" then
+                        -- args: track, item, take, fx_name
+                        if #args >= 4 then
+                            local take, err = resolve_take(args[1], args[2], args[3])
+                            if take then
+                                -- TakeFX_AddByName(take, fxname, instantiate); -1 = add to end
+                                response.ret = reaper.TakeFX_AddByName(take, args[4], -1)
+                                response.ok = true
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TakeFX_AddByName requires 4 arguments (track, item, take, fx_name)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TakeFX_Delete" then
+                        -- args: track, item, take, fx_index
+                        if #args >= 4 then
+                            local take, err = resolve_take(args[1], args[2], args[3])
+                            if take then
+                                response.ret = reaper.TakeFX_Delete(take, args[4])
+                                response.ok = true
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TakeFX_Delete requires 4 arguments (track, item, take, fx_index)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TakeFX_GetFXName" then
+                        -- args: track, item, take, fx_index
+                        if #args >= 4 then
+                            local take, err = resolve_take(args[1], args[2], args[3])
+                            if take then
+                                local _, fx_name = reaper.TakeFX_GetFXName(take, args[4], "")
+                                response.ret = fx_name
+                                response.value = fx_name
+                                response.ok = true
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TakeFX_GetFXName requires 4 arguments (track, item, take, fx_index)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TakeFX_GetEnabled" then
+                        -- args: track, item, take, fx_index
+                        if #args >= 4 then
+                            local take, err = resolve_take(args[1], args[2], args[3])
+                            if take then
+                                response.ret = reaper.TakeFX_GetEnabled(take, args[4])
+                                response.ok = true
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TakeFX_GetEnabled requires 4 arguments (track, item, take, fx_index)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TakeFX_SetEnabled" then
+                        -- args: track, item, take, fx_index, enabled
+                        if #args >= 5 then
+                            local take, err = resolve_take(args[1], args[2], args[3])
+                            if take then
+                                reaper.TakeFX_SetEnabled(take, args[4], args[5])
+                                response.ret = true
+                                response.ok = true
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TakeFX_SetEnabled requires 5 arguments (track, item, take, fx_index, enabled)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TakeFX_GetNumParams" then
+                        -- args: track, item, take, fx_index
+                        if #args >= 4 then
+                            local take, err = resolve_take(args[1], args[2], args[3])
+                            if take then
+                                response.ret = reaper.TakeFX_GetNumParams(take, args[4])
+                                response.ok = true
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TakeFX_GetNumParams requires 4 arguments (track, item, take, fx_index)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TakeFX_GetParamName" then
+                        -- args: track, item, take, fx_index, param_index
+                        if #args >= 5 then
+                            local take, err = resolve_take(args[1], args[2], args[3])
+                            if take then
+                                local _, p_name = reaper.TakeFX_GetParamName(take, args[4], args[5], "")
+                                response.ret = p_name
+                                response.value = p_name
+                                response.ok = true
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TakeFX_GetParamName requires 5 arguments (track, item, take, fx_index, param_index)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TakeFX_GetParam" then
+                        -- args: track, item, take, fx_index, param_index
+                        if #args >= 5 then
+                            local take, err = resolve_take(args[1], args[2], args[3])
+                            if take then
+                                local val, minval, maxval = reaper.TakeFX_GetParam(take, args[4], args[5])
+                                response.value = val
+                                response.min = minval
+                                response.max = maxval
+                                response.ok = true
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TakeFX_GetParam requires 5 arguments (track, item, take, fx_index, param_index)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TakeFX_SetParam" then
+                        -- args: track, item, take, fx_index, param_index, value
+                        if #args >= 6 then
+                            local take, err = resolve_take(args[1], args[2], args[3])
+                            if take then
+                                response.ret = reaper.TakeFX_SetParam(take, args[4], args[5], args[6])
+                                response.ok = true
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TakeFX_SetParam requires 6 arguments (track, item, take, fx_index, param_index, value)"
+                            response.ok = false
+                        end
+
+                    -- ===== Takes & comping (v1.3.0 Phase B) =====
+                    elseif fname == "GetTakes" then
+                        -- args: track, item -> list takes with name + active flag
+                        if #args >= 2 then
+                            local track = reaper.GetTrack(0, args[1])
+                            local item = track and reaper.GetTrackMediaItem(track, args[2])
+                            if item then
+                                local active = reaper.GetActiveTake(item)
+                                local takes = {}
+                                local count = reaper.CountTakes(item)
+                                for t = 0, count - 1 do
+                                    local take = reaper.GetTake(item, t)
+                                    if take then
+                                        -- GetTakeName returns a single string (not retval, name)
+                                        takes[#takes + 1] = {
+                                            index = t,
+                                            name = reaper.GetTakeName(take),
+                                            is_active = (take == active)
+                                        }
+                                    end
+                                end
+                                response.takes = takes
+                                response.ret = count
+                                response.ok = true
+                            else
+                                response.error = track and ("Media item not found at index " .. tostring(args[2]))
+                                    or ("Track not found at index " .. tostring(args[1]))
+                                response.ok = false
+                            end
+                        else
+                            response.error = "GetTakes requires 2 arguments (track, item)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "GetActiveTakeIndex" then
+                        -- args: track, item -> index of the active take (-1 if none)
+                        if #args >= 2 then
+                            local track = reaper.GetTrack(0, args[1])
+                            local item = track and reaper.GetTrackMediaItem(track, args[2])
+                            if item then
+                                local active = reaper.GetActiveTake(item)
+                                local idx = -1
+                                if active then
+                                    for t = 0, reaper.CountTakes(item) - 1 do
+                                        if reaper.GetTake(item, t) == active then
+                                            idx = t
+                                            break
+                                        end
+                                    end
+                                end
+                                response.ret = idx
+                                response.ok = true
+                            else
+                                response.error = track and ("Media item not found at index " .. tostring(args[2]))
+                                    or ("Track not found at index " .. tostring(args[1]))
+                                response.ok = false
+                            end
+                        else
+                            response.error = "GetActiveTakeIndex requires 2 arguments (track, item)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "SetActiveTakeByIndex" then
+                        -- args: track, item, take
+                        if #args >= 3 then
+                            local take, err = resolve_take(args[1], args[2], args[3])
+                            if take then
+                                reaper.SetActiveTake(take)
+                                reaper.UpdateArrange()
+                                response.ret = true
+                                response.ok = true
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "SetActiveTakeByIndex requires 3 arguments (track, item, take)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "ExplodeTakes" then
+                        -- args: track, item -> action 40642 "Take: Explode takes of items in place"
+                        if #args >= 2 then
+                            local ok2, err = run_item_action(args[1], args[2], 40642)
+                            response.ok = ok2
+                            response.ret = ok2
+                            if not ok2 then response.error = err end
+                        else
+                            response.error = "ExplodeTakes requires 2 arguments (track, item)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "CropToActiveTake" then
+                        -- args: track, item -> action 40131 "Take: Crop to active take in items"
+                        if #args >= 2 then
+                            local ok2, err = run_item_action(args[1], args[2], 40131)
+                            response.ok = ok2
+                            response.ret = ok2
+                            if not ok2 then response.error = err end
+                        else
+                            response.error = "CropToActiveTake requires 2 arguments (track, item)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "DeleteTakeByIndex" then
+                        -- args: track, item, take -> activate that take, then action 40129
+                        -- "Take: Delete active take from items"
+                        if #args >= 3 then
+                            local take, err = resolve_take(args[1], args[2], args[3])
+                            if take then
+                                reaper.SetActiveTake(take)
+                                local ok2, err2 = run_item_action(args[1], args[2], 40129)
+                                response.ok = ok2
+                                response.ret = ok2
+                                if not ok2 then response.error = err2 end
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "DeleteTakeByIndex requires 3 arguments (track, item, take)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "SelectCompLane" then
+                        -- args: track, lane -> C_LANEPLAYS:lane = 1 (lane plays exclusively).
+                        -- Requires the track to be in fixed-lane mode (I_FREEMODE == 2).
+                        if #args >= 2 then
+                            local track = reaper.GetTrack(0, args[1])
+                            if track then
+                                local mode = reaper.GetMediaTrackInfo_Value(track, "I_FREEMODE")
+                                local lanes = reaper.GetMediaTrackInfo_Value(track, "I_NUMFIXEDLANES")
+                                if mode ~= 2 then
+                                    response.error = "Track " .. tostring(args[1])
+                                        .. " is not in fixed-lane mode (enable track lanes first)"
+                                    response.ok = false
+                                elseif args[2] < 0 or args[2] >= lanes then
+                                    response.error = "Lane " .. tostring(args[2])
+                                        .. " out of range (track has " .. tostring(math.floor(lanes)) .. " lanes)"
+                                    response.ok = false
+                                else
+                                    reaper.SetMediaTrackInfo_Value(track, "C_LANEPLAYS:" .. math.floor(args[2]), 1)
+                                    reaper.UpdateArrange()
+                                    response.ret = true
+                                    response.ok = true
+                                end
+                            else
+                                response.error = "Track not found at index " .. tostring(args[1])
+                                response.ok = false
+                            end
+                        else
+                            response.error = "SelectCompLane requires 2 arguments (track, lane)"
+                            response.ok = false
+                        end
+
                     elseif fname == "IsTrackVisible" then
                         -- Check if track is visible in TCP/MCP
                         if #args >= 2 then
