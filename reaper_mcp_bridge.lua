@@ -3678,6 +3678,203 @@ local function process_request()
                             response.ok = false
                         end
 
+                    -- ===== v1.3.1 fixes & additions (ported from PR #1, credit @nuxero) =====
+                    elseif fname == "SetMediaItemInfo_Value" then
+                        -- args: track_index, item_index, param_name, value
+                        if #args >= 4 then
+                            local track
+                            if args[1] == -1 then
+                                track = reaper.GetMasterTrack(0)
+                            else
+                                track = reaper.GetTrack(0, args[1])
+                            end
+                            if not track then
+                                response.error = "Track not found at index " .. tostring(args[1])
+                                response.ok = false
+                            else
+                                local item = reaper.GetTrackMediaItem(track, args[2])
+                                if not item then
+                                    response.error = "Media item not found at index " .. tostring(args[2])
+                                        .. " on track " .. tostring(args[1])
+                                    response.ok = false
+                                else
+                                    reaper.SetMediaItemInfo_Value(item, args[3], args[4])
+                                    reaper.UpdateArrange()
+                                    response.ret = true
+                                    response.ok = true
+                                end
+                            end
+                        else
+                            response.error = "SetMediaItemInfo_Value requires 4 arguments (track, item, param, value)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "GetItemInfo" then
+                        -- args: track_index, item_index
+                        if #args >= 2 then
+                            local track = reaper.GetTrack(0, args[1])
+                            local item = track and reaper.GetTrackMediaItem(track, args[2])
+                            if item then
+                                local take = reaper.GetActiveTake(item)
+                                local is_midi = false
+                                local take_name = ""
+                                if take then
+                                    is_midi = reaper.TakeIsMIDI(take)
+                                    -- GetTakeName returns a single string
+                                    take_name = reaper.GetTakeName(take) or ""
+                                end
+                                response.ok = true
+                                response.info = {
+                                    position = reaper.GetMediaItemInfo_Value(item, "D_POSITION"),
+                                    length = reaper.GetMediaItemInfo_Value(item, "D_LENGTH"),
+                                    volume = reaper.GetMediaItemInfo_Value(item, "D_VOL"),
+                                    mute = reaper.GetMediaItemInfo_Value(item, "B_MUTE") == 1,
+                                    loop_source = reaper.GetMediaItemInfo_Value(item, "B_LOOPSRC") == 1,
+                                    fade_in = reaper.GetMediaItemInfo_Value(item, "D_FADEINLEN"),
+                                    fade_out = reaper.GetMediaItemInfo_Value(item, "D_FADEOUTLEN"),
+                                    is_midi = is_midi,
+                                    take_name = take_name
+                                }
+                            else
+                                response.error = track and ("Media item not found at index " .. tostring(args[2]))
+                                    or ("Track not found at index " .. tostring(args[1]))
+                                response.ok = false
+                            end
+                        else
+                            response.error = "GetItemInfo requires 2 arguments (track, item)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "GetMIDINotes" then
+                        -- args: track_index, item_index -> notes from the active MIDI take
+                        if #args >= 2 then
+                            local track = reaper.GetTrack(0, args[1])
+                            local item = track and reaper.GetTrackMediaItem(track, args[2])
+                            if not item then
+                                response.error = track and ("Media item not found at index " .. tostring(args[2]))
+                                    or ("Track not found at index " .. tostring(args[1]))
+                                response.ok = false
+                            else
+                                local take = reaper.GetActiveTake(item)
+                                if not take or not reaper.TakeIsMIDI(take) then
+                                    response.error = "Active take is not MIDI"
+                                    response.ok = false
+                                else
+                                    local _, note_count = reaper.MIDI_CountEvts(take)
+                                    local notes = {}
+                                    for n = 0, note_count - 1 do
+                                        local ok2, selected, muted, startppq, endppq, chan, pitch, vel =
+                                            reaper.MIDI_GetNote(take, n)
+                                        if ok2 then
+                                            notes[#notes + 1] = {
+                                                index = n,
+                                                pitch = pitch,
+                                                velocity = vel,
+                                                channel = chan,
+                                                selected = selected,
+                                                muted = muted,
+                                                start_time = reaper.MIDI_GetProjTimeFromPPQPos(take, startppq),
+                                                end_time = reaper.MIDI_GetProjTimeFromPPQPos(take, endppq)
+                                            }
+                                        end
+                                    end
+                                    response.notes = notes
+                                    response.ret = note_count
+                                    response.ok = true
+                                end
+                            end
+                        else
+                            response.error = "GetMIDINotes requires 2 arguments (track, item)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "Track_GetPeakInfo" then
+                        -- args: track_index, channel -> current peak in dB
+                        if #args >= 2 then
+                            local track
+                            if args[1] == -1 then
+                                track = reaper.GetMasterTrack(0)
+                            else
+                                track = reaper.GetTrack(0, args[1])
+                            end
+                            if track then
+                                local peak = reaper.Track_GetPeakInfo(track, args[2])
+                                local peak_db = -150
+                                if peak > 0 then
+                                    peak_db = 20 * math.log(peak, 10)
+                                end
+                                response.ret = peak_db
+                                response.ok = true
+                            else
+                                response.error = "Track not found at index " .. tostring(args[1])
+                                response.ok = false
+                            end
+                        else
+                            response.error = "Track_GetPeakInfo requires 2 arguments (track, channel)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "Track_GetPeakHoldDB" then
+                        -- args: track_index, channel -> held peak (dB) since last meter reset
+                        if #args >= 2 then
+                            local track
+                            if args[1] == -1 then
+                                track = reaper.GetMasterTrack(0)
+                            else
+                                track = reaper.GetTrack(0, args[1])
+                            end
+                            if track then
+                                -- API returns dB/100 (0.01 == 1 dB)
+                                response.ret = reaper.Track_GetPeakHoldDB(track, args[2], false) * 100
+                                response.ok = true
+                            else
+                                response.error = "Track not found at index " .. tostring(args[1])
+                                response.ok = false
+                            end
+                        else
+                            response.error = "Track_GetPeakHoldDB requires 2 arguments (track, channel)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "ClearAllPeakIndicators" then
+                        -- reset peak hold on master + all tracks (clearOnRead flag)
+                        local master = reaper.GetMasterTrack(0)
+                        if master then
+                            reaper.Track_GetPeakHoldDB(master, 0, true)
+                            reaper.Track_GetPeakHoldDB(master, 1, true)
+                        end
+                        for i = 0, reaper.CountTracks(0) - 1 do
+                            local tr = reaper.GetTrack(0, i)
+                            if tr then
+                                reaper.Track_GetPeakHoldDB(tr, 0, true)
+                                reaper.Track_GetPeakHoldDB(tr, 1, true)
+                            end
+                        end
+                        response.ret = true
+                        response.ok = true
+
+                    elseif fname == "TrackFX_CopyToTrack" then
+                        -- args: src_track, fx_index, dst_track, dst_position, is_move
+                        if #args >= 5 then
+                            local function trk(idx)
+                                if idx == -1 then return reaper.GetMasterTrack(0) end
+                                return reaper.GetTrack(0, idx)
+                            end
+                            local src, dst = trk(args[1]), trk(args[3])
+                            if src and dst then
+                                reaper.TrackFX_CopyToTrack(src, args[2], dst, args[4], args[5] and true or false)
+                                response.ret = true
+                                response.ok = true
+                            else
+                                response.error = "Track not found (src " .. tostring(args[1])
+                                    .. ", dst " .. tostring(args[3]) .. ")"
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TrackFX_CopyToTrack requires 5 arguments (src_track, fx, dst_track, position, move)"
+                            response.ok = false
+                        end
+
                     elseif fname == "IsTrackVisible" then
                         -- Check if track is visible in TCP/MCP
                         if #args >= 2 then

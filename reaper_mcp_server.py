@@ -9,11 +9,10 @@ A TwelveTake Studios project - https://twelvetake.com
 
 Author: TwelveTake Studios LLC
 License: MIT
-Version: 1.3.0
+Version: 1.3.1
 """
 
-__version__ = "1.3.0"
-__name__ = "twelvetake-reaper-mcp"
+__version__ = "1.3.1"
 
 import os
 import asyncio
@@ -368,7 +367,7 @@ async def track_fx_get_list(track_index: int) -> dict:
 
 
 @mcp.tool()
-async def track_fx_add_by_name(track_index: int, fx_name: str) -> dict:
+async def track_fx_add_by_name(track_index: int, fx_name: str, position: int = -1) -> dict:
     """
     Add an FX plugin to a track by name.
 
@@ -376,13 +375,35 @@ async def track_fx_add_by_name(track_index: int, fx_name: str) -> dict:
         track_index: Track index (0-based) or -1 for master track.
         fx_name: Name of the FX plugin to add (e.g., "ReaEQ", "ReaComp", "ReaLimit").
                  Use the exact plugin name as it appears in REAPER's FX browser.
+        position: Optional insertion position (0-based) in the FX chain.
+                  Default -1 adds at the end; 0 inserts at the beginning.
 
     Returns:
         Info about the added FX including its index.
     """
     # TrackFX_AddByName(track, fxname, recFX, instantiate)
-    # -1 for instantiate means add to end of chain
-    return await reaper_call("TrackFX_AddByName", track_index, fx_name, False, -1)
+    # instantiate: -1 = end of chain; <= -1000 = insert at (-1000 - position).
+    # Position support from PR #1 (@nuxero).
+    instantiate = -1 if position < 0 else (-1000 - position)
+    return await reaper_call("TrackFX_AddByName", track_index, fx_name, False, instantiate)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+async def track_fx_move(track_index: int, fx_index: int, new_position: int) -> dict:
+    """
+    Move an FX plugin to a new position within the same track's FX chain.
+
+    Args:
+        track_index: Track index (0-based) or -1 for master track.
+        fx_index: Current FX index (0-based) in the FX chain.
+        new_position: Target position (0-based). 0 = beginning of the chain.
+    """
+    err = _validate_indices(fx_index=fx_index, new_position=new_position)
+    if err:
+        return err
+    return await reaper_call(
+        "TrackFX_CopyToTrack", track_index, fx_index, track_index, new_position, True
+    )
 
 
 @mcp.tool()
@@ -1329,9 +1350,11 @@ async def create_midi_item(track_index: int, position: float, length: float) -> 
         length: Length in seconds.
 
     Returns:
-        Object with item info.
+        Object with item info including the new item_index.
     """
-    return await reaper_call("CreateNewMIDIItemInProj", track_index, position, position + length, False)
+    # Bridge DSL handler resolves the track index; the raw CreateNewMIDIItemInProj API
+    # needs a track pointer and cannot be called through the generic path. (PR #1, @nuxero)
+    return await reaper_call("CreateMIDIItem", track_index, position, position + length)
 
 
 @mcp.tool()
@@ -1349,32 +1372,46 @@ async def get_midi_item(track_index: int, item_index: int) -> dict:
     return await reaper_call("GetMIDIItemInfo", track_index, item_index)
 
 
+async def _beats_to_seconds(beats: float) -> float:
+    """Convert beats to seconds at the project's current tempo."""
+    tempo_result = await reaper_call("Master_GetTempo")
+    tempo = tempo_result.get("ret") or 120.0
+    return (beats / tempo) * 60.0
+
+
 @mcp.tool()
 async def add_midi_note(
     track_index: int,
     item_index: int,
     pitch: int,
     velocity: int,
-    start_ppq: float,
-    end_ppq: float,
+    start_beat: float,
+    length_beats: float,
     channel: int = 0
 ) -> dict:
     """
-    Add a MIDI note to an item.
+    Add a MIDI note to an item using musical timing (beats).
 
     Args:
         track_index: Track index (0-based).
         item_index: Item index (0-based) on the track.
         pitch: MIDI note number (0-127, 60 = middle C).
         velocity: Note velocity (1-127).
-        start_ppq: Start position in PPQ (pulses per quarter note).
-        end_ppq: End position in PPQ.
+        start_beat: Start position in beats from the item start (0 = first beat).
+        length_beats: Note length in beats (0.25 = sixteenth, 0.5 = eighth, 1.0 = quarter).
         channel: MIDI channel (0-15, default 0).
 
-    Returns:
-        Object with note index.
+    Example:
+        Four-on-the-floor kick: add_midi_note(0, 0, 36, 110, start_beat=0, length_beats=0.25)
+        then start_beat=1, 2, 3.
     """
-    return await reaper_call("MIDI_InsertNote", track_index, item_index, False, False, start_ppq, end_ppq, channel, pitch, velocity, False)
+    # Beats -> seconds at project tempo; the bridge DSL handler takes time offsets
+    # relative to the item start. (Fix + beats ergonomics from PR #1, @nuxero)
+    start_time = await _beats_to_seconds(start_beat)
+    length = await _beats_to_seconds(length_beats)
+    return await reaper_call(
+        "InsertMIDINote", track_index, item_index, pitch, start_time, length, velocity, channel
+    )
 
 
 @mcp.tool()
@@ -1384,30 +1421,33 @@ async def add_midi_notes_batch(
     notes: list
 ) -> dict:
     """
-    Add multiple MIDI notes to an item in one call.
+    Add multiple MIDI notes to an item in one call, using musical timing (beats).
 
     Args:
         track_index: Track index (0-based).
         item_index: Item index (0-based).
-        notes: List of note dicts with keys: pitch, velocity, start_ppq, end_ppq, channel (optional).
+        notes: List of note dicts with keys: pitch, velocity, start_beat, length_beats,
+               channel (optional).
 
     Returns:
         Object with count of notes added.
     """
+    tempo_result = await reaper_call("Master_GetTempo")
+    tempo = tempo_result.get("ret") or 120.0
+
     results = []
     for note in notes:
+        start_time = (note.get("start_beat", 0) / tempo) * 60.0
+        length = (note.get("length_beats", 1.0) / tempo) * 60.0
         result = await reaper_call(
-            "MIDI_InsertNote",
+            "InsertMIDINote",
             track_index,
             item_index,
-            False,
-            False,
-            note.get("start_ppq", 0),
-            note.get("end_ppq", 480),
-            note.get("channel", 0),
             note.get("pitch", 60),
+            start_time,
+            length,
             note.get("velocity", 100),
-            False
+            note.get("channel", 0)
         )
         results.append(result)
     return {"ok": True, "notes_added": len(results), "results": results}
@@ -2440,6 +2480,67 @@ async def get_track_peak(track_index: int, channel: int = 0) -> dict:
         Object with peak value in dB.
     """
     return await reaper_call("Track_GetPeakInfo", track_index, channel)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_track_peak_hold(track_index: int, channel: int = 0) -> dict:
+    """
+    Get the peak hold level of a track (highest peak since meters were last reset).
+
+    Returns the max peak from a previous playback without needing to be actively
+    playing — play the project, stop, then call this for gain staging.
+
+    Args:
+        track_index: Track index (0-based) or -1 for master.
+        channel: Channel (0=left, 1=right).
+
+    Returns:
+        Object with peak hold value in dB.
+    """
+    return await reaper_call("Track_GetPeakHoldDB", track_index, channel)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+async def clear_all_peak_indicators() -> dict:
+    """
+    Clear the peak hold indicators on all tracks (including master).
+
+    Resets the held peak values that accumulate during playback. Use before a
+    fresh playback pass when you want clean readings for gain staging.
+    """
+    return await reaper_call("ClearAllPeakIndicators")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_track_master_send(track_index: int) -> dict:
+    """
+    Get the master/parent send state of a track.
+
+    Args:
+        track_index: Track index (0-based) or -1 for master.
+
+    Returns:
+        Object with 'ret' field (1 = enabled, 0 = disabled).
+    """
+    return await reaper_call("GetMediaTrackInfo_Value", track_index, "B_MAINSEND")
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+async def set_track_master_send(track_index: int, enabled: bool) -> dict:
+    """
+    Enable or disable the master/parent send on a track.
+
+    When enabled, the track's audio routes to its parent folder track (or the
+    master if it has no parent). Disable it when a track should only output
+    through its sends (e.g., routed exclusively to a bus).
+
+    Args:
+        track_index: Track index (0-based) or -1 for master.
+        enabled: True to enable, False to disable.
+    """
+    return await reaper_call(
+        "SetMediaTrackInfo_Value", track_index, "B_MAINSEND", 1 if enabled else 0
+    )
 
 
 # --- ADVANCED FEATURES ---

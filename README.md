@@ -10,7 +10,7 @@ A comprehensive Model Context Protocol (MCP) server that enables AI assistants t
 
 Built by a working producer with 7+ albums released. These aren't theoretical tools—they're battle-tested in real sessions.
 
-**Version:** 1.3.0
+**Version:** 1.3.1
 
 ## Why This Server
 
@@ -32,7 +32,7 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
 - **Stock REAPER Lua only** — the bridge script has no dependencies, nothing extra to install in REAPER
 - Copy the script, run it, connect your AI assistant
 
-### 153 Tools Covering Real Production Needs
+### 158 Tools Covering Real Production Needs
 
 - **Full FX control** — add/remove plugins, get/set any parameter by index, manage presets, bypass
 - **FX parameter automation** — automate any plugin knob (flanger depth, filter cutoff, etc.)
@@ -185,7 +185,7 @@ REAPER_COMM_MODE=http python reaper_mcp_server.py
 
 ## Tool Reference
 
-### Track Operations (19 tools)
+### Track Operations (23 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -203,19 +203,24 @@ REAPER_COMM_MODE=http python reaper_mcp_server.py
 | `set_track_phase(index, invert)` | Invert phase |
 | `set_track_width(index, width)` | Set stereo width (0-2) |
 | `set_track_color(index, r, g, b)` | Set track color |
-| `get_track_peak(index, channel)` | Get current peak level |
+| `get_track_peak(index, channel)` | Get current peak level (dB) |
+| `get_track_peak_hold(index, channel)` | Get held peak since last reset (dB) |
+| `clear_all_peak_indicators()` | Reset peak hold on all tracks |
+| `get_track_master_send(index)` | Get master/parent send state |
+| `set_track_master_send(index, enabled)` | Enable/disable master send |
 | `set_track_as_folder(index, depth)` | Set as folder parent/child |
 | `arm_track(index, arm)` | Arm for recording |
 | `set_track_input(index, input)` | Set record input |
 | `set_track_monitor(index, mode)` | Set monitor mode |
 
-### FX Operations (15 tools)
+### FX Operations (16 tools)
 
 | Tool | Description |
 |------|-------------|
 | `track_fx_get_count(index)` | Count FX on track |
 | `track_fx_get_list(index)` | List all FX with details |
-| `track_fx_add_by_name(index, name)` | Add FX plugin |
+| `track_fx_add_by_name(index, name, position?)` | Add FX plugin (optionally at position) |
+| `track_fx_move(index, fx_index, new_position)` | Reorder FX in the chain |
 | `track_fx_delete(index, fx_index)` | Remove FX |
 | `track_fx_get_name(index, fx_index)` | Get FX name |
 | `track_fx_get_enabled(index, fx_index)` | Check if enabled |
@@ -317,7 +322,7 @@ Multi-take workflows: list/switch/delete takes, explode/crop, REAPER 7 fixed-lan
 |------|-------------|
 | `create_midi_item(track, pos, length)` | Create empty MIDI item |
 | `get_midi_item(track, item)` | Get MIDI item info |
-| `add_midi_note(track, item, pitch, vel, start, end, chan)` | Add single note |
+| `add_midi_note(track, item, pitch, vel, start_beat, length_beats, chan)` | Add single note (beats) |
 | `add_midi_notes_batch(track, item, notes)` | Add multiple notes |
 | `get_midi_notes(track, item)` | Get all notes |
 | `delete_midi_note(track, item, note)` | Delete a note |

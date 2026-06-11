@@ -5,6 +5,32 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.1] - 2026-06-10
+
+Bug-fix release — **with thanks to Héctor Zelaya ([@nuxero](https://github.com/nuxero)),
+whose [PR #1](https://github.com/TwelveTake-Studios/reaper-mcp/pull/1) diagnosed the broken
+call paths and contributed several of the fixes and tools ported here.** 158 tools total.
+
+### Fixed
+- `create_midi_item`, `add_midi_note`, `add_midi_notes_batch`, `get_midi_notes`,
+  `get_item_info`, all six `set_item_*` tools, and `get_track_peak` were silently broken:
+  they called raw REAPER API names that fell through to the bridge's generic fallback,
+  which cannot resolve track/item/take pointers from indices. All now route through
+  explicit bridge handlers. *(Diagnosis and several fixes from @nuxero's PR #1.)*
+- `add_midi_note` / `add_midi_notes_batch` now use **musical timing in beats**
+  (`start_beat`, `length_beats`) instead of the former PPQ arguments — clearer for AI use
+  and matching the bridge's actual time-based semantics. (Signature change is treated as a
+  fix: the previous tools never worked.)
+- Removed the module-level `__name__` override that prevented
+  `python reaper_mcp_server.py` from starting (the `if __name__ == "__main__"` guard could
+  never fire; only the pip console script worked).
+
+### Added *(from PR #1, @nuxero)*
+- `track_fx_add_by_name` optional `position` argument (insert anywhere in the chain).
+- `track_fx_move` — reorder FX within a track's chain.
+- `get_track_peak_hold` / `clear_all_peak_indicators` — peak-hold metering for gain staging.
+- `get_track_master_send` / `set_track_master_send` — control the master/parent send.
+
 ## [1.3.0] - 2026-06-10
 
 **Takes & Take FX** — 18 new tools (135 → 153), fully backward compatible. The multi-take
@@ -82,6 +108,7 @@ Total tools: **130**.
 - File-based communication bridge (default) plus optional HTTP mode
   (Lua and Python in-REAPER servers).
 
+[1.3.1]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.3.1
 [1.3.0]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.3.0
 [1.2.1]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.2.1
 [1.2.0]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.2.0

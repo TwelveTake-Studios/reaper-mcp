@@ -175,3 +175,80 @@ def test_takes_negative_index_rejected_before_bridge(reaper):
     assert result["ok"] is False
     assert "lane_index" in result["error"]
     assert reaper.calls == []
+
+
+# --- v1.3.1: fixed call paths (PR #1, @nuxero) ---
+# These pin tools to their explicit bridge handlers. The old raw-API names fell through
+# to the generic bridge fallback, which cannot resolve pointers (the tools never worked).
+
+def test_create_midi_item_uses_dsl_handler(reaper):
+    run(srv.create_midi_item(0, 1.0, 4.0))
+    assert reaper.last == ("CreateMIDIItem", [0, 1.0, 5.0])  # start, end = pos + length
+
+
+def test_add_midi_note_beats_to_seconds(reaper):
+    # Recorder returns ret=0 for Master_GetTempo -> falls back to 120 BPM (1 beat = 0.5s)
+    run(srv.add_midi_note(0, 1, 60, 100, start_beat=2.0, length_beats=1.0))
+    func, args = reaper.last
+    assert func == "InsertMIDINote"
+    assert args[:3] == [0, 1, 60]
+    assert args[3] == pytest.approx(1.0)   # 2 beats @ 120 BPM
+    assert args[4] == pytest.approx(0.5)   # 1 beat @ 120 BPM
+    assert args[5:] == [100, 0]
+
+
+def test_add_midi_notes_batch_beats(reaper):
+    notes = [{"pitch": 36, "velocity": 110, "start_beat": 1.0, "length_beats": 0.5}]
+    result = run(srv.add_midi_notes_batch(0, 0, notes))
+    assert result["notes_added"] == 1
+    func, args = reaper.last
+    assert func == "InsertMIDINote"
+    assert args[3] == pytest.approx(0.5)    # 1 beat @ 120 BPM
+    assert args[4] == pytest.approx(0.25)   # 0.5 beat @ 120 BPM
+
+
+def test_get_midi_notes_handler(reaper):
+    run(srv.get_midi_notes(0, 1))
+    assert reaper.last == ("GetMIDINotes", [0, 1])
+
+
+def test_set_item_tools_use_item_info_handler(reaper):
+    run(srv.set_item_position(0, 1, 2.5))
+    assert reaper.last == ("SetMediaItemInfo_Value", [0, 1, "D_POSITION", 2.5])
+    run(srv.set_item_mute(0, 1, True))
+    assert reaper.last == ("SetMediaItemInfo_Value", [0, 1, "B_MUTE", 1])
+
+
+def test_get_track_peak_handler(reaper):
+    run(srv.get_track_peak(0, 1))
+    assert reaper.last == ("Track_GetPeakInfo", [0, 1])
+
+
+# --- v1.3.1: new tools (PR #1, @nuxero) ---
+
+def test_track_fx_add_by_name_position(reaper):
+    run(srv.track_fx_add_by_name(0, "ReaEQ"))
+    assert reaper.last == ("TrackFX_AddByName", [0, "ReaEQ", False, -1])
+    run(srv.track_fx_add_by_name(0, "ReaEQ", position=0))
+    assert reaper.last == ("TrackFX_AddByName", [0, "ReaEQ", False, -1000])
+    run(srv.track_fx_add_by_name(0, "ReaEQ", position=2))
+    assert reaper.last == ("TrackFX_AddByName", [0, "ReaEQ", False, -1002])
+
+
+def test_track_fx_move(reaper):
+    run(srv.track_fx_move(0, 2, 0))
+    assert reaper.last == ("TrackFX_CopyToTrack", [0, 2, 0, 0, True])
+
+
+def test_peak_hold_and_clear(reaper):
+    run(srv.get_track_peak_hold(3, 1))
+    assert reaper.last == ("Track_GetPeakHoldDB", [3, 1])
+    run(srv.clear_all_peak_indicators())
+    assert reaper.last == ("ClearAllPeakIndicators", [])
+
+
+def test_master_send(reaper):
+    run(srv.get_track_master_send(2))
+    assert reaper.last == ("GetMediaTrackInfo_Value", [2, "B_MAINSEND"])
+    run(srv.set_track_master_send(2, False))
+    assert reaper.last == ("SetMediaTrackInfo_Value", [2, "B_MAINSEND", 0])
