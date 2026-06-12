@@ -32,7 +32,7 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
 - **Stock REAPER Lua only** — the bridge script has no dependencies, nothing extra to install in REAPER
 - Copy the script, run it, connect your AI assistant
 
-### 158 Tools Covering Real Production Needs
+### 163 Tools Covering Real Production Needs
 
 - **Full FX control** — add/remove plugins, get/set any parameter by index, manage presets, bypass
 - **FX parameter automation** — automate any plugin knob (flanger depth, filter cutoff, etc.)
@@ -233,6 +233,19 @@ REAPER_COMM_MODE=http python reaper_mcp_server.py
 | `get_fx_preset(index, fx_index)` | Get current preset |
 | `set_fx_preset(index, fx_index, name)` | Load preset |
 | `save_fx_preset(index, fx_index, name)` | Save current settings as preset |
+
+### ReaEQ Operations (5 tools)
+
+Dedicated tools for ReaEQ parameter control. These use REAPER's EQ-specific API which
+handles non-linear parameter curves (dB gain, log frequency, log Q) correctly.
+
+| Tool | Description |
+|------|-------------|
+| `get_eq_bands(track, fx)` | Get all ReaEQ band settings with human-readable values |
+| `set_eq_band(track, fx, bandtype, bandidx, paramtype, value)` | Set EQ band parameter (Hz, dB, or Q) with proper normalization |
+| `get_eq_band_enabled(track, fx, bandtype, bandidx)` | Check if an EQ band is enabled |
+| `set_eq_band_enabled(track, fx, bandtype, bandidx, enabled)` | Enable/disable an EQ band |
+| `find_eq(track, instantiate?)` | Find ReaEQ on a track (optionally add it) |
 
 ### Take FX Operations (11 tools)
 
