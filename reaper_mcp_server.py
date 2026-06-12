@@ -9,10 +9,10 @@ A TwelveTake Studios project - https://twelvetake.com
 
 Author: TwelveTake Studios LLC
 License: MIT
-Version: 1.3.1
+Version: 1.3.2
 """
 
-__version__ = "1.3.1"
+__version__ = "1.3.2"
 
 import os
 import asyncio
@@ -1772,26 +1772,43 @@ async def open_project(path: str) -> dict:
     return await reaper_call("Main_openProject", path)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
 async def render_project(
     output_path: str,
     start_time: float = None,
     end_time: float = None,
-    tail_seconds: float = 0
+    tail_seconds: float = 0,
+    overwrite: bool = False
 ) -> dict:
     """
-    Render the project to an audio file.
+    Render the project's master mix to an audio file (uses REAPER's last render settings
+    for format details; a .wav extension selects WAV output).
+
+    If the target file already exists, this returns an error unless overwrite=True
+    (which deletes the existing file first). This is explicit because REAPER's own
+    behavior on existing files (prompt vs auto-increment) is a user preference, and the
+    overwrite prompt blocks unattended rendering.
 
     Args:
         output_path: Full path for output file (extension determines format).
         start_time: Start time in seconds (None = project start).
         end_time: End time in seconds (None = project end).
         tail_seconds: Extra seconds to render at end for reverb tails.
+        overwrite: True to replace an existing file at output_path.
 
     Returns:
-        Object with render status.
+        Object with render status and REAPER's computed output target(s).
     """
-    return await reaper_call("RenderProject", output_path, start_time, end_time, tail_seconds)
+    # None -> -1 sentinels: JSON nulls become Lua nils, which corrupt the bridge's
+    # positional argument handling.
+    return await reaper_call(
+        "RenderProject",
+        output_path,
+        -1 if start_time is None else start_time,
+        -1 if end_time is None else end_time,
+        tail_seconds or 0,
+        bool(overwrite),
+    )
 
 
 @mcp.tool()
@@ -1799,14 +1816,20 @@ async def render_region(region_index: int, output_path: str) -> dict:
     """
     Render a specific region to an audio file.
 
+    NOT YET IMPLEMENTED — returns an explanatory error. A full region-render suite
+    (render matrix, stems) is planned for v1.9. Use render_project with explicit
+    start_time/end_time as a workaround.
+
     Args:
         region_index: Region index (0-based).
         output_path: Full path for output file.
-
-    Returns:
-        Object with render status.
     """
-    return await reaper_call("RenderRegion", region_index, output_path)
+    return {
+        "ok": False,
+        "error": "render_region is not yet implemented (planned for the v1.9 render suite). "
+                 "Workaround: get the region bounds via get_regions, then call "
+                 "render_project with start_time/end_time.",
+    }
 
 
 # --- MARKERS AND REGIONS ---

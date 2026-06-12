@@ -56,10 +56,14 @@ local function decode_json(str)
     elseif str == "true" then return true
     elseif str == "false" then return false
     elseif str:match("^%-?%d+%.?%d*$") then return tonumber(str)
-    elseif str:match('^"(.*)"$') then 
-        -- Unescape string
+    elseif str:match('^"(.*)"$') then
+        -- Unescape string in a SINGLE pass so '\\' is consumed atomically.
+        -- (Sequential gsubs corrupted Windows paths: in "Temp\\reaper" the second
+        -- backslash + 'r' matched '\\r' and became a carriage return.)
         local s = str:match('^"(.*)"$')
-        s = s:gsub('\\n', '\n'):gsub('\\r', '\r'):gsub('\\"', '"')
+        local escapes = { n = '\n', r = '\r', t = '\t', b = '\b', f = '\f',
+                          ['"'] = '"', ['\\'] = '\\', ['/'] = '/' }
+        s = s:gsub('\\(.)', function(c) return escapes[c] or c end)
         return s
     elseif str:match("^%[.*%]$") then
         -- Array - improved parsing
@@ -1066,6 +1070,43 @@ local function run_item_action(track_index, item_index, cmd_id)
     return true, nil
 end
 
+-- Resolve a track envelope by name from (track_index, env_name). -1 = master track.
+local function resolve_envelope(track_index, env_name)
+    local track
+    if track_index == -1 then
+        track = reaper.GetMasterTrack(0)
+    else
+        track = reaper.GetTrack(0, track_index)
+    end
+    if not track then
+        return nil, "Track not found at index " .. tostring(track_index)
+    end
+    local env = reaper.GetTrackEnvelopeByName(track, env_name)
+    if not env then
+        return nil, "Envelope '" .. tostring(env_name) .. "' not found on track "
+            .. tostring(track_index) .. " (create/show it in REAPER first)"
+    end
+    return env, nil
+end
+
+-- Resolve the active MIDI take of (track_index, item_index).
+local function resolve_midi_take(track_index, item_index)
+    local track = reaper.GetTrack(0, track_index)
+    if not track then
+        return nil, "Track not found at index " .. tostring(track_index)
+    end
+    local item = reaper.GetTrackMediaItem(track, item_index)
+    if not item then
+        return nil, "Media item not found at index " .. tostring(item_index)
+            .. " on track " .. tostring(track_index)
+    end
+    local take = reaper.GetActiveTake(item)
+    if not take or not reaper.TakeIsMIDI(take) then
+        return nil, "Active take of item " .. tostring(item_index) .. " is not MIDI"
+    end
+    return take, nil
+end
+
 -- Main processing function
 local function process_request()
     -- Look for any request files with numbered pattern
@@ -1431,32 +1472,32 @@ local function process_request()
                         end
 
                     elseif fname == "InsertEnvelopePoint" then
-                        -- Insert envelope point
-                        if #args >= 7 then
-                            local envelope = args[1]
-                            
-                            -- Handle envelope pointer
-                            if type(envelope) == "table" and envelope.__ptr then
-                                response.error = "Cannot use envelope pointer from previous call - envelope objects cannot be reused"
-                                response.ok = false
-                            elseif type(envelope) == "userdata" then
-                                -- It's a valid envelope object
-                                local time = args[2]
-                                local value = args[3]
-                                local shape = args[4]
-                                local tension = args[5]
-                                local selected = args[6]
-                                local noSort = args[7]
-                                
-                                local result = reaper.InsertEnvelopePoint(envelope, time, value, shape, tension, selected, noSort)
-                                response.ok = result
+                        -- Insert envelope point.
+                        -- Primary convention (what the server sends):
+                        --   (track_index, envelope_name, time, value, shape, tension, selected, noSort)
+                        -- Legacy convention kept for compatibility: (envelope_userdata, time, value, ...)
+                        if type(args[1]) == "number" and type(args[2]) == "string" then
+                            local env, err = resolve_envelope(args[1], args[2])
+                            if env then
+                                local result = reaper.InsertEnvelopePoint(
+                                    env, args[3], args[4], args[5] or 0, args[6] or 0,
+                                    args[7] and true or false, false)
+                                reaper.Envelope_SortPoints(env)
+                                reaper.UpdateArrange()
+                                response.ok = result and true or false
                                 response.ret = result
+                                if not result then response.error = "InsertEnvelopePoint failed" end
                             else
-                                response.error = "Invalid envelope parameter"
+                                response.error = err
                                 response.ok = false
                             end
+                        elseif type(args[1]) == "userdata" and #args >= 7 then
+                            local result = reaper.InsertEnvelopePoint(
+                                args[1], args[2], args[3], args[4], args[5], args[6], args[7])
+                            response.ok = result
+                            response.ret = result
                         else
-                            response.error = "InsertEnvelopePoint requires 7 arguments"
+                            response.error = "InsertEnvelopePoint requires (track_index, envelope_name, time, value, shape)"
                             response.ok = false
                         end
                     
@@ -3872,6 +3913,365 @@ local function process_request()
                             end
                         else
                             response.error = "TrackFX_CopyToTrack requires 5 arguments (src_track, fx, dst_track, position, move)"
+                            response.ok = false
+                        end
+
+                    -- ===== v1.3.2: explicit handlers for tools that fell to the generic fallback =====
+                    elseif fname == "MIDI_DeleteNote" then
+                        -- args: track, item, note_index
+                        if #args >= 3 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if take then
+                                local ok2 = reaper.MIDI_DeleteNote(take, args[3])
+                                reaper.MIDI_Sort(take)
+                                response.ret = ok2
+                                response.ok = ok2
+                                if not ok2 then response.error = "Note not found at index " .. tostring(args[3]) end
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "MIDI_DeleteNote requires 3 arguments (track, item, note_index)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "SplitMediaItem" then
+                        -- args: track, item, position (project seconds). Returns right-half item index.
+                        if #args >= 3 then
+                            local track = reaper.GetTrack(0, args[1])
+                            local item = track and reaper.GetTrackMediaItem(track, args[2])
+                            if item then
+                                local right = reaper.SplitMediaItem(item, args[3])
+                                if right then
+                                    local right_index = -1
+                                    for i = 0, reaper.CountTrackMediaItems(track) - 1 do
+                                        if reaper.GetTrackMediaItem(track, i) == right then
+                                            right_index = i
+                                            break
+                                        end
+                                    end
+                                    reaper.UpdateArrange()
+                                    response.ret = right_index
+                                    response.ok = true
+                                else
+                                    response.error = "Split failed (position outside the item?)"
+                                    response.ok = false
+                                end
+                            else
+                                response.error = track and ("Media item not found at index " .. tostring(args[2]))
+                                    or ("Track not found at index " .. tostring(args[1]))
+                                response.ok = false
+                            end
+                        else
+                            response.error = "SplitMediaItem requires 3 arguments (track, item, position)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "DuplicateItem" then
+                        -- args: track, item -> action 41295 "Item: Duplicate items"
+                        if #args >= 2 then
+                            local ok2, err = run_item_action(args[1], args[2], 41295)
+                            response.ok = ok2
+                            response.ret = ok2
+                            if not ok2 then response.error = err end
+                        else
+                            response.error = "DuplicateItem requires 2 arguments (track, item)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "GetMIDIItemInfo" then
+                        -- args: track, item
+                        if #args >= 2 then
+                            local track = reaper.GetTrack(0, args[1])
+                            local item = track and reaper.GetTrackMediaItem(track, args[2])
+                            if item then
+                                local take = reaper.GetActiveTake(item)
+                                local is_midi = take and reaper.TakeIsMIDI(take) or false
+                                local note_count = 0
+                                if is_midi then
+                                    local _, notes = reaper.MIDI_CountEvts(take)
+                                    note_count = notes
+                                end
+                                response.ok = true
+                                response.info = {
+                                    position = reaper.GetMediaItemInfo_Value(item, "D_POSITION"),
+                                    length = reaper.GetMediaItemInfo_Value(item, "D_LENGTH"),
+                                    is_midi = is_midi,
+                                    note_count = note_count
+                                }
+                            else
+                                response.error = track and ("Media item not found at index " .. tostring(args[2]))
+                                    or ("Track not found at index " .. tostring(args[1]))
+                                response.ok = false
+                            end
+                        else
+                            response.error = "GetMIDIItemInfo requires 2 arguments (track, item)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "ClearMIDIItem" then
+                        -- args: track, item -> remove all MIDI events from the active take
+                        if #args >= 2 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if take then
+                                reaper.MIDI_SetAllEvts(take, "")
+                                reaper.MIDI_Sort(take)
+                                response.ret = true
+                                response.ok = true
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "ClearMIDIItem requires 2 arguments (track, item)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TrackFX_GetPresetList" then
+                        -- args: track, fx. REAPER's API cannot enumerate preset NAMES;
+                        -- return the count plus the current preset name/index.
+                        if #args >= 2 then
+                            local track
+                            if args[1] == -1 then track = reaper.GetMasterTrack(0)
+                            else track = reaper.GetTrack(0, args[1]) end
+                            if track then
+                                local idx, count = reaper.TrackFX_GetPresetIndex(track, args[2])
+                                local _, cur = reaper.TrackFX_GetPreset(track, args[2], "")
+                                response.ok = true
+                                response.preset_count = count
+                                response.current_index = idx
+                                response.current_preset = cur
+                                response.note = "REAPER's API cannot list preset names; use set_fx_preset with a known name"
+                            else
+                                response.error = "Track not found at index " .. tostring(args[1])
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TrackFX_GetPresetList requires 2 arguments (track, fx)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TrackFX_SavePreset" then
+                        -- Honest unsupported: vanilla ReaScript has no API to save a named FX preset.
+                        response.ok = false
+                        response.error = "Not supported: REAPER's API cannot save named FX presets. "
+                            .. "Save manually via the FX window's preset menu (+ button), or use "
+                            .. "get_track_fx_chunk to capture the current FX state instead."
+
+                    elseif fname == "CountEnvelopePoints" then
+                        -- args: track, envelope_name
+                        if #args >= 2 then
+                            local env, err = resolve_envelope(args[1], args[2])
+                            if env then
+                                response.ret = reaper.CountEnvelopePoints(env)
+                                response.ok = true
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "CountEnvelopePoints requires 2 arguments (track, envelope_name)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "GetEnvelopePoints" then
+                        -- args: track, envelope_name
+                        if #args >= 2 then
+                            local env, err = resolve_envelope(args[1], args[2])
+                            if env then
+                                local points = {}
+                                local count = reaper.CountEnvelopePoints(env)
+                                for p = 0, count - 1 do
+                                    local ok2, time, value, shape, tension, selected =
+                                        reaper.GetEnvelopePoint(env, p)
+                                    if ok2 then
+                                        points[#points + 1] = {
+                                            index = p, time = time, value = value,
+                                            shape = shape, tension = tension, selected = selected
+                                        }
+                                    end
+                                end
+                                response.points = points
+                                response.ret = count
+                                response.ok = true
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "GetEnvelopePoints requires 2 arguments (track, envelope_name)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "DeleteEnvelopePoint" then
+                        -- args: track, envelope_name, point_index
+                        if #args >= 3 then
+                            local env, err = resolve_envelope(args[1], args[2])
+                            if env then
+                                local ok2 = reaper.DeleteEnvelopePointEx(env, -1, args[3])
+                                reaper.Envelope_SortPoints(env)
+                                reaper.UpdateArrange()
+                                response.ret = ok2
+                                response.ok = ok2
+                                if not ok2 then response.error = "Point not found at index " .. tostring(args[3]) end
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "DeleteEnvelopePoint requires 3 arguments (track, envelope_name, point_index)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "ClearEnvelope" then
+                        -- args: track, envelope_name -> delete all points (explicit loop;
+                        -- DeleteEnvelopePointRange can leave a point behind)
+                        if #args >= 2 then
+                            local env, err = resolve_envelope(args[1], args[2])
+                            if env then
+                                local count = reaper.CountEnvelopePoints(env)
+                                for p = count - 1, 0, -1 do
+                                    reaper.DeleteEnvelopePointEx(env, -1, p)
+                                end
+                                reaper.Envelope_SortPoints(env)
+                                reaper.UpdateArrange()
+                                response.remaining = reaper.CountEnvelopePoints(env)
+                                response.ret = true
+                                response.ok = true
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "ClearEnvelope requires 2 arguments (track, envelope_name)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "SetEnvelopeArm" then
+                        -- args: track, envelope_name, arm. No direct API; edit the state chunk's ARM flag.
+                        if #args >= 3 then
+                            local env, err = resolve_envelope(args[1], args[2])
+                            if env then
+                                local ok2, chunk = reaper.GetEnvelopeStateChunk(env, "", false)
+                                if ok2 and chunk then
+                                    local flag = args[3] and "1" or "0"
+                                    local new_chunk, n = chunk:gsub("\nARM %d", "\nARM " .. flag, 1)
+                                    if n > 0 then
+                                        reaper.SetEnvelopeStateChunk(env, new_chunk, false)
+                                        response.ret = true
+                                        response.ok = true
+                                    else
+                                        response.error = "ARM flag not found in envelope state"
+                                        response.ok = false
+                                    end
+                                else
+                                    response.error = "Could not read envelope state"
+                                    response.ok = false
+                                end
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "SetEnvelopeArm requires 3 arguments (track, envelope_name, arm)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "GetUndoState" then
+                        -- next undo/redo action labels (nil-safe)
+                        response.can_undo = reaper.Undo_CanUndo2(0)
+                        response.can_redo = reaper.Undo_CanRedo2(0)
+                        response.ok = true
+
+                    elseif fname == "SetTimeSignature" then
+                        -- args: numerator, denominator -> tempo/time-sig marker at project start
+                        if #args >= 2 then
+                            local bpm = reaper.Master_GetTempo()
+                            local ok2 = reaper.SetTempoTimeSigMarker(0, -1, 0, -1, -1, bpm, args[1], args[2], false)
+                            reaper.UpdateTimeline()
+                            response.ret = ok2
+                            response.ok = ok2
+                            if not ok2 then response.error = "SetTempoTimeSigMarker failed" end
+                        else
+                            response.error = "SetTimeSignature requires 2 arguments (numerator, denominator)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "RenderProject" then
+                        -- args: output_path, start_time (-1 = project start), end_time (-1 = project end),
+                        --       tail_seconds. Renders the master mix via "render last settings" (41824).
+                        if #args >= 1 and type(args[1]) == "string" and args[1] ~= "" then
+                            local path = args[1]
+                            local start_t = tonumber(args[2]) or -1
+                            local end_t = tonumber(args[3]) or -1
+                            local tail = tonumber(args[4]) or 0
+
+                            local dir = path:match("^(.*)[/\\]") or ""
+                            local file = path:match("[^/\\]+$") or path
+                            local base = file:gsub("%.[A-Za-z0-9]+$", "")
+                            local ext = file:match("%.([A-Za-z0-9]+)$")
+
+                            reaper.GetSetProjectInfo_String(0, "RENDER_FILE", dir, true)
+                            reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", base, true)
+                            if ext and ext:lower() == "wav" then
+                                reaper.GetSetProjectInfo_String(0, "RENDER_FORMAT", "evaw", true)
+                            end
+                            -- master mix, source = master
+                            reaper.GetSetProjectInfo(0, "RENDER_SETTINGS", 0, true)
+                            if start_t >= 0 and end_t > start_t then
+                                reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 0, true) -- custom bounds
+                                reaper.GetSetProjectInfo(0, "RENDER_STARTPOS", start_t, true)
+                                reaper.GetSetProjectInfo(0, "RENDER_ENDPOS", end_t + tail, true)
+                            elseif tail > 0 then
+                                local proj_len = reaper.GetProjectLength(0)
+                                reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 0, true)
+                                reaper.GetSetProjectInfo(0, "RENDER_STARTPOS", 0, true)
+                                reaper.GetSetProjectInfo(0, "RENDER_ENDPOS", proj_len + tail, true)
+                            else
+                                reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 1, true) -- entire project
+                            end
+                            -- Read back REAPER's own computed output target(s)
+                            local _, targets = reaper.GetSetProjectInfo_String(0, "RENDER_TARGETS", "", false)
+                            -- Existing-target handling is part of the tool contract (args[5]
+                            -- = overwrite). We never delete files unless the caller asked,
+                            -- because REAPER's behavior on existing files (prompt vs
+                            -- auto-increment) is a user preference we cannot assume.
+                            local existing = {}
+                            local function exists(p)
+                                local f = io.open(p, "rb")
+                                if f then f:close() return true end
+                                return false
+                            end
+                            if targets and targets ~= "" then
+                                for t in string.gmatch(targets, "[^;]+") do
+                                    if exists(t) then existing[#existing + 1] = t end
+                                end
+                            elseif exists(path) then
+                                existing[#existing + 1] = path
+                            end
+                            if #existing > 0 and not args[5] then
+                                response.error = "Render target already exists: "
+                                    .. table.concat(existing, "; ")
+                                    .. ". Pass overwrite=true to replace it, or render to a "
+                                    .. "different path. (Rendering onto an existing file may "
+                                    .. "otherwise pop REAPER's overwrite prompt, which blocks "
+                                    .. "unattended rendering.)"
+                                response.ok = false
+                            else
+                                if #existing > 0 then
+                                    for _, t in ipairs(existing) do os.remove(t) end
+                                end
+                                -- 42230 = render using last settings, auto-close render dialog.
+                                -- (41824 opens the dialog on projects that have never rendered.)
+                                reaper.Main_OnCommand(42230, 0)
+                                response.ret = true
+                                response.output = path
+                                response.targets = targets
+                                response.ok = true
+                            end
+                        else
+                            response.error = "RenderProject requires output_path (string)"
                             response.ok = false
                         end
 

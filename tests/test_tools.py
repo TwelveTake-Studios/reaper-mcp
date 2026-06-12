@@ -252,3 +252,64 @@ def test_master_send(reaper):
     assert reaper.last == ("GetMediaTrackInfo_Value", [2, "B_MAINSEND"])
     run(srv.set_track_master_send(2, False))
     assert reaper.last == ("SetMediaTrackInfo_Value", [2, "B_MAINSEND", 0])
+
+
+# --- v1.3.2: explicit handlers for the remaining generic-fallback victims ---
+
+def test_midi_item_tools_marshalling(reaper):
+    run(srv.delete_midi_note(0, 1, 2))
+    assert reaper.last == ("MIDI_DeleteNote", [0, 1, 2])
+    run(srv.clear_midi_item(0, 1))
+    assert reaper.last == ("ClearMIDIItem", [0, 1])
+    run(srv.get_midi_item(0, 1))
+    assert reaper.last == ("GetMIDIItemInfo", [0, 1])
+
+
+def test_item_edit_tools_marshalling(reaper):
+    run(srv.split_item(0, 1, 2.5))
+    assert reaper.last == ("SplitMediaItem", [0, 1, 2.5])
+    run(srv.duplicate_item(0, 1))
+    assert reaper.last == ("DuplicateItem", [0, 1])
+
+
+def test_envelope_tools_marshalling(reaper):
+    run(srv.add_envelope_point(0, "Volume", 1.5, 0.7))
+    assert reaper.last == ("InsertEnvelopePoint", [0, "Volume", 1.5, 0.7, 0, 0, False, False])
+    run(srv.get_envelope_point_count(0, "Volume"))
+    assert reaper.last == ("CountEnvelopePoints", [0, "Volume"])
+    run(srv.get_envelope_points(0, "Volume"))
+    assert reaper.last == ("GetEnvelopePoints", [0, "Volume"])
+    run(srv.delete_envelope_point(0, "Volume", 3))
+    assert reaper.last == ("DeleteEnvelopePoint", [0, "Volume", 3])
+    run(srv.clear_envelope(0, "Pan"))
+    assert reaper.last == ("ClearEnvelope", [0, "Pan"])
+    run(srv.arm_track_envelope(0, "Volume", True))
+    assert reaper.last == ("SetEnvelopeArm", [0, "Volume", True])
+
+
+def test_undo_state_and_time_signature(reaper):
+    run(srv.get_undo_state())
+    assert reaper.last == ("GetUndoState", [])
+    run(srv.set_time_signature(6, 8))
+    assert reaper.last == ("SetTimeSignature", [6, 8])
+
+
+def test_render_project_none_becomes_sentinels(reaper):
+    run(srv.render_project("C:/tmp/out.wav"))
+    assert reaper.last == ("RenderProject", ["C:/tmp/out.wav", -1, -1, 0, False])
+    run(srv.render_project("C:/tmp/out.wav", 1.0, 3.0, 0.5, overwrite=True))
+    assert reaper.last == ("RenderProject", ["C:/tmp/out.wav", 1.0, 3.0, 0.5, True])
+
+
+def test_render_region_documented_error(reaper):
+    result = run(srv.render_region(0, "C:/tmp/r.wav"))
+    assert result["ok"] is False
+    assert "v1.9" in result["error"]
+    assert reaper.calls == []  # never reaches the bridge
+
+
+def test_fx_preset_tools_marshalling(reaper):
+    run(srv.get_fx_presets(0, 1))
+    assert reaper.last == ("TrackFX_GetPresetList", [0, 1])
+    run(srv.save_fx_preset(0, 1, "My Preset"))
+    assert reaper.last == ("TrackFX_SavePreset", [0, 1, "My Preset"])

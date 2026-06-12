@@ -5,6 +5,42 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.3.2] - 2026-06-12
+
+Bug-fix release completing the generic-fallback sweep started in v1.3.1: a systematic audit
+of every tool's bridge call path found 16 more silently broken tools (calling nonexistent
+API names, or pointer-requiring APIs the generic fallback cannot service). 158 tools.
+
+### Fixed
+- **Bridge JSON decoder corrupted Windows paths.** Escape sequences were unescaped with
+  sequential replacements and no `\\` handling, so any path segment starting with
+  `r`, `n`, `t`, `b`, or `f` after a backslash was mangled (e.g. `...\Temp\reaper.wav`
+  rendered to `...\Temp\_eaper.wav` via a stray carriage return). Now a single-pass
+  decoder that consumes `\\` atomically. Affected every string argument crossing the
+  bridge on Windows.
+- **MIDI:** `delete_midi_note`, `clear_midi_item`, `get_midi_item`.
+- **Item editing:** `split_item` (returns the new right-half item index),
+  `duplicate_item` (via action 41295).
+- **Envelopes:** `add_envelope_point` (its handler only accepted a raw envelope pointer,
+  which the server never sends — it never worked), `get_envelope_point_count`,
+  `get_envelope_points`, `delete_envelope_point`, `clear_envelope`,
+  `arm_track_envelope` (ARM via state chunk — REAPER has no direct API).
+- **Project:** `get_undo_state` (via `Undo_CanUndo2`/`Undo_CanRedo2`),
+  `set_time_signature` (tempo/time-sig marker at project start),
+  `render_project` (sets render file/bounds/format, renders dialog-free via action 42230;
+  `.wav` extension selects WAV output). New explicit `overwrite` parameter: an existing
+  target file returns a clean error unless `overwrite=True` — REAPER's own behavior on
+  existing files (prompt vs auto-increment) is a user preference, and its overwrite
+  prompt blocks unattended rendering.
+- `get_fx_presets` now returns the preset count + current preset (REAPER's API cannot
+  enumerate preset names — documented in the response).
+
+### Changed
+- `save_fx_preset` and `render_region` now return **clear documented errors** instead of
+  silent failures: REAPER's API cannot save named FX presets (workaround suggested), and
+  region rendering is deferred to the v1.9 render suite (workaround: `render_project`
+  with explicit bounds).
+
 ## [1.3.1] - 2026-06-10
 
 Bug-fix release — **with thanks to Héctor Zelaya ([@nuxero](https://github.com/nuxero)),
@@ -108,6 +144,7 @@ Total tools: **130**.
 - File-based communication bridge (default) plus optional HTTP mode
   (Lua and Python in-REAPER servers).
 
+[1.3.2]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.3.2
 [1.3.1]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.3.1
 [1.3.0]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.3.0
 [1.2.1]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.2.1
