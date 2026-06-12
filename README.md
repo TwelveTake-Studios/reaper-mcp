@@ -74,6 +74,25 @@ Or install dependencies directly:
 pip install mcp httpx
 ```
 
+#### Alternative: Nix Flake (Optional)
+
+If you use [Nix](https://nixos.org/), the project includes a flake-based dev shell that provides Python 3.12 and automatically creates/activates a virtual environment:
+
+```bash
+# Enter the dev shell manually
+nix develop
+
+# Or with direnv (recommended — auto-activates on cd):
+direnv allow
+```
+
+Once inside the shell, install the Python dependencies as usual:
+```bash
+pip install -r requirements.txt
+```
+
+This approach pins the Python version and keeps dependencies isolated without polluting your system.
+
 ### 3. Configure Your AI Assistant
 
 Add to your MCP client's configuration (e.g., `.mcp.json`):

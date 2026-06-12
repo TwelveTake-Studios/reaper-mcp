@@ -40,3 +40,6 @@ Thumbs.db
 # Claude Code / AI tooling (dev-only, never published)
 .claude/
 nul
+
+# Nix / direnv
+.direnv/
