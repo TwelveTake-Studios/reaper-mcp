@@ -17,6 +17,7 @@ __version__ = "1.4.0"
 import os
 import asyncio
 import json
+import math
 import time
 from pathlib import Path
 from typing import Optional
@@ -2665,8 +2666,6 @@ async def save_fx_preset(track_index: int, fx_index: int, preset_name: str) -> d
 # below was corrected against live REAPER 7.x: ReaEQ's gain is linear in amplitude
 # with unity at norm 0.5 and +12 dB at norm 1.0 (verified exact from -18 to +12 dB).
 # Frequency and Q are passed raw with isnorm=false, which REAPER handles correctly.
-
-import math
 
 _EQ_GAIN_AMP_MAX = 10.0 ** (12.0 / 20.0)  # +12 dB at norm 1.0
 
