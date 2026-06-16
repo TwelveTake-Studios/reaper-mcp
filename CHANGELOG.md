@@ -5,6 +5,28 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.0] - 2026-06-16
+
+### Added — ReaEQ band control (5 tools)
+Dedicated ReaEQ control: `find_eq`, `get_eq_bands`, `set_eq_band`, `get_eq_band_enabled`,
+`set_eq_band_enabled`. Read and set EQ bands in real units — frequency in Hz, gain in dB, Q —
+with REAPER-formatted values returned for readability.
+
+Band API and tool design from [@nuxero](https://github.com/nuxero)'s
+[PR #6](https://github.com/TwelveTake-Studios/reaper-mcp/pull/6). The bridge had no EQ
+handlers, so those were added (`TrackFX_GetEQParam`, `TrackFX_SetEQParam`, `TrackFX_GetEQ`,
+`TrackFX_GetEQBandEnabled`, `TrackFX_SetEQBandEnabled`, `TrackFX_GetFormattedParamValue`), and
+the gain dB↔normalized mapping was extended against live REAPER 7.x to span ReaEQ's full
+boost/cut range. Live-verified end to end.
+
+### Added — Nix flake dev shell
+A flake-based development shell (`nix develop`, or auto-activated via direnv) that pins
+Python 3.12 and manages a virtualenv. From [@nuxero](https://github.com/nuxero)'s
+[PR #7](https://github.com/TwelveTake-Studios/reaper-mcp/pull/7), broadened to all four default
+systems with the venv tooling aligned to Python 3.12. Verified on **x86_64-linux** (the shell
+builds; Python 3.12, pip, virtualenv, and the venv hook all work). The macOS (**Darwin**) shells
+evaluate but have **not** been tested — no macOS host was available.
+
 ## [1.3.2] - 2026-06-12
 
 Bug-fix release completing the generic-fallback sweep started in v1.3.1: a systematic audit
@@ -45,21 +67,26 @@ API names, or pointer-requiring APIs the generic fallback cannot service). 158 t
 
 Bug-fix release — **with thanks to Héctor Zelaya ([@nuxero](https://github.com/nuxero)),
 whose [PR #1](https://github.com/TwelveTake-Studios/reaper-mcp/pull/1) diagnosed the broken
-call paths and contributed several of the fixes and tools ported here.** 158 tools total.
+call paths and contributed several of the fixes and tools ported here, and to
+[@freke70](https://github.com/freke70), whose
+[issue #3](https://github.com/TwelveTake-Studios/reaper-mcp/issues/3) independently diagnosed
+the same MIDI call-path bugs and the startup `__name__` override.** 158 tools total.
 
 ### Fixed
 - `create_midi_item`, `add_midi_note`, `add_midi_notes_batch`, `get_midi_notes`,
   `get_item_info`, all six `set_item_*` tools, and `get_track_peak` were silently broken:
   they called raw REAPER API names that fell through to the bridge's generic fallback,
   which cannot resolve track/item/take pointers from indices. All now route through
-  explicit bridge handlers. *(Diagnosis and several fixes from @nuxero's PR #1.)*
+  explicit bridge handlers. *(Diagnosis and several fixes from @nuxero's PR #1; the MIDI
+  call-path bugs were also reported independently by @freke70 in issue #3.)*
 - `add_midi_note` / `add_midi_notes_batch` now use **musical timing in beats**
   (`start_beat`, `length_beats`) instead of the former PPQ arguments — clearer for AI use
   and matching the bridge's actual time-based semantics. (Signature change is treated as a
   fix: the previous tools never worked.)
 - Removed the module-level `__name__` override that prevented
   `python reaper_mcp_server.py` from starting (the `if __name__ == "__main__"` guard could
-  never fire; only the pip console script worked).
+  never fire; only the pip console script worked). *(Independently reported by @freke70 in
+  issue #3.)*
 
 ### Added *(from PR #1, @nuxero)*
 - `track_fx_add_by_name` optional `position` argument (insert anywhere in the chain).

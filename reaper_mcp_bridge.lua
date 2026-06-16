@@ -2808,7 +2808,189 @@ local function process_request()
                             response.error = "TrackFX_GetNumParams requires 2 arguments"
                             response.ok = false
                         end
-                    
+
+                    elseif fname == "TrackFX_GetEQParam" then
+                        -- Get ReaEQ band parameter (per-param query: track, fxidx, paramidx)
+                        if #args >= 3 then
+                            local track = nil
+                            if type(args[1]) == "number" then
+                                if args[1] == -1 then
+                                    track = reaper.GetMasterTrack(0)
+                                else
+                                    track = reaper.GetTrack(0, args[1])
+                                end
+                            elseif type(args[1]) == "table" and args[1].__ptr then
+                                response.error = "Cannot use track pointer from previous call"
+                                response.ok = false
+                            else
+                                track = args[1]
+                            end
+
+                            if track then
+                                local retval, bandtype, bandidx, paramtype, normval = reaper.TrackFX_GetEQParam(track, args[2], args[3])
+                                response.ok = retval
+                                response.ret = retval
+                                response.bandtype = bandtype
+                                response.bandidx = bandidx
+                                response.paramtype = paramtype
+                                response.normval = normval
+                            else
+                                response.error = "Track not found"
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TrackFX_GetEQParam requires 3 arguments"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TrackFX_SetEQParam" then
+                        -- Set ReaEQ band parameter (track, fxidx, bandtype, bandidx, paramtype, val, isnorm)
+                        if #args >= 7 then
+                            local track = nil
+                            if type(args[1]) == "number" then
+                                if args[1] == -1 then
+                                    track = reaper.GetMasterTrack(0)
+                                else
+                                    track = reaper.GetTrack(0, args[1])
+                                end
+                            elseif type(args[1]) == "table" and args[1].__ptr then
+                                response.error = "Cannot use track pointer from previous call"
+                                response.ok = false
+                            else
+                                track = args[1]
+                            end
+
+                            if track then
+                                local retval = reaper.TrackFX_SetEQParam(track, args[2], args[3], args[4], args[5], args[6], args[7])
+                                response.ok = retval
+                                response.ret = retval
+                            else
+                                response.error = "Track not found"
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TrackFX_SetEQParam requires 7 arguments"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TrackFX_GetEQ" then
+                        -- Locate (or instantiate) ReaEQ in track FX chain (track, instantiate)
+                        if #args >= 2 then
+                            local track = nil
+                            if type(args[1]) == "number" then
+                                if args[1] == -1 then
+                                    track = reaper.GetMasterTrack(0)
+                                else
+                                    track = reaper.GetTrack(0, args[1])
+                                end
+                            elseif type(args[1]) == "table" and args[1].__ptr then
+                                response.error = "Cannot use track pointer from previous call"
+                                response.ok = false
+                            else
+                                track = args[1]
+                            end
+
+                            if track then
+                                response.ret = reaper.TrackFX_GetEQ(track, args[2])
+                                response.ok = true
+                            else
+                                response.error = "Track not found"
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TrackFX_GetEQ requires 2 arguments"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TrackFX_GetEQBandEnabled" then
+                        -- Query whether a ReaEQ band is enabled (track, fxidx, bandtype, bandidx)
+                        if #args >= 4 then
+                            local track = nil
+                            if type(args[1]) == "number" then
+                                if args[1] == -1 then
+                                    track = reaper.GetMasterTrack(0)
+                                else
+                                    track = reaper.GetTrack(0, args[1])
+                                end
+                            elseif type(args[1]) == "table" and args[1].__ptr then
+                                response.error = "Cannot use track pointer from previous call"
+                                response.ok = false
+                            else
+                                track = args[1]
+                            end
+
+                            if track then
+                                response.ret = reaper.TrackFX_GetEQBandEnabled(track, args[2], args[3], args[4])
+                                response.ok = true
+                            else
+                                response.error = "Track not found"
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TrackFX_GetEQBandEnabled requires 4 arguments"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TrackFX_SetEQBandEnabled" then
+                        -- Enable/disable a ReaEQ band (track, fxidx, bandtype, bandidx, enable)
+                        if #args >= 5 then
+                            local track = nil
+                            if type(args[1]) == "number" then
+                                if args[1] == -1 then
+                                    track = reaper.GetMasterTrack(0)
+                                else
+                                    track = reaper.GetTrack(0, args[1])
+                                end
+                            elseif type(args[1]) == "table" and args[1].__ptr then
+                                response.error = "Cannot use track pointer from previous call"
+                                response.ok = false
+                            else
+                                track = args[1]
+                            end
+
+                            if track then
+                                local retval = reaper.TrackFX_SetEQBandEnabled(track, args[2], args[3], args[4], args[5])
+                                response.ok = retval
+                                response.ret = retval
+                            else
+                                response.error = "Track not found"
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TrackFX_SetEQBandEnabled requires 5 arguments"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TrackFX_GetFormattedParamValue" then
+                        -- Get human-readable formatted FX parameter value (track, fxidx, paramidx)
+                        if #args >= 3 then
+                            local track = nil
+                            if type(args[1]) == "number" then
+                                if args[1] == -1 then
+                                    track = reaper.GetMasterTrack(0)
+                                else
+                                    track = reaper.GetTrack(0, args[1])
+                                end
+                            elseif type(args[1]) == "table" and args[1].__ptr then
+                                response.error = "Cannot use track pointer from previous call"
+                                response.ok = false
+                            else
+                                track = args[1]
+                            end
+
+                            if track then
+                                local retval, buf = reaper.TrackFX_GetFormattedParamValue(track, args[2], args[3], "")
+                                response.ok = retval
+                                response.ret = buf
+                            else
+                                response.error = "Track not found"
+                                response.ok = false
+                            end
+                        else
+                            response.error = "TrackFX_GetFormattedParamValue requires 3 arguments"
+                            response.ok = false
+                        end
+
                     elseif fname == "TrackFX_GetParam" then
                         -- Get FX parameter value
                         if #args >= 3 then

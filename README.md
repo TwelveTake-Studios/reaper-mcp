@@ -32,7 +32,7 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
 - **Stock REAPER Lua only** — the bridge script has no dependencies, nothing extra to install in REAPER
 - Copy the script, run it, connect your AI assistant
 
-### 158 Tools Covering Real Production Needs
+### 163 Tools Covering Real Production Needs
 
 - **Full FX control** — add/remove plugins, get/set any parameter by index, manage presets, bypass
 - **FX parameter automation** — automate any plugin knob (flanger depth, filter cutoff, etc.)
@@ -73,6 +73,29 @@ Or install dependencies directly:
 ```bash
 pip install mcp httpx
 ```
+
+#### Alternative: Nix flake (optional)
+
+If you use [Nix](https://nixos.org/), the repo ships a flake-based dev shell that provides
+Python 3.12 and creates/activates a virtualenv for you:
+
+```bash
+# Enter the dev shell manually
+nix develop
+
+# Or, with direnv, auto-activate on cd:
+direnv allow
+```
+
+Then install the dependencies as usual:
+```bash
+pip install -r requirements.txt
+```
+
+This pins the Python version and keeps dependencies isolated from your system.
+
+> **Note:** the `x86_64-linux` dev shell is tested and working. The macOS (Darwin) shells are
+> provided but have **not** been tested — confirmation from a macOS user is welcome.
 
 ### 3. Configure Your AI Assistant
 
@@ -233,6 +256,19 @@ REAPER_COMM_MODE=http python reaper_mcp_server.py
 | `get_fx_preset(index, fx_index)` | Get current preset |
 | `set_fx_preset(index, fx_index, name)` | Load preset |
 | `save_fx_preset(index, fx_index, name)` | Save current settings as preset |
+
+### ReaEQ Operations (5 tools)
+
+Dedicated ReaEQ band control using REAPER's EQ-specific API, which handles ReaEQ's
+non-linear parameter curves (dB gain, log frequency, log Q) correctly.
+
+| Tool | Description |
+|------|-------------|
+| `find_eq(track, instantiate?)` | Find ReaEQ on a track (optionally add it) |
+| `get_eq_bands(track, fx)` | Read all ReaEQ bands with human-readable values |
+| `set_eq_band(track, fx, bandtype, bandidx, paramtype, value, is_normalized?)` | Set a band parameter (Hz, dB, or Q) |
+| `get_eq_band_enabled(track, fx, bandtype, bandidx?)` | Check whether a band is enabled |
+| `set_eq_band_enabled(track, fx, bandtype, bandidx?, enabled?)` | Enable/disable a band |
 
 ### Take FX Operations (11 tools)
 

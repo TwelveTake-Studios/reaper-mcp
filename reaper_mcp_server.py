@@ -9,10 +9,10 @@ A TwelveTake Studios project - https://twelvetake.com
 
 Author: TwelveTake Studios LLC
 License: MIT
-Version: 1.3.2
+Version: 1.4.0
 """
 
-__version__ = "1.3.2"
+__version__ = "1.4.0"
 
 import os
 import asyncio
@@ -2656,6 +2656,175 @@ async def save_fx_preset(track_index: int, fx_index: int, preset_name: str) -> d
         Object with success status.
     """
     return await reaper_call("TrackFX_SavePreset", track_index, fx_index, preset_name)
+
+
+# --- ReaEQ OPERATIONS ---
+# Dedicated ReaEQ band control. Based on @nuxero's PR #6 (band API, tool surface,
+# and the insight that gain must be written normalized because TrackFX_SetEQParam
+# with isnorm=false does not apply ReaEQ's gain curve). The dB<->normalized curve
+# below was corrected against live REAPER 7.x: ReaEQ's gain is linear in amplitude
+# with unity at norm 0.5 and +12 dB at norm 1.0 (verified exact from -18 to +12 dB).
+# Frequency and Q are passed raw with isnorm=false, which REAPER handles correctly.
+
+import math
+
+_EQ_GAIN_AMP_MAX = 10.0 ** (12.0 / 20.0)  # +12 dB at norm 1.0
+
+
+def _db_to_eq_norm(db: float) -> float:
+    """Convert a ReaEQ band gain in dB to its normalized (0-1) value."""
+    amp = 10.0 ** (db / 20.0)
+    if amp <= 1.0:
+        return max(0.0, amp / 2.0)
+    return min(1.0, 0.5 + (amp - 1.0) / (2.0 * (_EQ_GAIN_AMP_MAX - 1.0)))
+
+
+def _eq_norm_to_db(norm: float) -> float:
+    """Convert a ReaEQ band normalized (0-1) gain value to dB."""
+    if norm <= 0.0:
+        return -150.0
+    amp = (2.0 * norm) if norm <= 0.5 else (1.0 + (norm - 0.5) * 2.0 * (_EQ_GAIN_AMP_MAX - 1.0))
+    return 20.0 * math.log10(amp)
+
+
+_EQ_BANDTYPE_NAMES = {
+    -1: "master gain", 0: "hipass", 1: "loshelf", 2: "band", 3: "notch",
+    4: "hishelf", 5: "lopass", 6: "bandpass", 7: "parallel bandpass",
+}
+_EQ_PARAMTYPE_NAMES = {0: "freq", 1: "gain", 2: "Q"}
+
+
+@mcp.tool()
+async def get_eq_bands(track_index: int, fx_index: int) -> dict:
+    """
+    Get all ReaEQ band settings in one structured call.
+
+    Args:
+        track_index: Track index (0-based) or -1 for master.
+        fx_index: FX index (0-based) of ReaEQ in the FX chain.
+
+    Returns:
+        Object with a 'bands' list. Each band has band_index, bandtype,
+        bandtype_name, bandidx, paramtype, paramtype_name, normval, the
+        REAPER-formatted value, and (for gain params) the computed gain_db.
+    """
+    count_result = await reaper_call("TrackFX_GetNumParams", track_index, fx_index)
+    num_params = count_result.get("ret", 0)
+
+    bands = []
+    for i in range(num_params):
+        result = await reaper_call("TrackFX_GetEQParam", track_index, fx_index, i)
+        if result.get("ok"):
+            bt = result.get("bandtype", -99)
+            pt = result.get("paramtype", -1)
+            normval = result.get("normval", 0)
+            band_data = {
+                "band_index": i,
+                "bandtype": bt,
+                "bandtype_name": _EQ_BANDTYPE_NAMES.get(bt, "unknown"),
+                "bandidx": result.get("bandidx", 0),
+                "paramtype": pt,
+                "paramtype_name": _EQ_PARAMTYPE_NAMES.get(pt, "unknown"),
+                "normval": normval,
+            }
+            if pt == 1 and normval is not None:
+                band_data["gain_db"] = round(_eq_norm_to_db(normval), 2)
+            bands.append(band_data)
+
+    for band in bands:
+        fmt = await reaper_call("TrackFX_GetFormattedParamValue", track_index, fx_index, band["band_index"])
+        if fmt.get("ok"):
+            band["formatted"] = fmt.get("ret", "")
+
+    return {"ok": True, "bands": bands, "param_count": num_params}
+
+
+@mcp.tool()
+async def set_eq_band(track_index: int, fx_index: int, bandtype: int, bandidx: int,
+                      paramtype: int, value: float, is_normalized: bool = False) -> dict:
+    """
+    Set a ReaEQ band parameter.
+
+    Pass real values by default: frequency in Hz (paramtype 0), gain in dB
+    (paramtype 1), or Q (paramtype 2). Gain is converted to ReaEQ's normalized
+    curve internally; freq and Q are sent raw.
+
+    Args:
+        track_index: Track index (0-based) or -1 for master.
+        fx_index: FX index (0-based) of ReaEQ.
+        bandtype: -1=master gain, 0=hipass, 1=loshelf, 2=band, 3=notch,
+                  4=hishelf, 5=lopass, 6=bandpass, 7=parallel bandpass.
+        bandidx: Band index within that type (0=first). Ignored for master gain.
+        paramtype: 0=frequency (Hz), 1=gain (dB), 2=Q. Ignored for master gain.
+        value: The value, in real units unless is_normalized=True.
+        is_normalized: If True, value is a raw 0-1 normalized value written directly.
+
+    Returns:
+        Object with success status (ok).
+    """
+    if is_normalized:
+        return await reaper_call("TrackFX_SetEQParam", track_index, fx_index,
+                                 bandtype, bandidx, paramtype, value, True)
+    if paramtype == 1:
+        # Gain: dB -> normalized via ReaEQ's amplitude curve, written with isnorm=true.
+        norm_value = _db_to_eq_norm(value)
+        return await reaper_call("TrackFX_SetEQParam", track_index, fx_index,
+                                 bandtype, bandidx, paramtype, norm_value, True)
+    # Frequency and Q: REAPER converts these correctly with isnorm=false.
+    return await reaper_call("TrackFX_SetEQParam", track_index, fx_index,
+                             bandtype, bandidx, paramtype, value, False)
+
+
+@mcp.tool()
+async def get_eq_band_enabled(track_index: int, fx_index: int, bandtype: int,
+                              bandidx: int = 0) -> dict:
+    """
+    Check whether a ReaEQ band is enabled.
+
+    Args:
+        track_index: Track index (0-based) or -1 for master.
+        fx_index: FX index (0-based) of ReaEQ.
+        bandtype: Band type (0=hipass, 1=loshelf, 2=band, 3=notch, 4=hishelf, 5=lopass).
+        bandidx: Band index within that type (0=first).
+
+    Returns:
+        Object with 'ret' boolean (true=enabled).
+    """
+    return await reaper_call("TrackFX_GetEQBandEnabled", track_index, fx_index, bandtype, bandidx)
+
+
+@mcp.tool()
+async def set_eq_band_enabled(track_index: int, fx_index: int, bandtype: int,
+                              bandidx: int = 0, enabled: bool = True) -> dict:
+    """
+    Enable or disable a ReaEQ band.
+
+    Args:
+        track_index: Track index (0-based) or -1 for master.
+        fx_index: FX index (0-based) of ReaEQ.
+        bandtype: Band type (0=hipass, 1=loshelf, 2=band, 3=notch, 4=hishelf, 5=lopass).
+        bandidx: Band index within that type (0=first).
+        enabled: True to enable, False to disable.
+
+    Returns:
+        Object with success status (ok).
+    """
+    return await reaper_call("TrackFX_SetEQBandEnabled", track_index, fx_index, bandtype, bandidx, enabled)
+
+
+@mcp.tool()
+async def find_eq(track_index: int, instantiate: bool = False) -> dict:
+    """
+    Find ReaEQ on a track, optionally adding it if absent.
+
+    Args:
+        track_index: Track index (0-based) or -1 for master.
+        instantiate: If True and ReaEQ is not present, add it.
+
+    Returns:
+        Object with 'ret' = the FX index of ReaEQ, or -1 if not found.
+    """
+    return await reaper_call("TrackFX_GetEQ", track_index, instantiate)
 
 
 @mcp.tool()
