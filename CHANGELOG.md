@@ -5,6 +5,21 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.2] - 2026-06-19
+
+Bug-fix release. **The bridge changed; reinstall `reaper_mcp_bridge.lua` in REAPER for the
+`get_track_items` fix.**
+
+### Fixed
+- `get_track_items` / `get_selected_items` crashed (bridge error: `GetTakeName` "MediaItem_Take
+  expected") on any item with no active take — they passed the *item* to `GetTakeName`, which only
+  accepts a take. Now guarded: empty-take items return a blank name instead of erroring. Found by
+  exercising `explode_takes` against a real multi-take project.
+- `run_action_by_name` did not resolve named commands: it passed the name straight to
+  `Main_OnCommandEx` (which expects a numeric id), so named commands (`_RS...`, SWS `_SWS_...`)
+  silently did nothing. Now resolves via `NamedCommandLookup` first and returns a clean "not found"
+  error if unknown; numeric command-id strings run directly.
+
 ## [1.4.1] - 2026-06-19
 
 Bug-fix release: four pre-existing tool bugs surfaced by a new live-REAPER regression suite,

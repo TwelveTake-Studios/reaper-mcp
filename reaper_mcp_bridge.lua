@@ -400,8 +400,14 @@ local function GetSelectedItems()
             end
             
             local take = reaper.GetActiveTake(item)
-            local is_midi = take and reaper.TakeIsMIDI(take)
-            local retval, name = reaper.GetTakeName(take or item)
+            local is_midi = (take and reaper.TakeIsMIDI(take)) or false
+            -- Guard: GetTakeName requires a take; an item with no active take (empty item,
+            -- or one left by explode_takes) would crash on GetTakeName(item).
+            local name = ""
+            if take then
+                local _
+                _, name = reaper.GetTakeName(take)
+            end
             
             table.insert(items, {
                 index = i,
@@ -430,8 +436,13 @@ local function GetAllItems()
             local item = reaper.GetTrackMediaItem(track, i)
             if item then
                 local take = reaper.GetActiveTake(item)
-                local is_midi = take and reaper.TakeIsMIDI(take)
-                local retval, name = reaper.GetTakeName(take or item)
+                local is_midi = (take and reaper.TakeIsMIDI(take)) or false
+                -- Guard: GetTakeName needs a take; an item with no active take would crash.
+                local name = ""
+                if take then
+                    local _
+                    _, name = reaper.GetTakeName(take)
+                end
                 
                 table.insert(items, {
                     index = i,
@@ -462,8 +473,14 @@ local function GetTrackItems(track_index)
         local item = reaper.GetTrackMediaItem(track, i)
         if item then
             local take = reaper.GetActiveTake(item)
-            local is_midi = take and reaper.TakeIsMIDI(take)
-            local retval, name = reaper.GetTakeName(take or item)
+            local is_midi = (take and reaper.TakeIsMIDI(take)) or false
+            -- Guard: GetTakeName requires a take; an item with no active take (empty item,
+            -- or one left by explode_takes) would crash on GetTakeName(item).
+            local name = ""
+            if take then
+                local _
+                _, name = reaper.GetTakeName(take)
+            end
             
             table.insert(items, {
                 index = i,

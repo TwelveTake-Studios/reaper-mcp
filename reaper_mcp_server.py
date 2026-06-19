@@ -9,10 +9,10 @@ A TwelveTake Studios project - https://twelvetake.com
 
 Author: TwelveTake Studios LLC
 License: MIT
-Version: 1.4.1
+Version: 1.4.2
 """
 
-__version__ = "1.4.1"
+__version__ = "1.4.2"
 
 import os
 import asyncio
@@ -2592,15 +2592,37 @@ async def run_action(action_id: int) -> dict:
 @mcp.tool()
 async def run_action_by_name(action_name: str) -> dict:
     """
-    Run a REAPER action by name.
+    Run a REAPER action by its named command id.
+
+    Named commands (e.g. ReaScripts "_RS12345" or SWS "_SWS_...") are resolved
+    to a numeric command id via NamedCommandLookup before firing. A purely numeric
+    string (e.g. "40297") is treated as a built-in command id and run directly;
+    prefer run_action(action_id) for built-ins.
 
     Args:
-        action_name: Action name or command ID string (e.g., "_RS12345").
+        action_name: Named command id (e.g. "_RS12345") or a numeric command id string.
 
     Returns:
-        Object with success status.
+        Object with success status. If the named command cannot be resolved,
+        returns {"ok": False, "error": ...} without firing any action.
     """
-    return await reaper_call("Main_OnCommandEx", action_name, 0, 0)
+    name = action_name.strip()
+
+    # Numeric command-id string: run as a built-in action directly.
+    if name.lstrip("-").isdigit():
+        return await reaper_call("Main_OnCommand", int(name), 0)
+
+    # Named command: resolve to a numeric id first (0 == not found).
+    lookup = await reaper_call("NamedCommandLookup", name)
+    cmd_id = lookup.get("ret", 0) or 0
+    try:
+        cmd_id = int(cmd_id)
+    except (TypeError, ValueError):
+        cmd_id = 0
+    if cmd_id == 0:
+        return {"ok": False, "error": f"Action not found: {action_name!r}"}
+
+    return await reaper_call("Main_OnCommand", cmd_id, 0)
 
 
 @mcp.tool()
