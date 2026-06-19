@@ -9,10 +9,10 @@ A TwelveTake Studios project - https://twelvetake.com
 
 Author: TwelveTake Studios LLC
 License: MIT
-Version: 1.4.0
+Version: 1.4.1
 """
 
-__version__ = "1.4.0"
+__version__ = "1.4.1"
 
 import os
 import asyncio
@@ -255,9 +255,10 @@ async def insert_track(index: int = None, name: str = None) -> dict:
 
     result = await reaper_call("InsertTrackAtIndex", index, True)
 
-    # Set name if provided
+    # Set name if provided. (Same leading-0 bug as delete_track had: the bridge
+    # reads args[1] as the track, so the extra 0 named track 0 with a bogus field.)
     if name and result.get("ok"):
-        await reaper_call("GetSetMediaTrackInfo_String", 0, index, "P_NAME", name, True)
+        await reaper_call("GetSetMediaTrackInfo_String", index, "P_NAME", name, True)
 
     return result
 
@@ -272,7 +273,9 @@ async def delete_track(track_index: int) -> dict:
     """
     if track_index == -1:
         return {"ok": False, "error": "Cannot delete master track"}
-    return await reaper_call("DeleteTrack", 0, track_index)
+    # Bridge DeleteTrack handler reads args[1] as the track index; a leading 0 here
+    # meant it always deleted track 0 regardless of track_index. (Fixed.)
+    return await reaper_call("DeleteTrack", track_index)
 
 
 @mcp.tool()
@@ -1519,7 +1522,10 @@ async def set_midi_note_velocity(
     Returns:
         Object with success status.
     """
-    return await reaper_call("MIDI_SetNote", track_index, item_index, note_index, None, None, None, None, None, velocity, False)
+    # Dedicated bridge handler resolves the take and sets only the velocity. The old
+    # raw MIDI_SetNote path passed indices where a take pointer is required and collapsed
+    # its None args, so it never worked.
+    return await reaper_call("SetMIDINoteVelocity", track_index, item_index, note_index, velocity)
 
 
 # --- AUDIO ITEM OPERATIONS ---

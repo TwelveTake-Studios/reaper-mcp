@@ -5,6 +5,30 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.4.1] - 2026-06-19
+
+Bug-fix release: four pre-existing tool bugs surfaced by a new live-REAPER regression suite,
+including a `delete_track` data-loss bug. **The bridge changed — reinstall
+`reaper_mcp_bridge.lua` in REAPER to pick up the `track_fx_get_name` and
+`set_midi_note_velocity` fixes.**
+
+### Fixed
+- **`delete_track` deleted the wrong track (data loss).** It sent a spurious leading `0` to the
+  bridge `DeleteTrack` handler, which reads its first argument as the track index — so it always
+  deleted **track 0**, ignoring the index passed. Now sends the index directly. Found by the
+  live-REAPER test suite.
+- `insert_track`'s `name` argument silently did nothing (the same leading-`0` mistake in its
+  `GetSetMediaTrackInfo_String` call named track 0 with a bogus field). Now names the inserted
+  track correctly.
+- `track_fx_get_name` returned an error instead of the FX name. Its bridge handler required 4
+  arguments while the tool sends 3 (the 4th, buffer size, is optional and defaults to 256); the
+  handler now requires 2 (track + fx index), matching its own error message and the take-FX
+  equivalent. Found by the new live-REAPER test suite.
+- `set_midi_note_velocity` never worked: it sent raw indices through `MIDI_SetNote` (which the
+  bridge passed straight to an API expecting a take pointer) and its five `None` placeholder
+  arguments collapsed below the handler's arg-count guard. Now routes through a new
+  `SetMIDINoteVelocity` bridge handler that resolves the MIDI take and sets only the velocity.
+
 ## [1.4.0] - 2026-06-16
 
 ### Added — ReaEQ band control (5 tools)

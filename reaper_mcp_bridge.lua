@@ -2747,7 +2747,7 @@ local function process_request()
                     
                     elseif fname == "TrackFX_GetFXName" then
                         -- Get FX name
-                        if #args >= 4 then
+                        if #args >= 2 then
                             local track = nil
                             if type(args[1]) == "number" then
                                 if args[1] == -1 then
@@ -3965,6 +3965,23 @@ local function process_request()
                             end
                         else
                             response.error = "GetItemInfo requires 2 arguments (track, item)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "SetMIDINoteVelocity" then
+                        -- args: track_index, item_index, note_index, velocity
+                        if #args >= 4 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if take then
+                                local ok = reaper.MIDI_SetNote(take, args[3], nil, nil, nil, nil, nil, nil, args[4], false)
+                                response.ok = ok
+                                response.ret = ok
+                            else
+                                response.error = err
+                                response.ok = false
+                            end
+                        else
+                            response.error = "SetMIDINoteVelocity requires 4 arguments (track, item, note, velocity)"
                             response.ok = false
                         end
 
