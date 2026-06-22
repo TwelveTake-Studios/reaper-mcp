@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "twelvetake-reaper-mcp"
-version = "1.4.2"
+version = "1.5.0"
 description = "MCP server for controlling REAPER DAW - mixing, mastering, MIDI composition, and full music production"
 readme = "README.md"
 license = "MIT"
@@ -51,6 +51,9 @@ dependencies = [
 dev = [
     "pytest>=7.0",
     "ruff>=0.1",
+    # Embedded Lua, for the headless bridge-encoder regression test (tests/test_bridge_encoder.py).
+    # Skipped automatically where unavailable, so its absence never fails the suite.
+    "lupa>=2.0",
 ]
 
 [project.urls]

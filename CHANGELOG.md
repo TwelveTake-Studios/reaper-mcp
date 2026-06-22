@@ -5,6 +5,23 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.5.0] - 2026-06-22
+
+Wire-contract fix. **The bridge changed; reinstall `reaper_mcp_bridge.lua` in REAPER** so empty
+list responses serialize correctly. Shipped as a minor (not a patch) because it changes the JSON
+shape of responses.
+
+### Fixed
+- Empty list fields serialized as `{}` (a JSON object) instead of `[]`. The bridge JSON encoder
+  inferred array-ness from `#v > 0`, which is false for an empty table, so any empty list response
+  came back as an object — affecting `fx_names`, `tracks`, `items`, `markers`, `regions`, `takes`,
+  MIDI `notes`, envelope `points`, MIDI `distribution`, and the empty results of `get_markers` /
+  `get_regions` / `get_selected_tracks` / `get_selected_items`. Strict consumers that type-check or
+  compare `== []` broke on the wrong shape. Fixed with an array-marker metatable (`as_array`) so
+  tagged tables always encode as arrays even when empty; all 20 array-construction sites that can
+  reach the client empty are tagged. The change is additive — unmarked empty tables still encode as
+  `{}`, so genuine objects are unaffected. Covered by a new headless encoder regression test.
+
 ## [1.4.2] - 2026-06-19
 
 Bug-fix release. **The bridge changed; reinstall `reaper_mcp_bridge.lua` in REAPER for the
@@ -210,6 +227,10 @@ Total tools: **130**.
 - File-based communication bridge (default) plus optional HTTP mode
   (Lua and Python in-REAPER servers).
 
+[1.5.0]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.5.0
+[1.4.2]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.4.2
+[1.4.1]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.4.1
+[1.4.0]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.4.0
 [1.3.2]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.3.2
 [1.3.1]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.3.1
 [1.3.0]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.3.0

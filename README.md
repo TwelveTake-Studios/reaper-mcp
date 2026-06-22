@@ -2,7 +2,7 @@
 
 A [TwelveTake Studios](https://twelvetake.com) project.
 
-[![Tools](https://img.shields.io/badge/tools-135-blue)](https://github.com/TwelveTake/reaper-mcp)
+[![Tools](https://img.shields.io/badge/tools-163-blue)](https://github.com/TwelveTake/reaper-mcp)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow)](https://buymeacoffee.com/twelvetake)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-ff5e5b)](https://ko-fi.com/twelvetake)
 
@@ -10,7 +10,7 @@ A comprehensive Model Context Protocol (MCP) server that enables AI assistants t
 
 Built by a working producer with 7+ albums released. These aren't theoretical tools—they're battle-tested in real sessions.
 
-**Version:** 1.3.2
+**Version:** 1.5.0
 
 ## Why This Server
 
