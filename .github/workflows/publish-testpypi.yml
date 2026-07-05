@@ -1,0 +1,39 @@
+name: Publish to TestPyPI
+
+# Rehearse a release on TestPyPI (https://test.pypi.org) via Trusted Publishing (OIDC) -
+# no stored token. MANUAL only: run this before a real release to sanity-check the build,
+# metadata, and upload flow end to end. Bump the version first (TestPyPI is immutable too,
+# so a given version can only be uploaded once).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  testpypi:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write        # required for TestPyPI Trusted Publishing (OIDC)
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Build sdist + wheel
+        run: |
+          python -m pip install --upgrade build
+          python -m build
+
+      - name: Check metadata
+        run: |
+          python -m pip install --upgrade twine
+          python -m twine check dist/*
+
+      - name: Publish to TestPyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+        with:
+          repository-url: https://test.pypi.org/legacy/
