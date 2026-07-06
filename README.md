@@ -8,9 +8,7 @@ A [TwelveTake Studios](https://twelvetake.com) project.
 
 A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control REAPER DAW for mixing, mastering, MIDI composition, and full music production workflows.
 
-Built by a working producer with 7+ albums released. These aren't theoretical tools—they're battle-tested in real sessions.
-
-**Version:** 1.5.0
+**Version:** 1.5.1
 
 ## Why This Server
 
