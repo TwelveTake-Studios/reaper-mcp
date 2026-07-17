@@ -9,18 +9,19 @@ A TwelveTake Studios project - https://twelvetake.com
 
 Author: TwelveTake Studios LLC
 License: MIT
-Version: 1.5.1
+Version: 1.6.0
 """
 
-__version__ = "1.5.1"
+__version__ = "1.6.0"
 
 import os
 import asyncio
 import json
 import math
+import random
 import time
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Union
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
@@ -1526,6 +1527,776 @@ async def set_midi_note_velocity(
     # raw MIDI_SetNote path passed indices where a take pointer is required and collapsed
     # its None args, so it never worked.
     return await reaper_call("SetMIDINoteVelocity", track_index, item_index, note_index, velocity)
+
+
+# --- v1.6.0 MIDI UTILITIES (note transforms) ---
+
+def _midi_note_filter(
+    pitch_low: Optional[int] = 0,
+    pitch_high: Optional[int] = 127,
+    start_beat: Optional[float] = None,
+    end_beat: Optional[float] = None,
+    channel: Optional[int] = -1,
+) -> dict:
+    """Build the shared v1.6.0 note-filter object, omit-when-unbounded.
+
+    Only constraining values are included; a missing key means "unbounded/all" on the
+    bridge side. This avoids positional nulls and sentinel magic numbers — a real
+    negative ``start_beat`` stays expressible, and all-defaults sends ``{}``.
+    """
+    filt: dict = {}
+    if pitch_low is not None and pitch_low != 0:
+        filt["pitch_low"] = pitch_low
+    if pitch_high is not None and pitch_high != 127:
+        filt["pitch_high"] = pitch_high
+    if start_beat is not None:
+        filt["start_beat"] = start_beat
+    if end_beat is not None:
+        filt["end_beat"] = end_beat
+    if channel is not None and channel != -1:
+        filt["channel"] = channel
+    return filt
+
+
+@mcp.tool()
+async def transpose_midi_notes(
+    track_index: int,
+    item_index: int,
+    semitones: int,
+    pitch_low: int = 0,
+    pitch_high: int = 127,
+    start_beat: Optional[float] = None,
+    end_beat: Optional[float] = None,
+    channel: int = -1,
+) -> dict:
+    """
+    Transpose MIDI notes by a number of semitones (octave = 12).
+
+    Operates on the active take of (track_index, item_index). By default every note is
+    shifted; narrow the target with the optional value filter (pitch range, an onset
+    window in beats-from-item-start, channel). A note pushed outside 0-127 is left at its
+    original pitch and counted in `skipped` — never clamped, never dropped.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Item index (0-based) on the track.
+        semitones: Signed semitone shift (12 = up an octave, -12 = down). 0 = no-op.
+        pitch_low: Only transpose notes with original pitch >= this (0-127, inclusive).
+        pitch_high: Only transpose notes with original pitch <= this (0-127, inclusive).
+        start_beat: Only notes whose onset is at/after this beat from item start.
+        end_beat: Only notes whose onset is at/before this beat from item start.
+        channel: Only this MIDI channel (0-15); -1 = all channels.
+
+    Returns:
+        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]} — the full note
+        list after the transform (note indices re-sync after the internal sort).
+    """
+    if track_index < 0 or item_index < 0:
+        return {"ok": False, "error": "track_index and item_index must be >= 0"}
+    if channel != -1 and not (0 <= channel <= 15):
+        return {"ok": False, "error": "channel must be -1 (all) or 0-15"}
+    if not (0 <= pitch_low <= 127) or not (0 <= pitch_high <= 127):
+        return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
+    filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
+    return await reaper_call("TransposeMIDINotes", track_index, item_index, int(round(semitones)), filt)
+
+
+@mcp.tool()
+async def nudge_midi_notes(
+    track_index: int,
+    item_index: int,
+    amount_beats: float,
+    pitch_low: int = 0,
+    pitch_high: int = 127,
+    start_beat: Optional[float] = None,
+    end_beat: Optional[float] = None,
+    channel: int = -1,
+) -> dict:
+    """
+    Shift MIDI notes in time by a number of beats (+ = later, - = earlier).
+
+    Each matched note's start and end move by the same amount, so note lengths are
+    preserved. Notes pushed before the item start or past the item end are kept (never
+    clamped) and reported in `out_of_bounds`. Narrow the target with the optional value
+    filter (pitch range, an onset window in beats-from-item-start, channel).
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Item index (0-based) on the track.
+        amount_beats: Signed beat shift (0.25 = a 16th later, -1.0 = a beat earlier). 0 = no-op.
+        pitch_low: Only nudge notes with pitch >= this (0-127, inclusive).
+        pitch_high: Only nudge notes with pitch <= this (0-127, inclusive).
+        start_beat: Only notes whose onset is at/after this beat from item start.
+        end_beat: Only notes whose onset is at/before this beat from item start.
+        channel: Only this MIDI channel (0-15); -1 = all channels.
+
+    Returns:
+        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
+    """
+    if track_index < 0 or item_index < 0:
+        return {"ok": False, "error": "track_index and item_index must be >= 0"}
+    if channel != -1 and not (0 <= channel <= 15):
+        return {"ok": False, "error": "channel must be -1 (all) or 0-15"}
+    if not (0 <= pitch_low <= 127) or not (0 <= pitch_high <= 127):
+        return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
+    filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
+    return await reaper_call("NudgeMIDINotes", track_index, item_index, float(amount_beats), filt)
+
+
+@mcp.tool()
+async def get_selected_midi_notes(track_index: int, item_index: int) -> dict:
+    """
+    Read the MIDI notes currently SELECTED in REAPER's editor for the active take.
+
+    The escape hatch for "operate on what I've selected": select notes by hand in REAPER,
+    call this to see which they are, then translate that into an explicit value filter
+    (pitch range / beat window / channel) for the transform tools. Read-only, no undo.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Item index (0-based) on the track.
+
+    Returns:
+        {ok, notes:[...], ret} — the selected notes, same shape as get_midi_notes (each note
+        carries item-relative start_beat/end_beat). `index` is REAPER's absolute PPQ-sorted
+        note index, so a partial selection is non-contiguous. Empty selection -> notes:[].
+    """
+    if track_index < 0 or item_index < 0:
+        return {"ok": False, "error": "track_index and item_index must be >= 0"}
+    return await reaper_call("GetSelectedMIDINotes", track_index, item_index)
+
+
+@mcp.tool()
+async def set_midi_note(
+    track_index: int,
+    item_index: int,
+    note_index: int,
+    pitch: Optional[int] = None,
+    start_beat: Optional[float] = None,
+    length_beats: Optional[float] = None,
+    channel: Optional[int] = None,
+) -> dict:
+    """
+    Edit one existing MIDI note in place, addressed by its index.
+
+    The per-note editor: change a single note's pitch, start (beats from item start),
+    length, and/or channel. Only the fields you pass change; the rest are left as-is. At
+    least one field is required. (Velocity is set with set_midi_note_velocity, not here.)
+
+    `note_index` is REAPER's PPQ-sorted note index from get_midi_notes / get_selected_midi_notes
+    and is UNSTABLE — re-read after the edit, since the returned list reflects the new order.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Item index (0-based) on the track.
+        note_index: Note to edit (0-based, PPQ-sort order).
+        pitch: New pitch (0-127). Out of range -> error, no write.
+        start_beat: New start in beats from item start (moves the note; length preserved). A
+            value before the item start clamps there (REAPER floors notes at the item start),
+            reported in out_of_bounds.
+        length_beats: New length in beats (> 0; resizes from the current start). <= 0 -> error.
+        channel: New MIDI channel (0-15). Out of range -> error.
+
+    Returns:
+        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]} on success, or
+        {ok:false, error} for a bad index / empty edit / invalid value (no write).
+    """
+    if track_index < 0 or item_index < 0 or note_index < 0:
+        return {"ok": False, "error": "track_index, item_index, note_index must be >= 0"}
+    # The bridge validates these too (valid_pitch / valid_channel / valid_length) and that stays
+    # as defense in depth -- but the docstring promises "out of range -> error, no write", and a
+    # promise the caller can only collect on after a round-trip is a slower promise. Reject here.
+    if pitch is not None and not (0 <= pitch <= 127):
+        return {"ok": False, "error": "pitch must be 0-127"}
+    if channel is not None and not (0 <= channel <= 15):
+        return {"ok": False, "error": "channel must be 0-15"}
+    if length_beats is not None and not (math.isfinite(length_beats) and length_beats > 0):
+        return {"ok": False, "error": "length_beats must be a finite number > 0"}
+    if start_beat is not None and not math.isfinite(start_beat):
+        return {"ok": False, "error": "start_beat must be a finite number of beats"}
+    edits: dict = {}
+    if pitch is not None:
+        edits["pitch"] = pitch
+    if start_beat is not None:
+        edits["start_beat"] = start_beat
+    if length_beats is not None:
+        edits["length_beats"] = length_beats
+    if channel is not None:
+        edits["channel"] = channel
+    if not edits:
+        return {"ok": False, "error": "set_midi_note needs at least one of pitch/start_beat/length_beats/channel"}
+    return await reaper_call("SetMIDINote", track_index, item_index, note_index, edits)
+
+
+@mcp.tool()
+async def ramp_midi_note_velocities(
+    track_index: int,
+    item_index: int,
+    start_velocity: int,
+    end_velocity: int,
+    pitch_low: int = 0,
+    pitch_high: int = 127,
+    start_beat: Optional[float] = None,
+    end_beat: Optional[float] = None,
+    channel: int = -1,
+) -> dict:
+    """
+    Apply a linear velocity ramp (crescendo / decrescendo) across MIDI notes.
+
+    Velocities interpolate by each note's onset: the earliest note in the filtered set gets
+    start_velocity, the latest gets end_velocity, everything between is linear. Notes sharing
+    an onset (a chord) get the same velocity. Results clamp to 1-127 (reported in `clamped`).
+    Narrow the target with the optional filter (pitch range, onset window, channel).
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Item index (0-based) on the track.
+        start_velocity: Velocity at the earliest onset (1-127; out of range clamps, not rejected).
+        end_velocity: Velocity at the latest onset (1-127). May be below start (decrescendo).
+        pitch_low: Only ramp notes with pitch >= this (0-127, inclusive).
+        pitch_high: Only ramp notes with pitch <= this (0-127, inclusive).
+        start_beat: Only notes whose onset is at/after this beat from item start.
+        end_beat: Only notes whose onset is at/before this beat from item start.
+        channel: Only this MIDI channel (0-15); -1 = all channels.
+
+    Returns:
+        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
+    """
+    if track_index < 0 or item_index < 0:
+        return {"ok": False, "error": "track_index and item_index must be >= 0"}
+    if channel != -1 and not (0 <= channel <= 15):
+        return {"ok": False, "error": "channel must be -1 (all) or 0-15"}
+    if not (0 <= pitch_low <= 127) or not (0 <= pitch_high <= 127):
+        return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
+    filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
+    return await reaper_call("RampMIDINoteVelocities", track_index, item_index,
+                             int(start_velocity), int(end_velocity), filt)
+
+
+@mcp.tool()
+async def scale_midi_note_velocities(
+    track_index: int,
+    item_index: int,
+    mode: str = "multiply",
+    ratio: float = 1.0,
+    value: int = 100,
+    pivot: int = -1,
+    pitch_low: Optional[int] = None,
+    pitch_high: Optional[int] = None,
+    start_beat: Optional[float] = None,
+    end_beat: Optional[float] = None,
+    channel: Optional[int] = None,
+) -> dict:
+    """
+    Scale MIDI note velocities: multiply, set to a fixed value, or compress toward a pivot.
+
+    - multiply: new = velocity * ratio (ratio >= 0, no upper cap; results clamp to 1-127).
+    - set: every matched note's velocity becomes `value` (1-127).
+    - compress: pull velocities toward a pivot — new = pivot + (velocity - pivot) * ratio, with
+      ratio in [0,1] (0 collapses to the pivot, 1 = unchanged). Use multiply to boost.
+      pivot -1 (default) auto-picks the rounded mean of the filtered notes' velocities.
+
+    Narrow the target with the optional filter (pitch range, onset window, channel).
+
+    Args:
+        track_index / item_index: 0-based; active take must be MIDI.
+        mode: "multiply" | "set" | "compress".
+        ratio: multiply/compress factor (see above).
+        value: target velocity for `set` mode (1-127).
+        pivot: compress pivot (1-127), or -1 to auto-pick the filtered mean.
+        pitch_low / pitch_high: pitch filter (0-127, inclusive).
+        start_beat / end_beat: onset window in beats from item start.
+        channel: MIDI channel (0-15); None/-1 = all.
+
+    Returns:
+        {ok, notes_changed, clamped, skipped, out_of_bounds, pivot_used, notes:[...]}.
+    """
+    if track_index < 0 or item_index < 0:
+        return {"ok": False, "error": "track_index and item_index must be >= 0"}
+    if mode not in ("multiply", "set", "compress"):
+        return {"ok": False, "error": "mode must be 'multiply', 'set', or 'compress'"}
+    if mode == "multiply" and not (math.isfinite(ratio) and ratio >= 0):
+        return {"ok": False, "error": "multiply ratio must be a finite number >= 0"}
+    if mode == "compress" and not (math.isfinite(ratio) and 0.0 <= ratio <= 1.0):
+        return {"ok": False, "error": "compress ratio must be in [0.0, 1.0] (use multiply to boost)"}
+    if mode == "set" and not (1 <= value <= 127):
+        return {"ok": False, "error": "set value must be 1-127"}
+    if pivot != -1 and not (1 <= pivot <= 127):
+        return {"ok": False, "error": "pivot must be 1-127 or -1 (auto)"}
+    if channel is not None and channel != -1 and not (0 <= channel <= 15):
+        return {"ok": False, "error": "channel must be -1 (all) or 0-15"}
+    pl = 0 if pitch_low is None else pitch_low
+    ph = 127 if pitch_high is None else pitch_high
+    if not (0 <= pl <= 127) or not (0 <= ph <= 127):
+        return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
+    filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
+    return await reaper_call("ScaleMIDINoteVelocities", track_index, item_index,
+                             mode, float(ratio), int(value), int(pivot), filt)
+
+
+@mcp.tool()
+async def strum_midi_notes(
+    track_index: int,
+    item_index: int,
+    spread_beats: float,
+    direction: str = "up",
+    chord_window_beats: float = 0.0,
+    pitch_low: Optional[int] = None,
+    pitch_high: Optional[int] = None,
+    start_beat: Optional[float] = None,
+    end_beat: Optional[float] = None,
+    channel: Optional[int] = None,
+) -> dict:
+    """
+    Strum chords: stagger the onsets of simultaneous notes so each chord rolls out.
+
+    Notes sharing an onset (a chord) are spread over `spread_beats` (total first-to-last span);
+    `up` strikes the lowest note first, `down` the highest. Only re-times existing notes (invents
+    nothing); note lengths are preserved. Narrow the target with the optional filter.
+
+    Args:
+        track_index / item_index: 0-based; active take must be MIDI.
+        spread_beats: Total first-to-last onset span within each chord (>= 0; 0 = no-op).
+        direction: "up" (lowest first) or "down" (highest first).
+        chord_window_beats: Onset tolerance for grouping notes into a chord (0 = exact same onset).
+        pitch_low / pitch_high: pitch filter (0-127, inclusive).
+        start_beat / end_beat: onset window in beats from item start.
+        channel: MIDI channel (0-15); None/-1 = all.
+
+    Returns:
+        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
+    """
+    if track_index < 0 or item_index < 0:
+        return {"ok": False, "error": "track_index and item_index must be >= 0"}
+    if direction not in ("up", "down"):
+        return {"ok": False, "error": "direction must be 'up' or 'down'"}
+    if not (math.isfinite(spread_beats) and spread_beats >= 0):
+        return {"ok": False, "error": "spread_beats must be a finite number >= 0"}
+    if not (math.isfinite(chord_window_beats) and chord_window_beats >= 0):
+        return {"ok": False, "error": "chord_window_beats must be a finite number >= 0"}
+    if channel is not None and channel != -1 and not (0 <= channel <= 15):
+        return {"ok": False, "error": "channel must be -1 (all) or 0-15"}
+    pl = 0 if pitch_low is None else pitch_low
+    ph = 127 if pitch_high is None else pitch_high
+    if not (0 <= pl <= 127) or not (0 <= ph <= 127):
+        return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
+    filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
+    return await reaper_call("StrumMIDINotes", track_index, item_index,
+                             float(spread_beats), direction, float(chord_window_beats), filt)
+
+
+# Scale names the bridge's MODE_INTERVALS table accepts (documented here for the tool
+# docstring; the bridge stays the single source of truth and rejects an unknown name).
+_SCALE_MODES = ("major", "minor", "harmonic_minor", "melodic_minor", "dorian", "phrygian",
+                "lydian", "mixolydian", "locrian", "major_pentatonic", "minor_pentatonic",
+                "blues", "whole_tone", "chromatic", "ionian", "aeolian", "natural_minor")
+
+
+@mcp.tool()
+async def snap_midi_notes_to_scale(
+    track_index: int,
+    item_index: int,
+    root: int,
+    mode: Union[str, List[int]] = "major",
+    direction: str = "nearest",
+    pitch_low: Optional[int] = None,
+    pitch_high: Optional[int] = None,
+    start_beat: Optional[float] = None,
+    end_beat: Optional[float] = None,
+    channel: int = -1,
+) -> dict:
+    """
+    Snap off-key MIDI notes onto a scale (fix a wrong note, force a part into a key).
+
+    Notes already in the scale are left alone. Each off-scale note moves to the nearest
+    in-scale pitch; with `nearest`, a tie (the note sits exactly between two scale tones)
+    resolves toward the middle of the selection, which keeps a line from drifting. A note
+    with no in-scale pitch left inside 0-127 is left where it is and counted in `skipped`
+    — it is never dropped and never wrapped to another octave.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Item index (0-based) on the track.
+        root: Root pitch class, 0-11 (0=C, 1=C#, 2=D ... 11=B).
+        mode: Scale name — one of major, minor, harmonic_minor, melodic_minor, dorian,
+            phrygian, lydian, mixolydian, locrian, major_pentatonic, minor_pentatonic,
+            blues, whole_tone, chromatic (aliases: ionian, aeolian, natural_minor) — OR a
+            custom list of semitone intervals from the root, each 0-11 (e.g. [0,2,4,7,9]).
+        direction: "nearest" (closest scale tone), "up" (only upward), "down" (only downward).
+            `up`/`down` never fall back to the other direction; they skip instead.
+        pitch_low: Only snap notes with pitch >= this (0-127, inclusive). None = no bound.
+        pitch_high: Only snap notes with pitch <= this (0-127, inclusive). None = no bound.
+        start_beat: Only notes whose onset is at/after this beat from item start.
+        end_beat: Only notes whose onset is at/before this beat from item start.
+        channel: Only this MIDI channel (0-15); -1 = all channels.
+
+    Returns:
+        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]} — the full note
+        list after the transform (note indices re-sync after the internal sort).
+    """
+    if track_index < 0 or item_index < 0:
+        return {"ok": False, "error": "track_index and item_index must be >= 0"}
+    if not isinstance(root, int) or isinstance(root, bool) or not (0 <= root <= 11):
+        return {"ok": False, "error": "root must be a pitch class 0-11 (0=C, 1=C#, ... 11=B)"}
+    if direction not in ("nearest", "up", "down"):
+        return {"ok": False, "error": "direction must be 'nearest', 'up' or 'down'"}
+    if isinstance(mode, list):
+        if not mode:
+            return {"ok": False, "error": "mode list must not be empty"}
+        for iv in mode:
+            if not isinstance(iv, int) or isinstance(iv, bool) or not (0 <= iv <= 11):
+                return {"ok": False, "error": "mode list entries must be integers 0-11 (semitones from root)"}
+    elif not isinstance(mode, str):
+        return {"ok": False, "error": "mode must be a scale name or a list of intervals 0-11"}
+    if channel != -1 and not (0 <= channel <= 15):
+        return {"ok": False, "error": "channel must be -1 (all) or 0-15"}
+    if pitch_low is not None and not (0 <= pitch_low <= 127):
+        return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
+    if pitch_high is not None and not (0 <= pitch_high <= 127):
+        return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
+    filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
+    return await reaper_call("SnapMIDINotesToScale", track_index, item_index,
+                             int(root), mode, direction, filt)
+
+
+@mcp.tool()
+async def quantize_midi_notes(
+    track_index: int,
+    item_index: int,
+    grid: float = 0.25,
+    strength: float = 1.0,
+    swing: float = 0.0,
+    pitch_low: int = 0,
+    pitch_high: int = 127,
+    start_beat: Optional[float] = None,
+    end_beat: Optional[float] = None,
+    channel: int = -1,
+) -> dict:
+    """
+    Quantize MIDI note onsets onto the grid (tighten sloppy timing, add swing).
+
+    Onsets snap to the PROJECT bar/beat grid, so notes land where the ruler says a 16th is —
+    not at an offset from the item's own start. Note lengths are preserved: start and end move
+    together. Use `strength` to tighten only part of the way and keep some human feel, and
+    `swing` to push the off-beats late for a shuffle. Notes pushed past the item end are kept
+    and reported in `out_of_bounds`; a note that would land before the item start is placed at
+    the item start instead (REAPER refuses anything earlier) and also reported there.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Item index (0-based) on the track.
+        grid: Grid spacing in beats — 0.25 = 1/16, 0.5 = 1/8, 1.0 = 1/4. Must be > 0.
+        strength: 0.0-1.0. 1.0 snaps exactly onto the grid; 0.5 moves each note halfway there;
+            0.0 is a no-op.
+        swing: 0.0-1.0. 0.0 = straight; 1.0 = full triplet feel (off-beats at 66.7%); values
+            between scale linearly. Only the off-beat (odd) grid cells are delayed.
+        pitch_low: Only quantize notes with pitch >= this (0-127, inclusive).
+        pitch_high: Only quantize notes with pitch <= this (0-127, inclusive).
+        start_beat: Only notes whose onset is at/after this beat from item start.
+        end_beat: Only notes whose onset is at/before this beat from item start.
+        channel: Only this MIDI channel (0-15); -1 = all channels.
+
+    Returns:
+        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
+    """
+    if track_index < 0 or item_index < 0:
+        return {"ok": False, "error": "track_index and item_index must be >= 0"}
+    if not (math.isfinite(grid) and grid > 0):
+        return {"ok": False, "error": "grid must be a finite number > 0 (beats; 0.25 = 1/16)"}
+    if not (math.isfinite(strength) and 0.0 <= strength <= 1.0):
+        return {"ok": False, "error": "strength must be 0.0-1.0"}
+    if not (math.isfinite(swing) and 0.0 <= swing <= 1.0):
+        return {"ok": False, "error": "swing must be 0.0-1.0"}
+    if channel != -1 and not (0 <= channel <= 15):
+        return {"ok": False, "error": "channel must be -1 (all) or 0-15"}
+    if not (0 <= pitch_low <= 127) or not (0 <= pitch_high <= 127):
+        return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
+    filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
+    return await reaper_call("QuantizeMIDINotes", track_index, item_index,
+                             float(grid), float(strength), float(swing), filt)
+
+
+@mcp.tool()
+async def stretch_midi_notes(
+    track_index: int,
+    item_index: int,
+    factor: float,
+    pivot_beat: Optional[float] = None,
+    pitch_low: int = 0,
+    pitch_high: int = 127,
+    start_beat: Optional[float] = None,
+    end_beat: Optional[float] = None,
+    channel: int = -1,
+) -> dict:
+    """
+    Stretch or compress MIDI timing (half-time, double-time, or any ratio).
+
+    Each targeted note scales as a rigid unit about one fixed pivot: its distance from the
+    pivot AND its length both multiply by `factor`, so the phrase's rhythm is preserved while
+    its overall speed changes. 2.0 = half-time (twice as long), 0.5 = double-time. The pivot
+    stays put; by default it is the first targeted note, so a phrase grows or shrinks away from
+    its own downbeat.
+
+    Notes pushed past the item end are kept and reported in `out_of_bounds` (the item is not
+    auto-extended). A note pushed before the item start is placed at the item start — REAPER
+    refuses anything earlier — keeping its scaled end, so it comes out shorter than `factor`
+    alone implies; it is reported in `out_of_bounds` too.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Item index (0-based) on the track.
+        factor: Time scale ratio, must be > 0. 2.0 = twice as long/slow, 0.5 = half/fast.
+        pivot_beat: The fixed point, in beats from item start. None = the earliest targeted
+            onset. May be negative, and may sit outside the targeted notes.
+        pitch_low: Only stretch notes with pitch >= this (0-127, inclusive).
+        pitch_high: Only stretch notes with pitch <= this (0-127, inclusive).
+        start_beat: Only notes whose onset is at/after this beat from item start.
+        end_beat: Only notes whose onset is at/before this beat from item start.
+        channel: Only this MIDI channel (0-15); -1 = all channels.
+
+    Returns:
+        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
+    """
+    if track_index < 0 or item_index < 0:
+        return {"ok": False, "error": "track_index and item_index must be >= 0"}
+    if not (math.isfinite(factor) and factor > 0):
+        return {"ok": False, "error": "factor must be a finite number > 0 (2.0 = twice as long)"}
+    if pivot_beat is not None and not math.isfinite(pivot_beat):
+        return {"ok": False, "error": "pivot_beat must be a finite number of beats, or omitted"}
+    if channel != -1 and not (0 <= channel <= 15):
+        return {"ok": False, "error": "channel must be -1 (all) or 0-15"}
+    if not (0 <= pitch_low <= 127) or not (0 <= pitch_high <= 127):
+        return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
+    # one trailing object carries the filter AND pivot_beat: the bridge's note_in_filter reads
+    # only its own 5 keys and ignores the extra, so a second object would buy nothing.
+    opts = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
+    if pivot_beat is not None:
+        opts["pivot_beat"] = float(pivot_beat)
+    return await reaper_call("StretchMIDINotes", track_index, item_index, float(factor), opts)
+
+
+@mcp.tool()
+async def legato_midi_notes(
+    track_index: int,
+    item_index: int,
+    mode: str = "connect",
+    voice: str = "chordal",
+    max_gap_beats: float = 4.0,
+    length_beats: float = 1.0,
+    pitch_low: Optional[int] = None,
+    pitch_high: Optional[int] = None,
+    start_beat: Optional[float] = None,
+    end_beat: Optional[float] = None,
+    channel: int = -1,
+) -> dict:
+    """
+    Close the gaps in a MIDI line (legato), or set every note to one length.
+
+    Only note ENDS move — starts are never touched, so the rhythm of the part is preserved.
+
+    `connect` runs each note's end forward to the next note's onset, so the line plays
+    seamlessly. A note that already reaches (or overlaps) the next one is left alone — this
+    never shortens anything. A gap wider than `max_gap_beats` is treated as a rest you meant
+    to be there: left alone and counted in `gaps_preserved`. The last note is left alone.
+
+    `fixed` ignores all that and simply sets every targeted note's length to `length_beats`.
+
+    Notes whose new end passes the item end are kept and reported in `out_of_bounds`.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Item index (0-based) on the track.
+        mode: "connect" (extend each end to the next onset) or "fixed" (set every length).
+        voice: connect only. "chordal" extends to the next onset of any note, so a chord's
+            notes move together; "per_pitch" extends to the next note of the SAME pitch and
+            channel, which keeps interleaved voices independent.
+        max_gap_beats: connect only. Gaps wider than this are left as rests (>= 0).
+        length_beats: fixed only. The length every targeted note is set to (> 0).
+        pitch_low: Only affect notes with pitch >= this (0-127, inclusive). None = no bound.
+        pitch_high: Only affect notes with pitch <= this (0-127, inclusive). None = no bound.
+        start_beat: Only notes whose onset is at/after this beat from item start.
+        end_beat: Only notes whose onset is at/before this beat from item start.
+        channel: Only this MIDI channel (0-15); -1 = all channels.
+
+    Returns:
+        {ok, notes_changed, clamped, skipped, out_of_bounds, gaps_preserved, notes:[...]}.
+    """
+    if track_index < 0 or item_index < 0:
+        return {"ok": False, "error": "track_index and item_index must be >= 0"}
+    if mode not in ("connect", "fixed"):
+        return {"ok": False, "error": "mode must be 'connect' or 'fixed'"}
+    if voice not in ("chordal", "per_pitch"):
+        return {"ok": False, "error": "voice must be 'chordal' or 'per_pitch'"}
+    if not (math.isfinite(max_gap_beats) and max_gap_beats >= 0):
+        return {"ok": False, "error": "max_gap_beats must be a finite number >= 0"}
+    if not (math.isfinite(length_beats) and length_beats > 0):
+        return {"ok": False, "error": "length_beats must be a finite number > 0"}
+    if channel != -1 and not (0 <= channel <= 15):
+        return {"ok": False, "error": "channel must be -1 (all) or 0-15"}
+    pl = 0 if pitch_low is None else pitch_low
+    ph = 127 if pitch_high is None else pitch_high
+    if not (0 <= pl <= 127) or not (0 <= ph <= 127):
+        return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
+    filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
+    return await reaper_call("LegatoMIDINotes", track_index, item_index, mode, voice,
+                             float(max_gap_beats), float(length_beats), filt)
+
+
+# Offsets are rounded to this many decimals before they cross the wire. Not cosmetic: the
+# bridge's hand-rolled JSON decoder matches numbers with `^%-?%d+%.?%d*$`, which rejects
+# scientific notation -- and a gaussian draw under 1e-4 serializes as e.g. "1.2e-05", decodes
+# to nil, and silently collapses the whole offsets array (a hole breaks Lua's `#`). At sigma
+# 0.02 that is ~0.4% per note, so a 100-note take hits it about a third of the time. Rounding
+# to 1e-4 makes every value a plain decimal; the cost is a tenth of a tick at 960 PPQ, which
+# the bridge's tick rounding discards anyway.
+_WIRE_DECIMALS = 4
+
+
+@mcp.tool()
+async def humanize_midi_notes(
+    track_index: int,
+    item_index: int,
+    timing: float = 0.02,
+    velocity: float = 8.0,
+    seed: int = 0,
+    pitch_low: int = 0,
+    pitch_high: int = 127,
+    start_beat: Optional[float] = None,
+    end_beat: Optional[float] = None,
+    channel: int = -1,
+    max_sigma: float = 2.0,
+) -> dict:
+    """
+    Humanize MIDI: nudge timing and velocity by small random amounts, reproducibly.
+
+    Takes the machine-perfect edge off a programmed part. Each note gets its own random
+    timing and velocity offset drawn from a bell curve, so most notes move a little and a few
+    move more — the way a player does. Note lengths are preserved (start and end move
+    together), and pitches are never touched.
+
+    The randomness is SEEDED and computed here, not in REAPER: the same take with the same
+    seed and settings gives byte-identical results every time. Change `seed` for a different
+    feel; keep it to reproduce one.
+
+    Notes pushed past the item end are kept and reported in `out_of_bounds`; a note pushed
+    before the item start is placed at the item start (REAPER refuses anything earlier),
+    keeping its length, and reported there too. Velocities are clamped to 1-127 and counted
+    in `clamped` — a humanized note never drops to 0 (silent).
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Item index (0-based) on the track.
+        timing: Timing spread in beats (standard deviation). 0.02 is a subtle human feel;
+            0.0 = leave timing alone and only touch velocity.
+        velocity: Velocity spread (standard deviation, in velocity units). 0.0 = timing only.
+        seed: Any integer. Same seed + same settings + same take = same result.
+        pitch_low: Only humanize notes with pitch >= this (0-127, inclusive).
+        pitch_high: Only humanize notes with pitch <= this (0-127, inclusive).
+        start_beat: Only notes whose onset is at/after this beat from item start.
+        end_beat: Only notes whose onset is at/before this beat from item start.
+        channel: Only this MIDI channel (0-15); -1 = all channels.
+        max_sigma: Cap on how far any single note may stray, in multiples of the spread.
+            Stops one freak draw from throwing a note far out of place.
+
+    Returns:
+        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
+    """
+    if track_index < 0 or item_index < 0:
+        return {"ok": False, "error": "track_index and item_index must be >= 0"}
+    if not (math.isfinite(timing) and timing >= 0):
+        return {"ok": False, "error": "timing must be a finite number >= 0 (beats)"}
+    if not (math.isfinite(velocity) and velocity >= 0):
+        return {"ok": False, "error": "velocity must be a finite number >= 0"}
+    if not (math.isfinite(max_sigma) and max_sigma >= 0):
+        return {"ok": False, "error": "max_sigma must be a finite number >= 0"}
+    if channel != -1 and not (0 <= channel <= 15):
+        return {"ok": False, "error": "channel must be -1 (all) or 0-15"}
+    if not (0 <= pitch_low <= 127) or not (0 <= pitch_high <= 127):
+        return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
+
+    # One non-destructive sizing read, then one atomic destructive write.
+    read = await reaper_call("GetMIDINotes", track_index, item_index)
+    if not read.get("ok"):
+        return read
+    count = len(read.get("notes") or [])
+
+    rng = random.Random(seed)
+    t_lim, v_lim = max_sigma * timing, max_sigma * velocity
+    timing_offsets, velocity_offsets = [], []
+    for _ in range(count):
+        # Draw order is pinned -- timing THEN velocity, for EVERY note including filtered-out
+        # ones and including sigma 0 (gauss still consumes its draw). That keeps the stream,
+        # and so the seed -> note mapping, independent of the filter and of the amounts.
+        t = rng.gauss(0.0, timing)
+        v = rng.gauss(0.0, velocity)
+        timing_offsets.append(round(max(-t_lim, min(t_lim, t)), _WIRE_DECIMALS))
+        velocity_offsets.append(round(max(-v_lim, min(v_lim, v)), _WIRE_DECIMALS))
+
+    filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
+    return await reaper_call("HumanizeMIDINotes", track_index, item_index,
+                             timing_offsets, velocity_offsets, filt)
+
+
+# The only v1.6.0 tool that removes notes rather than moving them, so it is the only one
+# carrying destructiveHint -- an MCP client can warn before calling it.
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
+async def remove_overlapping_midi_notes(
+    track_index: int,
+    item_index: int,
+    mode: str = "trim",
+    min_length_beats: float = 0.0078125,
+    pitch_low: int = 0,
+    pitch_high: int = 127,
+    start_beat: Optional[float] = None,
+    end_beat: Optional[float] = None,
+    channel: int = -1,
+) -> dict:
+    """
+    Clean up overlapping MIDI notes (same pitch stacked on itself).
+
+    Two notes only conflict if they share a pitch AND a channel AND actually overlap in time.
+    A chord is never a conflict, the same pitch on two channels is never a conflict, and notes
+    that merely touch (one ends exactly where the next begins) are left alone.
+
+    `trim` (default) is the safe one: it shortens the earlier note so it stops where the next
+    begins. Nothing is lost — the notes just stop fighting. `delete` instead drops one note of
+    each overlapping pair, keeping the louder (ties go to the longer note).
+
+    NOTE: this tool can REMOVE notes. Even in `trim` mode, notes stacked on the exact same
+    onset are collapsed to one (the loudest), because there is nothing to trim between them —
+    and a trim left shorter than `min_length_beats` is removed rather than left as a click.
+    Everything removed is reported in `notes_removed`. It is undoable in REAPER as one step.
+
+    Args:
+        track_index: Track index (0-based).
+        item_index: Item index (0-based) on the track.
+        mode: "trim" (shorten the earlier note) or "delete" (drop the quieter note).
+        min_length_beats: A trimmed note left shorter than this is removed instead of leaving
+            an inaudible click. Default 1/128 of a beat. 0 disables it.
+        pitch_low: Only consider notes with pitch >= this (0-127, inclusive). Notes outside the
+            filter are invisible: never touched, and never counted as an overlap partner.
+        pitch_high: Only consider notes with pitch <= this (0-127, inclusive).
+        start_beat: Only notes whose onset is at/after this beat from item start.
+        end_beat: Only notes whose onset is at/before this beat from item start.
+        channel: Only this MIDI channel (0-15); -1 = all channels.
+
+    Returns:
+        {ok, mode, notes_changed, clamped, skipped, out_of_bounds, notes_removed, trimmed,
+        deduped, deleted, notes:[...]} — `notes_removed` = deduped + deleted.
+    """
+    if track_index < 0 or item_index < 0:
+        return {"ok": False, "error": "track_index and item_index must be >= 0"}
+    if mode not in ("trim", "delete"):
+        return {"ok": False, "error": "mode must be 'trim' or 'delete'"}
+    if not (math.isfinite(min_length_beats) and min_length_beats >= 0):
+        return {"ok": False, "error": "min_length_beats must be a finite number >= 0"}
+    if channel != -1 and not (0 <= channel <= 15):
+        return {"ok": False, "error": "channel must be -1 (all) or 0-15"}
+    if not (0 <= pitch_low <= 127) or not (0 <= pitch_high <= 127):
+        return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
+    filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
+    return await reaper_call("RemoveOverlappingMIDINotes", track_index, item_index,
+                             mode, float(min_length_beats), filt)
 
 
 # --- AUDIO ITEM OPERATIONS ---

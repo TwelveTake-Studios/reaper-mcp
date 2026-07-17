@@ -602,29 +602,6 @@ local function InsertMIDINote(track_index, item_index, pitch, start_ppq, length_
     return {ok = true}
 end
 
--- Quantize item
-local function QuantizeItem(track_index, item_index, strength, grid)
-    local track = reaper.GetTrack(0, track_index)
-    if not track then
-        return {ok = false, error = "Track not found"}
-    end
-    
-    local item = reaper.GetTrackMediaItem(track, item_index)
-    if not item then
-        return {ok = false, error = "Item not found"}
-    end
-    
-    local take = reaper.GetActiveTake(item)
-    if not take or not reaper.TakeIsMIDI(take) then
-        return {ok = false, error = "Not a MIDI take"}
-    end
-    
-    -- Note: This is a simplified quantization
-    -- In practice, you'd use MIDI editor actions or more complex logic
-    -- For now, just return success
-    return {ok = true}
-end
-
 -- Track operations
 local function GetTrackVolume(track_index)
     local track = reaper.GetTrack(0, track_index)
@@ -1018,7 +995,6 @@ DSL_FUNCTIONS = {
     CreateAudioItem = CreateAudioItem,
     SetItemLoopSource = SetItemLoopSource,
     InsertMIDINote = InsertMIDINote,
-    QuantizeItem = QuantizeItem,
     
     -- Track operations
     GetTrackVolume = GetTrackVolume,
@@ -1132,6 +1108,669 @@ local function resolve_midi_take(track_index, item_index)
     end
     return take, nil
 end
+
+-- === v1.6.0 MIDI utilities — shared helpers ==============================
+-- Pure transform seams (no reaper.*), sliced out for headless golden tests.
+-- === MIDI_PURE_BEGIN (sliceable: no reaper.* — headless-testable) ===
+-- note fields used here: {index, startppq, endppq, chan, pitch, vel, selected, muted}.
+-- ctx = {item_start_ppq, ppq_per_qn}. A beat bound b maps to PPQ item_start_ppq + b*ppq_per_qn.
+local function note_in_filter(note, filt, ctx)
+    if note.pitch < (filt.pitch_low or 0) then return false end
+    if note.pitch > (filt.pitch_high or 127) then return false end
+    if filt.channel ~= nil and filt.channel ~= -1 and note.chan ~= filt.channel then return false end
+    if filt.start_beat ~= nil and note.startppq < ctx.item_start_ppq + filt.start_beat * ctx.ppq_per_qn then
+        return false
+    end
+    if filt.end_beat ~= nil and note.startppq > ctx.item_start_ppq + filt.end_beat * ctx.ppq_per_qn then
+        return false
+    end
+    return true
+end
+
+-- transpose: pitch-only, count-preserving. Out-of-range result pitch -> skip (D3).
+local function transpose_notes_pure(notes, semitones, filt, ctx)
+    local changes = {}
+    local notes_changed, skipped = 0, 0
+    for _, n in ipairs(notes) do
+        if note_in_filter(n, filt, ctx) then
+            local np = n.pitch + semitones
+            if np < 0 or np > 127 then
+                skipped = skipped + 1
+            elseif np ~= n.pitch then
+                changes[#changes + 1] = {index = n.index, new_pitch = np}
+                notes_changed = notes_changed + 1
+            end
+        end
+    end
+    return {changes = changes, notes_changed = notes_changed, skipped = skipped}
+end
+
+-- nudge: shift matched notes' start AND end by the same tick delta (length preserved).
+-- Notes moved before item start / past item end are ALLOWED and counted (D10), never clamped.
+local function nudge_notes_pure(notes, delta_ppq, filt, ctx)
+    local changes = {}
+    local notes_changed, out_of_bounds = 0, 0
+    if delta_ppq ~= 0 then
+        for _, n in ipairs(notes) do
+            if note_in_filter(n, filt, ctx) then
+                local len = n.endppq - n.startppq
+                local ns = n.startppq + delta_ppq
+                local oob = false
+                -- REAPER refuses MIDI notes before the item/source start; clamp to it and flag [D10].
+                if ns < ctx.item_start_ppq then
+                    ns = ctx.item_start_ppq
+                    oob = true
+                end
+                local ne = ns + len                             -- length preserved
+                if ne > ctx.item_end_ppq then oob = true end    -- past item end: REAPER allows, just flag
+                if ns ~= n.startppq then                        -- only write notes that actually move
+                    changes[#changes + 1] = {index = n.index, new_start = ns, new_end = ne}
+                    notes_changed = notes_changed + 1
+                end
+                if oob then out_of_bounds = out_of_bounds + 1 end
+            end
+        end
+    end
+    return {changes = changes, notes_changed = notes_changed, out_of_bounds = out_of_bounds}
+end
+
+-- filter to the notes flagged selected in REAPER (order/fields/absolute index preserved).
+local function filter_selected(notes)
+    local out = {}
+    for _, n in ipairs(notes) do
+        if n.selected then out[#out + 1] = n end
+    end
+    return out
+end
+
+-- set_midi_note seams (single-note edit) ----------------------------------
+local function beats_to_take_ppq(beat, item_start_ppq, ppq_per_qn)
+    return item_start_ppq + beat * ppq_per_qn
+end
+local function len_beats_to_ppq(len_beats, ppq_per_qn)
+    return len_beats * ppq_per_qn
+end
+-- move (start only) preserves length; resize (length only) keeps start; both sets both; neither untouched.
+local function compute_note_span(old_start, old_end, new_start_ppq, new_len_ppq)
+    if new_start_ppq and new_len_ppq then
+        return new_start_ppq, new_start_ppq + new_len_ppq
+    elseif new_start_ppq then
+        return new_start_ppq, new_start_ppq + (old_end - old_start)
+    elseif new_len_ppq then
+        return old_start, old_start + new_len_ppq
+    else
+        return old_start, old_end
+    end
+end
+local function note_out_of_bounds(startppq, endppq, item_start_ppq, item_end_ppq)
+    return startppq < item_start_ppq or endppq > item_end_ppq
+end
+local function valid_pitch(p) return type(p) == "number" and p == math.floor(p) and p >= 0 and p <= 127 end
+local function valid_channel(c) return type(c) == "number" and c == math.floor(c) and c >= 0 and c <= 15 end
+local function valid_length(l) return type(l) == "number" and l > 0 end
+
+-- linear velocity ramp keyed on onset: earliest filtered note -> start_vel, latest -> end_vel.
+-- Notes sharing an onset get the same t (chord = one velocity). Result clamped to 1-127 (D3).
+local function midi_ramp_velocities(notes, filt, ctx, start_vel, end_vel)
+    local matched, min_ppq, max_ppq = {}, nil, nil
+    for _, n in ipairs(notes) do
+        if note_in_filter(n, filt, ctx) then
+            matched[#matched + 1] = n
+            if not min_ppq or n.startppq < min_ppq then min_ppq = n.startppq end
+            if not max_ppq or n.startppq > max_ppq then max_ppq = n.startppq end
+        end
+    end
+    local changes, notes_changed, clamped = {}, 0, 0
+    local span = (max_ppq and max_ppq - min_ppq) or 0
+    for _, n in ipairs(matched) do
+        local t = (span > 0) and (n.startppq - min_ppq) / span or 0
+        local nv = math.floor(start_vel + t * (end_vel - start_vel) + 0.5)
+        if nv < 1 then nv = 1; clamped = clamped + 1
+        elseif nv > 127 then nv = 127; clamped = clamped + 1 end
+        if nv ~= n.vel then
+            changes[#changes + 1] = {index = n.index, new_vel = nv}
+            notes_changed = notes_changed + 1
+        end
+    end
+    return {changes = changes, notes_changed = notes_changed, clamped = clamped}
+end
+
+-- scale velocities: multiply / set / compress(-toward-pivot). compress ratio in [0,1] is a
+-- convex blend (never clamps); set is validated (never clamps); only multiply can clamp [1,127].
+-- pivot -1 (compress) = rounded mean of the filtered originals (once, order-independent).
+local function compute_scaled_velocities(notes, opts, filt, ctx)
+    local matched = {}
+    for _, n in ipairs(notes) do
+        if note_in_filter(n, filt, ctx) then matched[#matched + 1] = n end
+    end
+    local pivot_used = opts.pivot
+    if opts.mode == "compress" and opts.pivot == -1 then
+        if #matched == 0 then
+            pivot_used = -1
+        else
+            local sum = 0
+            for _, n in ipairs(matched) do sum = sum + n.vel end
+            pivot_used = math.floor(sum / #matched + 0.5)
+        end
+    end
+    local out, notes_changed, clamped = {}, 0, 0
+    for _, n in ipairs(matched) do
+        local raw
+        if opts.mode == "multiply" then
+            raw = n.vel * opts.ratio
+        elseif opts.mode == "set" then
+            raw = opts.value
+        else
+            raw = pivot_used + (n.vel - pivot_used) * opts.ratio
+        end
+        local rounded = math.floor(raw + 0.5)
+        local final = math.max(1, math.min(127, rounded))
+        if final ~= rounded then clamped = clamped + 1 end
+        local changed = final ~= n.vel
+        if changed then notes_changed = notes_changed + 1 end
+        out[#out + 1] = {index = n.index, new_vel = final, changed = changed}
+    end
+    return out, {notes_changed = notes_changed, clamped = clamped, pivot_used = pivot_used}
+end
+
+-- strum: group eligible notes into chords by onset (within chord_window_ppq), then stagger each
+-- chord's onsets over spread_ppq (up = lowest first, down = highest first). Whole-note shift; length
+-- preserved. D9 (invents no pitches). Only delays -> past-item-end counted (never before-start).
+local function strum_notes_pure(notes, opts, filt, ctx)
+    local elig = {}
+    for _, n in ipairs(notes) do
+        if note_in_filter(n, filt, ctx) then elig[#elig + 1] = n end
+    end
+    table.sort(elig, function(a, b)
+        if a.startppq ~= b.startppq then return a.startppq < b.startppq end
+        return a.index < b.index
+    end)
+    local changes, notes_changed, out_of_bounds = {}, 0, 0
+    local i = 1
+    while i <= #elig do
+        local anchor = elig[i].startppq
+        local group, j = {}, i
+        while j <= #elig and (elig[j].startppq - anchor) <= opts.chord_window_ppq do
+            group[#group + 1] = elig[j]; j = j + 1
+        end
+        if #group >= 2 and opts.spread_ppq > 0 then
+            table.sort(group, function(a, b)
+                if a.pitch ~= b.pitch then return a.pitch < b.pitch end
+                if a.chan ~= b.chan then return a.chan < b.chan end
+                return a.index < b.index
+            end)
+            if opts.direction == "down" then
+                local rev = {}
+                for k = #group, 1, -1 do rev[#rev + 1] = group[k] end
+                group = rev
+            end
+            local step = opts.spread_ppq / (#group - 1)
+            for k, n in ipairs(group) do
+                local ns = math.floor(anchor + (k - 1) * step + 0.5)
+                local ne = ns + (n.endppq - n.startppq)
+                if ns ~= n.startppq then
+                    changes[#changes + 1] = {index = n.index, new_start = ns, new_end = ne}
+                    notes_changed = notes_changed + 1
+                end
+                if ns < ctx.item_start_ppq or ne > ctx.item_end_ppq then
+                    out_of_bounds = out_of_bounds + 1
+                end
+            end
+        end
+        i = j
+    end
+    return {changes = changes, notes_changed = notes_changed, out_of_bounds = out_of_bounds}
+end
+
+-- snap-to-scale seams -----------------------------------------------------
+-- Named scales as intervals-from-root in semitones. A custom interval list arrives in this
+-- same shape, so named and custom modes take one identical code path.
+local MODE_INTERVALS = {
+    major            = {0, 2, 4, 5, 7, 9, 11},
+    minor            = {0, 2, 3, 5, 7, 8, 10},
+    harmonic_minor   = {0, 2, 3, 5, 7, 8, 11},
+    melodic_minor    = {0, 2, 3, 5, 7, 9, 11},
+    dorian           = {0, 2, 3, 5, 7, 9, 10},
+    phrygian         = {0, 1, 3, 5, 7, 8, 10},
+    lydian           = {0, 2, 4, 6, 7, 9, 11},
+    mixolydian       = {0, 2, 4, 5, 7, 9, 10},
+    locrian          = {0, 1, 3, 5, 6, 8, 10},
+    major_pentatonic = {0, 2, 4, 7, 9},
+    minor_pentatonic = {0, 3, 5, 7, 10},
+    blues            = {0, 3, 5, 6, 7, 10},
+    whole_tone       = {0, 2, 4, 6, 8, 10},
+    chromatic        = {0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11},
+}
+MODE_INTERVALS.ionian = MODE_INTERVALS.major
+MODE_INTERVALS.aeolian = MODE_INTERVALS.minor
+MODE_INTERVALS.natural_minor = MODE_INTERVALS.minor
+
+-- The scale as a pitch-class set (semantically REAPER's (root, 12-bit mask), held as a plain
+-- set so the seam stays Lua-version-agnostic — no bitwise ops, which the golden-test runtime
+-- may not have). Nothing is sent to MIDI_SetScale: snap has no highlight side effect.
+local function scale_pitch_classes(root, intervals)
+    local pcs = {}
+    for _, i in ipairs(intervals) do pcs[(root + i) % 12] = true end
+    return pcs
+end
+
+-- mode arg -> interval list. A custom list rides through as-is; a name resolves via
+-- MODE_INTERVALS (case-insensitive). nil = unknown name; the handler turns that into an error.
+local function resolve_mode_intervals(mode)
+    if type(mode) == "table" then return mode end
+    return MODE_INTERVALS[tostring(mode):lower()]
+end
+
+-- Nearest in-scale pitch from p searching in dir (1 = up, -1 = down), or nil when the closest
+-- in-scale pitch class lands outside MIDI 0-127 — every candidate beyond it is further out, so
+-- there is no legal target this way (D3 skip; no cross-direction fallback). A non-empty scale
+-- always has a member within 11 semitones of an off-scale pitch, so the bounded loop suffices.
+local function nearest_in_scale(p, scale_pcs, dir)
+    for d = 1, 11 do
+        local t = p + dir * d
+        if scale_pcs[t % 12] then
+            if t >= 0 and t <= 127 then return t end
+            return nil
+        end
+    end
+    return nil
+end
+
+-- snap: pitch-only, count-preserving. Each off-scale filtered note moves to the nearest
+-- in-scale pitch (up / down / nearest). `nearest` breaks a tie TOWARD the filtered mean (D4:
+-- above the mean -> down, below -> up, exactly on it -> down). No legal target -> skip (D3).
+-- In-scale notes are untouched; same-pitch collisions are left to remove_overlapping (D6).
+local function snap_notes_to_scale_pure(notes, filt, ctx, scale_pcs, direction)
+    local matched = {}
+    for _, n in ipairs(notes) do
+        if note_in_filter(n, filt, ctx) then matched[#matched + 1] = n end
+    end
+    -- mean of the ORIGINAL pitches of the WHOLE filtered subset, once (order-independent)
+    local mean = 0
+    if #matched > 0 then
+        local sum = 0
+        for _, n in ipairs(matched) do sum = sum + n.pitch end
+        mean = sum / #matched
+    end
+    local changes, notes_changed, skipped = {}, 0, 0
+    for _, n in ipairs(matched) do
+        if not scale_pcs[n.pitch % 12] then
+            local up_t = nearest_in_scale(n.pitch, scale_pcs, 1)
+            local down_t = nearest_in_scale(n.pitch, scale_pcs, -1)
+            local target
+            if direction == "up" then
+                target = up_t
+            elseif direction == "down" then
+                target = down_t
+            elseif up_t and down_t then
+                local du, dd = up_t - n.pitch, n.pitch - down_t
+                if du < dd then
+                    target = up_t
+                elseif dd < du then
+                    target = down_t
+                else
+                    target = (n.pitch < mean) and up_t or down_t   -- tie -> toward the mean [D4]
+                end
+            else
+                target = up_t or down_t                            -- nearest, only one legal side
+            end
+            if target then                                         -- always differs from n.pitch
+                changes[#changes + 1] = {index = n.index, new_pitch = target}
+                notes_changed = notes_changed + 1
+            else
+                skipped = skipped + 1
+            end
+        end
+    end
+    return {changes = changes, notes_changed = notes_changed, skipped = skipped}
+end
+
+-- quantize: snap targeted onsets to the PROJECT bar/beat grid [D11] — origin project QN 0,
+-- spacing `grid` QN. Deliberately NOT item-relative: a producer's onsets land on project bars,
+-- while the value filter and the returned beats stay item-anchored. All math is in QN, so it is
+-- tempo-safe (no seconds, no hardcoded PPQ); the handler hands each note its project `qn` and
+-- `len_qn`, membership still runs on PPQ via note_in_filter.
+-- Swing [D5] delays ODD grid cells only (cell parity from the STRAIGHT grid, MPC-style).
+-- [D10] a note snapped before the item start is clamped to it (REAPER refuses anything earlier)
+-- and counted; a note pushed past the item end is allowed as-is and counted. Length preserved.
+local function quantize_notes(notes, grid, strength, swing, filt, ctx)
+    local changes, notes_changed, out_of_bounds = {}, 0, 0
+    for _, n in ipairs(notes) do
+        if note_in_filter(n, filt, ctx) then
+            local k = math.floor(n.qn / grid + 0.5)          -- nearest straight cell (k<0 before QN 0)
+            local swing_delay = (k % 2 == 1) and (swing * grid / 3) or 0
+            local target = k * grid + swing_delay
+            local new_qn = n.qn + strength * (target - n.qn)  -- strength blend, in QN
+            local oob, at_item_start = false, false
+            if new_qn < ctx.item_start_qn then
+                new_qn = ctx.item_start_qn
+                oob, at_item_start = true, true
+            end
+            local new_end_qn = new_qn + n.len_qn              -- length preserved in QN
+            local moved = new_qn ~= n.qn
+            if moved and new_end_qn > ctx.item_end_qn then oob = true end
+            if moved then
+                changes[#changes + 1] = {index = n.index, new_qn = new_qn,
+                                         new_end_qn = new_end_qn, at_item_start = at_item_start}
+                notes_changed = notes_changed + 1
+            end
+            if oob then out_of_bounds = out_of_bounds + 1 end
+        end
+    end
+    return {changes = changes, notes_changed = notes_changed, out_of_bounds = out_of_bounds}
+end
+
+-- stretch: scale each targeted note as a rigid unit about ONE fixed pivot — onset-offset AND
+-- length scale by `factor`. Pivot is `pivot_ppq` when given, else the earliest onset among the
+-- TARGETED notes (fixed once, so the group scales coherently). Pure PPQ, so tempo-independent;
+-- only the caller's beat->PPQ conversion of pivot/window touches ppq_per_qn.
+-- [D10] past item end: allowed as-is + counted. Before item start: REAPER refuses it, so the
+-- start clamps to item_start_ppq while the scaled end STAYS PUT — the note comes out shorter
+-- (Dave's call 2026-07-16, option (a): every end stays faithful to the scaling). Order is
+-- clamp-then-floor: a clamp can shorten a note toward zero, and a note whose whole scaled span
+-- lands before the item start would otherwise end up with new_end < new_start, so the 1-tick
+-- min length runs last and turns that into a legal 1-tick note at the item start.
+-- out_of_bounds counts the RAW scaled position — where the scaling put the note, not where it
+-- was legalised to.
+local function stretch_notes(notes, factor, pivot_ppq, filt, ctx)
+    local targeted = {}
+    for _, n in ipairs(notes) do
+        if note_in_filter(n, filt, ctx) then targeted[#targeted + 1] = n end
+    end
+    local pivot = pivot_ppq
+    if not pivot then
+        for _, n in ipairs(targeted) do
+            if not pivot or n.startppq < pivot then pivot = n.startppq end
+        end
+    end
+    local changes, notes_changed, out_of_bounds = {}, 0, 0
+    if pivot then
+        for _, n in ipairs(targeted) do
+            local raw_s = math.floor(pivot + (n.startppq - pivot) * factor + 0.5)
+            local raw_e = math.floor(pivot + (n.endppq - pivot) * factor + 0.5)
+            if raw_s < ctx.item_start_ppq or raw_e > ctx.item_end_ppq then   -- judged on RAW
+                out_of_bounds = out_of_bounds + 1
+            end
+            local ns = raw_s
+            if ns < ctx.item_start_ppq then ns = ctx.item_start_ppq end      -- clamp first...
+            local ne = raw_e                                                 -- scaled end stays put
+            if ne < ns + 1 then ne = ns + 1 end                              -- ...then floor length
+            if ns ~= n.startppq or ne ~= n.endppq then
+                changes[#changes + 1] = {index = n.index, new_start = ns, new_end = ne}
+                notes_changed = notes_changed + 1
+            end
+        end
+    end
+    return {changes = changes, notes_changed = notes_changed, out_of_bounds = out_of_bounds}
+end
+
+-- legato: close the gaps in a line. ONLY ends move, never starts — so unlike the other timing
+-- transforms there is no before-item-start case to clamp; only past-item-end, which D10 allows.
+--   connect (extend-only): each targeted note's end runs forward to the next relevant onset.
+--     `chordal` takes the next DISTINCT onset among the targeted set (so a chord's notes all
+--     extend to the next chord together); `per_pitch` takes the next onset of the same
+--     (channel, pitch), which keeps interleaved voices independent.
+--     A note that already reaches or overruns its next onset (gap <= 0) is left ALONE — legato
+--     never trims, and the overlap is remove_overlapping's job (D6). A gap wider than
+--     max_gap_ppq is a rest the player meant: left alone and counted in gaps_preserved.
+--     The last note (no next onset) is left alone.
+--   fixed: every targeted note's length is set to length_ppq, last one included; voice,
+--     max_gap and the extend-only rule do not apply.
+-- Anchors come from the TARGETED set only, so a targeted note may extend straight through an
+-- untargeted one.
+local function legato_pure(notes, opts, filt, ctx)
+    local targeted = {}
+    for _, n in ipairs(notes) do
+        if note_in_filter(n, filt, ctx) then targeted[#targeted + 1] = n end
+    end
+    local changes, notes_changed, gaps_preserved, out_of_bounds = {}, 0, 0, 0
+    for _, n in ipairs(targeted) do
+        local new_end
+        if opts.mode == "fixed" then
+            new_end = n.startppq + opts.length_ppq
+        else
+            local nxt
+            for _, m in ipairs(targeted) do
+                -- strictly later onsets only, so chord-mates never anchor each other
+                if m.startppq > n.startppq
+                   and (opts.voice ~= "per_pitch" or (m.pitch == n.pitch and m.chan == n.chan))
+                   and (not nxt or m.startppq < nxt) then
+                    nxt = m.startppq
+                end
+            end
+            if nxt then
+                local gap = nxt - n.endppq
+                if gap > 0 then                          -- gap <= 0: already reaches -> never trim
+                    if gap <= opts.max_gap_ppq then      -- inclusive: a gap exactly at the ceiling closes
+                        new_end = nxt
+                    else
+                        gaps_preserved = gaps_preserved + 1
+                    end
+                end
+            end
+        end
+        if new_end and new_end ~= n.endppq then
+            changes[#changes + 1] = {index = n.index, new_end = new_end}
+            notes_changed = notes_changed + 1
+            if new_end > ctx.item_end_ppq then out_of_bounds = out_of_bounds + 1 end
+        end
+    end
+    return {changes = changes, notes_changed = notes_changed,
+            gaps_preserved = gaps_preserved, out_of_bounds = out_of_bounds}
+end
+
+-- humanize: apply PRE-DRAWN per-note offsets. The bridge rolls no dice (D8) — Python owns the
+-- seeded RNG, so a run is reproducible. Offsets are keyed by ABSOLUTE note index (0-based here,
+-- so 1-based in the Lua arrays), which is why filtered-out notes still consume a draw upstream:
+-- the seed -> note mapping must not shift when the filter changes.
+-- Start AND end move by the same delta, so length is preserved. That is precisely the bug in
+-- the orphan Step 0 deleted: it clamped the start and left the end, silently restretching notes.
+-- [D10] past item end: allowed as-is + counted. Before item start: REAPER refuses it, so clamp
+-- to item_start_ppq (length still preserved) + count. Clamping is counted even when the note
+-- ends up where it began (a note already at the item start with a negative draw), because the
+-- transform did try to put it outside. A past-end note is only counted if this run moved it.
+-- Velocity clamps to [1,127] — floor 1, never 0 (a humanized note must not go silent).
+local function humanize_midi_notes_pure(notes, filt, ctx, toff_ppq, voff)
+    local out, notes_changed, clamped, out_of_bounds = {}, 0, 0, 0
+    for _, n in ipairs(notes) do
+        if note_in_filter(n, filt, ctx) then
+            local dt = toff_ppq[n.index + 1] or 0
+            local vo = voff[n.index + 1] or 0
+            local oob = false
+            local ns = n.startppq + dt
+            if ns < ctx.item_start_ppq then
+                ns = ctx.item_start_ppq
+                oob = true
+            end
+            local ne = ns + (n.endppq - n.startppq)            -- length preserved
+            if dt ~= 0 and ne > ctx.item_end_ppq then oob = true end
+            local timing_changed = ns ~= n.startppq
+            local raw_vel = math.floor(n.vel + vo + 0.5)
+            local nv = math.max(1, math.min(127, raw_vel))
+            if nv ~= raw_vel then clamped = clamped + 1 end
+            local vel_changed = nv ~= n.vel
+            if timing_changed or vel_changed then
+                notes_changed = notes_changed + 1
+                out[#out + 1] = {index = n.index, timing_changed = timing_changed,
+                                 vel_changed = vel_changed,
+                                 new_start = ns, new_end = ne, new_vel = nv}
+            end
+            if oob then out_of_bounds = out_of_bounds + 1 end
+        end
+    end
+    return out, {notes_changed = notes_changed, clamped = clamped,
+                 skipped = 0, out_of_bounds = out_of_bounds}
+end
+
+-- remove_overlapping: the family's only COUNT-CHANGING tool — the only one that can destroy
+-- musical content rather than move it, so the rules are deliberately conservative.
+-- Two notes overlap only if they share a pitch AND a channel AND their spans strictly
+-- intersect. Half-open: A.end == B.start is ABUTTING, not overlapping, which is what makes a
+-- trim run idempotent. A chord (same onset, different pitch) is never an overlap; neither is
+-- the same pitch on two channels.
+-- `notes` here is ALREADY scoped by the caller's filter: an out-of-scope note is invisible —
+-- never edited, never deleted, and never a partner that could cause someone else's deletion.
+--   dedupe (both modes): notes sharing an onset collapse to one — highest velocity, tie to the
+--     longest, tie to the lowest index. Runs first because trimming to a same-onset neighbour
+--     would otherwise produce a zero-length note.
+--   trim: each note's end pulls back to the next onset (one pass, off ORIGINAL onsets). If that
+--     would leave it shorter than min_length_ppq it is removed instead — counted as deduped,
+--     not trimmed, since nothing was left to trim.
+--   delete: a greedy sweep drops the loser of each overlap (lower velocity, tie to the shorter,
+--     tie to the higher index); the survivor's timing is never touched.
+-- Returns edits sorted by index and removals sorted DESCENDING: MIDI_DeleteNote shifts every
+-- higher index down, so deleting ascending would silently delete the wrong notes.
+local function remove_overlaps_pure(notes, opts)
+    local groups, order = {}, {}
+    for _, n in ipairs(notes) do
+        local key = n.pitch .. ":" .. n.chan
+        if not groups[key] then groups[key] = {}; order[#order + 1] = key end
+        local g = groups[key]
+        g[#g + 1] = n
+    end
+    table.sort(order)                      -- pairs() order is undefined; keep output stable
+    local edits, removals = {}, {}
+    local trimmed, deduped, deleted = 0, 0, 0
+    -- true when `a` should survive against `b`: higher velocity, then longer, then lower index
+    local function beats(a, b)
+        if a.vel ~= b.vel then return a.vel > b.vel end
+        local la, lb = a.endppq - a.startppq, b.endppq - b.startppq
+        if la ~= lb then return la > lb end
+        return a.index < b.index
+    end
+    for _, key in ipairs(order) do
+        local g = groups[key]
+        table.sort(g, function(a, b)
+            if a.startppq ~= b.startppq then return a.startppq < b.startppq end
+            return a.index < b.index
+        end)
+        -- (1) dedupe: collapse each identical-onset run to its best note
+        local kept = {}
+        local i = 1
+        while i <= #g do
+            local j = i
+            while j < #g and g[j + 1].startppq == g[i].startppq do j = j + 1 end
+            local best = g[i]
+            for k = i + 1, j do
+                if beats(g[k], best) then best = g[k] end
+            end
+            for k = i, j do
+                if g[k] ~= best then
+                    removals[#removals + 1] = g[k].index
+                    deduped = deduped + 1
+                end
+            end
+            kept[#kept + 1] = best
+            i = j + 1
+        end
+        if opts.mode == "trim" then
+            -- (2a) pull each end back to the next onset; min_length_ppq 0 disables the floor
+            -- naturally (a strict overlap always leaves a positive length)
+            for k = 1, #kept - 1 do
+                local a, b = kept[k], kept[k + 1]
+                if a.endppq > b.startppq then
+                    if (b.startppq - a.startppq) < opts.min_length_ppq then
+                        removals[#removals + 1] = a.index
+                        deduped = deduped + 1
+                    else
+                        edits[#edits + 1] = {index = a.index, new_end = b.startppq}
+                        trimmed = trimmed + 1
+                    end
+                end
+            end
+        else
+            -- (2b) greedy sweep: the loser of each overlap goes, the survivor is left alone
+            local active
+            for k = 1, #kept do
+                local n = kept[k]
+                if active and active.endppq > n.startppq then
+                    local winner = beats(active, n) and active or n
+                    local loser = (winner == active) and n or active
+                    removals[#removals + 1] = loser.index
+                    deleted = deleted + 1
+                    active = winner
+                else
+                    active = n
+                end
+            end
+        end
+    end
+    table.sort(edits, function(a, b) return a.index < b.index end)
+    table.sort(removals, function(a, b) return a > b end)   -- DESCENDING; see note above
+    return {edits = edits, removals = removals,
+            trimmed = trimmed, deduped = deduped, deleted = deleted}
+end
+-- === MIDI_PURE_END ===
+
+-- Impure helpers (need reaper.*): read notes, derive ctx, build the response note list.
+local function midi_read_notes(take)
+    local _, count = reaper.MIDI_CountEvts(take)
+    local out = {}
+    for n = 0, count - 1 do
+        local ok, sel, mut, sppq, eppq, chan, pitch, vel = reaper.MIDI_GetNote(take, n)
+        if ok then
+            out[#out + 1] = {index = n, startppq = sppq, endppq = eppq,
+                             chan = chan, pitch = pitch, vel = vel, selected = sel, muted = mut}
+        end
+    end
+    return out
+end
+
+-- ctx for filter/timing math; ppq_per_qn is a fixed property of the take (tempo-map-safe).
+local function midi_ctx(take, item)
+    local ppq_per_qn = reaper.MIDI_GetPPQPosFromProjQN(take, 1) - reaper.MIDI_GetPPQPosFromProjQN(take, 0)
+    local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+    local item_len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+    local start_ppq = reaper.MIDI_GetPPQPosFromProjTime(take, item_pos)
+    local end_ppq = reaper.MIDI_GetPPQPosFromProjTime(take, item_pos + item_len)
+    return {
+        ppq_per_qn = ppq_per_qn,
+        item_start_ppq = start_ppq,
+        item_end_ppq = end_ppq,
+        -- QN bounds for the QN-native transforms (quantize): comparing in QN keeps the
+        -- item-edge tests on the same tempo-safe axis the grid math runs on.
+        item_start_qn = reaper.MIDI_GetProjQNFromPPQPos(take, start_ppq),
+        item_end_qn = reaper.MIDI_GetProjQNFromPPQPos(take, end_ppq),
+    }
+end
+
+-- The ONE shared response note-dict builder (contract [H]): seconds for back-compat +
+-- item-relative start_beat/end_beat (tempo-safe) so output feeds the beat filter exactly.
+local function midi_note_list(take, item)
+    local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+    local item_start_qn = reaper.MIDI_GetProjQNFromPPQPos(take, reaper.MIDI_GetPPQPosFromProjTime(take, item_pos))
+    local _, count = reaper.MIDI_CountEvts(take)
+    local notes = as_array({})
+    for n = 0, count - 1 do
+        local ok, sel, mut, sppq, eppq, chan, pitch, vel = reaper.MIDI_GetNote(take, n)
+        if ok then
+            notes[#notes + 1] = {
+                index = n, pitch = pitch, velocity = vel, channel = chan,
+                selected = sel, muted = mut,
+                start_time = reaper.MIDI_GetProjTimeFromPPQPos(take, sppq),
+                end_time = reaper.MIDI_GetProjTimeFromPPQPos(take, eppq),
+                start_beat = reaper.MIDI_GetProjQNFromPPQPos(take, sppq) - item_start_qn,
+                end_beat = reaper.MIDI_GetProjQNFromPPQPos(take, eppq) - item_start_qn,
+            }
+        end
+    end
+    return notes, count
+end
+
+-- Expose the pure seams for headless golden tests.
+_G.__MIDI_TEST = {note_in_filter = note_in_filter, transpose_notes_pure = transpose_notes_pure,
+                  nudge_notes_pure = nudge_notes_pure, filter_selected = filter_selected,
+                  compute_note_span = compute_note_span, beats_to_take_ppq = beats_to_take_ppq,
+                  len_beats_to_ppq = len_beats_to_ppq, note_out_of_bounds = note_out_of_bounds,
+                  valid_pitch = valid_pitch, valid_channel = valid_channel, valid_length = valid_length,
+                  midi_ramp_velocities = midi_ramp_velocities,
+                  compute_scaled_velocities = compute_scaled_velocities, strum_notes_pure = strum_notes_pure,
+                  scale_pitch_classes = scale_pitch_classes, resolve_mode_intervals = resolve_mode_intervals,
+                  nearest_in_scale = nearest_in_scale, snap_notes_to_scale_pure = snap_notes_to_scale_pure,
+                  quantize_notes = quantize_notes, stretch_notes = stretch_notes,
+                  legato_pure = legato_pure, humanize_midi_notes_pure = humanize_midi_notes_pure,
+                  remove_overlaps_pure = remove_overlaps_pure}
+-- ========================================================================
 
 -- Main processing function
 local function process_request()
@@ -4026,24 +4665,7 @@ local function process_request()
                                     response.error = "Active take is not MIDI"
                                     response.ok = false
                                 else
-                                    local _, note_count = reaper.MIDI_CountEvts(take)
-                                    local notes = as_array({})
-                                    for n = 0, note_count - 1 do
-                                        local ok2, selected, muted, startppq, endppq, chan, pitch, vel =
-                                            reaper.MIDI_GetNote(take, n)
-                                        if ok2 then
-                                            notes[#notes + 1] = {
-                                                index = n,
-                                                pitch = pitch,
-                                                velocity = vel,
-                                                channel = chan,
-                                                selected = selected,
-                                                muted = muted,
-                                                start_time = reaper.MIDI_GetProjTimeFromPPQPos(take, startppq),
-                                                end_time = reaper.MIDI_GetProjTimeFromPPQPos(take, endppq)
-                                            }
-                                        end
-                                    end
+                                    local notes, note_count = midi_note_list(take, item)
                                     response.notes = notes
                                     response.ret = note_count
                                     response.ok = true
@@ -4051,6 +4673,682 @@ local function process_request()
                             end
                         else
                             response.error = "GetMIDINotes requires 2 arguments (track, item)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "TransposeMIDINotes" then
+                        -- args: track_index, item_index, semitones, filter{}  (v1.6.0)
+                        if #args >= 3 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if not take then
+                                response.error = err
+                                response.ok = false
+                            else
+                                local item = reaper.GetMediaItemTake_Item(take)
+                                local ctx = midi_ctx(take, item)
+                                if not (ctx.ppq_per_qn and ctx.ppq_per_qn > 0) then
+                                    response.error = "Could not determine PPQ-per-quarter-note for take"
+                                    response.ok = false
+                                else
+                                    local semitones = args[3]
+                                    local filt = args[4] or {}
+                                    local res = transpose_notes_pure(midi_read_notes(take), semitones, filt, ctx)
+                                    reaper.Undo_BeginBlock()
+                                    local wok, werr = pcall(function()
+                                        for _, ch in ipairs(res.changes) do
+                                            reaper.MIDI_SetNote(take, ch.index, nil, nil, nil, nil, nil, ch.new_pitch, nil, true)
+                                        end
+                                        reaper.MIDI_Sort(take)
+                                    end)
+                                    reaper.Undo_EndBlock("Transpose MIDI notes", 4)
+                                    if wok then
+                                        response.notes = midi_note_list(take, item)
+                                        response.notes_changed = res.notes_changed
+                                        response.clamped = 0
+                                        response.skipped = res.skipped
+                                        response.out_of_bounds = 0
+                                        response.ok = true
+                                    else
+                                        response.error = "Transpose failed: " .. tostring(werr)
+                                        response.ok = false
+                                    end
+                                end
+                            end
+                        else
+                            response.error = "TransposeMIDINotes requires track_index, item_index, semitones"
+                            response.ok = false
+                        end
+
+                    elseif fname == "NudgeMIDINotes" then
+                        -- args: track_index, item_index, amount_beats, filter{}  (v1.6.0)
+                        if #args >= 3 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if not take then
+                                response.error = err
+                                response.ok = false
+                            else
+                                local item = reaper.GetMediaItemTake_Item(take)
+                                local ctx = midi_ctx(take, item)
+                                if not (ctx.ppq_per_qn and ctx.ppq_per_qn > 0) then
+                                    response.error = "Could not determine PPQ-per-quarter-note for take"
+                                    response.ok = false
+                                else
+                                    local filt = args[4] or {}
+                                    local delta_ppq = math.floor(args[3] * ctx.ppq_per_qn + 0.5)
+                                    local res = nudge_notes_pure(midi_read_notes(take), delta_ppq, filt, ctx)
+                                    if res.notes_changed > 0 then
+                                        reaper.Undo_BeginBlock()
+                                        local wok, werr = pcall(function()
+                                            for _, ch in ipairs(res.changes) do
+                                                reaper.MIDI_SetNote(take, ch.index, nil, nil, ch.new_start, ch.new_end, nil, nil, nil, true)
+                                            end
+                                            reaper.MIDI_Sort(take)
+                                        end)
+                                        reaper.Undo_EndBlock("Nudge MIDI notes", 4)
+                                        if not wok then
+                                            response.error = "Nudge failed: " .. tostring(werr)
+                                            response.ok = false
+                                        end
+                                    end
+                                    if not response.error then
+                                        response.notes = midi_note_list(take, item)
+                                        response.notes_changed = res.notes_changed
+                                        response.clamped = 0
+                                        response.skipped = 0
+                                        response.out_of_bounds = res.out_of_bounds
+                                        response.ok = true
+                                    end
+                                end
+                            end
+                        else
+                            response.error = "NudgeMIDINotes requires track_index, item_index, amount_beats"
+                            response.ok = false
+                        end
+
+                    elseif fname == "GetSelectedMIDINotes" then
+                        -- args: track_index, item_index -> only the notes selected in REAPER (v1.6.0, read-only, D2)
+                        if #args >= 2 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if not take then
+                                response.error = err
+                                response.ok = false
+                            else
+                                local item = reaper.GetMediaItemTake_Item(take)
+                                local sel = as_array(filter_selected((midi_note_list(take, item))))
+                                response.notes = sel
+                                response.ret = #sel
+                                response.ok = true
+                            end
+                        else
+                            response.error = "GetSelectedMIDINotes requires 2 arguments (track, item)"
+                            response.ok = false
+                        end
+
+                    elseif fname == "SelectAllMIDINotes" then
+                        -- TEST-ONLY helper (v1.6.0). No public @mcp.tool() wraps this: the
+                        -- selection *writer* tool is deferred to v1.7.0 (S2). It exists solely so
+                        -- the get_selected_midi_notes live test can arrange a non-empty selection
+                        -- (freshly inserted notes come in unselected), proving the selected=true
+                        -- value flows through and a selected note carries Shape H. Uses the proper
+                        -- resolve_midi_take addressing, not the orphan GetMediaItem+take_index path.
+                        -- args: track_index, item_index, select (bool, default true)
+                        if #args >= 2 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if not take then
+                                response.error = err
+                                response.ok = false
+                            else
+                                local want = args[3]
+                                if want == nil then want = true end
+                                reaper.MIDI_SelectAll(take, want)   -- flips flags only; no sort needed
+                                response.ok = true
+                            end
+                        else
+                            response.error = "SelectAllMIDINotes requires track_index, item_index"
+                            response.ok = false
+                        end
+
+                    elseif fname == "SetMIDINote" then
+                        -- args: track_index, item_index, note_index, edits{pitch?, start_beat?, length_beats?, channel?}
+                        if #args >= 3 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            local note_index = args[3]
+                            local edits = args[4] or {}
+                            local ok0, _sel, _mut, sppq, eppq = false, nil, nil, nil, nil
+                            if take then ok0, _sel, _mut, sppq, eppq = reaper.MIDI_GetNote(take, note_index) end
+                            if not take then
+                                response.error = err
+                                response.ok = false
+                            elseif not ok0 then
+                                response.error = "Note not found at index " .. tostring(note_index)
+                                response.ok = false
+                            elseif edits.pitch == nil and edits.start_beat == nil and edits.length_beats == nil and edits.channel == nil then
+                                response.error = "set_midi_note requires at least one of pitch/start_beat/length_beats/channel"
+                                response.ok = false
+                            elseif edits.pitch ~= nil and not valid_pitch(edits.pitch) then
+                                response.error = "pitch must be an integer 0-127"
+                                response.ok = false
+                            elseif edits.channel ~= nil and not valid_channel(edits.channel) then
+                                response.error = "channel must be an integer 0-15"
+                                response.ok = false
+                            elseif edits.length_beats ~= nil and not valid_length(edits.length_beats) then
+                                response.error = "length_beats must be > 0"
+                                response.ok = false
+                            else
+                                local item = reaper.GetMediaItemTake_Item(take)
+                                local ctx = midi_ctx(take, item)
+                                if not (ctx.ppq_per_qn and ctx.ppq_per_qn > 0) then
+                                    response.error = "Could not determine PPQ-per-quarter-note for take"
+                                    response.ok = false
+                                else
+                                    local timing = (edits.start_beat ~= nil or edits.length_beats ~= nil)
+                                    local startIn, endIn, oob = nil, nil, false
+                                    if timing then
+                                        local nsp = edits.start_beat ~= nil and beats_to_take_ppq(edits.start_beat, ctx.item_start_ppq, ctx.ppq_per_qn) or nil
+                                        local nlp = edits.length_beats ~= nil and len_beats_to_ppq(edits.length_beats, ctx.ppq_per_qn) or nil
+                                        local fs, fe = compute_note_span(sppq, eppq, nsp, nlp)
+                                        oob = note_out_of_bounds(fs, fe, ctx.item_start_ppq, ctx.item_end_ppq)
+                                        if fs < ctx.item_start_ppq then     -- REAPER floors at item start; clamp, keep length
+                                            fe = fe + (ctx.item_start_ppq - fs)
+                                            fs = ctx.item_start_ppq
+                                        end
+                                        startIn, endIn = fs, fe
+                                    end
+                                    reaper.Undo_BeginBlock()
+                                    local wok, werr = pcall(function()
+                                        reaper.MIDI_SetNote(take, note_index, nil, nil, startIn, endIn, edits.channel, edits.pitch, nil, true)
+                                        reaper.MIDI_Sort(take)
+                                    end)
+                                    reaper.Undo_EndBlock("Set MIDI note", 4)
+                                    if wok then
+                                        response.notes = midi_note_list(take, item)
+                                        response.notes_changed = 1
+                                        response.clamped = 0
+                                        response.skipped = 0
+                                        response.out_of_bounds = oob and 1 or 0
+                                        response.ok = true
+                                    else
+                                        response.error = "Set note failed: " .. tostring(werr)
+                                        response.ok = false
+                                    end
+                                end
+                            end
+                        else
+                            response.error = "SetMIDINote requires track_index, item_index, note_index"
+                            response.ok = false
+                        end
+
+                    elseif fname == "RampMIDINoteVelocities" then
+                        -- args: track_index, item_index, start_velocity, end_velocity, filter{}
+                        if #args >= 4 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if not take then
+                                response.error = err
+                                response.ok = false
+                            else
+                                local item = reaper.GetMediaItemTake_Item(take)
+                                local ctx = midi_ctx(take, item)
+                                if not (ctx.ppq_per_qn and ctx.ppq_per_qn > 0) then
+                                    response.error = "Could not determine PPQ-per-quarter-note for take"
+                                    response.ok = false
+                                else
+                                    local filt = args[5] or {}
+                                    local res = midi_ramp_velocities(midi_read_notes(take), filt, ctx, args[3], args[4])
+                                    if res.notes_changed > 0 then
+                                        reaper.Undo_BeginBlock()
+                                        local wok, werr = pcall(function()
+                                            for _, ch in ipairs(res.changes) do
+                                                reaper.MIDI_SetNote(take, ch.index, nil, nil, nil, nil, nil, nil, ch.new_vel, true)
+                                            end
+                                            reaper.MIDI_Sort(take)
+                                        end)
+                                        reaper.Undo_EndBlock("Ramp MIDI note velocities", 4)
+                                        if not wok then
+                                            response.error = "Ramp failed: " .. tostring(werr)
+                                            response.ok = false
+                                        end
+                                    end
+                                    if not response.error then
+                                        response.notes = midi_note_list(take, item)
+                                        response.notes_changed = res.notes_changed
+                                        response.clamped = res.clamped
+                                        response.skipped = 0
+                                        response.out_of_bounds = 0
+                                        response.ok = true
+                                    end
+                                end
+                            end
+                        else
+                            response.error = "RampMIDINoteVelocities requires track, item, start_velocity, end_velocity"
+                            response.ok = false
+                        end
+
+                    elseif fname == "ScaleMIDINoteVelocities" then
+                        -- args: track, item, mode, ratio, value, pivot, filter{}  (validation done server-side)
+                        if #args >= 6 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if not take then
+                                response.error = err
+                                response.ok = false
+                            else
+                                local item = reaper.GetMediaItemTake_Item(take)
+                                local ctx = midi_ctx(take, item)
+                                if not (ctx.ppq_per_qn and ctx.ppq_per_qn > 0) then
+                                    response.error = "Could not determine PPQ-per-quarter-note for take"
+                                    response.ok = false
+                                else
+                                    local opts = {mode = args[3], ratio = args[4], value = args[5], pivot = args[6]}
+                                    local filt = args[7] or {}
+                                    local out, stats = compute_scaled_velocities(midi_read_notes(take), opts, filt, ctx)
+                                    if stats.notes_changed > 0 then
+                                        reaper.Undo_BeginBlock()
+                                        local wok, werr = pcall(function()
+                                            for _, ch in ipairs(out) do
+                                                if ch.changed then
+                                                    reaper.MIDI_SetNote(take, ch.index, nil, nil, nil, nil, nil, nil, ch.new_vel, true)
+                                                end
+                                            end
+                                            reaper.MIDI_Sort(take)
+                                        end)
+                                        reaper.Undo_EndBlock("Scale MIDI note velocities", 4)
+                                        if not wok then
+                                            response.error = "Scale velocities failed: " .. tostring(werr)
+                                            response.ok = false
+                                        end
+                                    end
+                                    if not response.error then
+                                        response.notes = midi_note_list(take, item)
+                                        response.notes_changed = stats.notes_changed
+                                        response.clamped = stats.clamped
+                                        response.skipped = 0
+                                        response.out_of_bounds = 0
+                                        response.pivot_used = stats.pivot_used
+                                        response.ok = true
+                                    end
+                                end
+                            end
+                        else
+                            response.error = "ScaleMIDINoteVelocities requires track, item, mode, ratio, value, pivot"
+                            response.ok = false
+                        end
+
+                    elseif fname == "StrumMIDINotes" then
+                        -- args: track, item, spread_beats, direction, chord_window_beats, filter{}
+                        if #args >= 5 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if not take then
+                                response.error = err
+                                response.ok = false
+                            else
+                                local item = reaper.GetMediaItemTake_Item(take)
+                                local ctx = midi_ctx(take, item)
+                                if not (ctx.ppq_per_qn and ctx.ppq_per_qn > 0) then
+                                    response.error = "Could not determine PPQ-per-quarter-note for take"
+                                    response.ok = false
+                                else
+                                    local opts = {
+                                        spread_ppq = args[3] * ctx.ppq_per_qn,
+                                        direction = args[4],
+                                        chord_window_ppq = args[5] * ctx.ppq_per_qn,
+                                    }
+                                    local filt = args[6] or {}
+                                    local res = strum_notes_pure(midi_read_notes(take), opts, filt, ctx)
+                                    if res.notes_changed > 0 then
+                                        reaper.Undo_BeginBlock()
+                                        local wok, werr = pcall(function()
+                                            for _, ch in ipairs(res.changes) do
+                                                reaper.MIDI_SetNote(take, ch.index, nil, nil, ch.new_start, ch.new_end, nil, nil, nil, true)
+                                            end
+                                            reaper.MIDI_Sort(take)
+                                        end)
+                                        reaper.Undo_EndBlock("Strum MIDI", 4)
+                                        if not wok then
+                                            response.error = "Strum failed: " .. tostring(werr)
+                                            response.ok = false
+                                        end
+                                    end
+                                    if not response.error then
+                                        response.notes = midi_note_list(take, item)
+                                        response.notes_changed = res.notes_changed
+                                        response.clamped = 0
+                                        response.skipped = 0
+                                        response.out_of_bounds = res.out_of_bounds
+                                        response.ok = true
+                                    end
+                                end
+                            end
+                        else
+                            response.error = "StrumMIDINotes requires track, item, spread_beats, direction, chord_window_beats"
+                            response.ok = false
+                        end
+
+                    elseif fname == "SnapMIDINotesToScale" then
+                        -- args: track, item, root, mode, direction, filter{}  (v1.6.0)
+                        if #args >= 5 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if not take then
+                                response.error = err
+                                response.ok = false
+                            else
+                                -- mode: a name from MODE_INTERVALS, or a custom interval list
+                                local intervals = resolve_mode_intervals(args[4])
+                                if not intervals or #intervals == 0 then
+                                    response.error = "Unknown scale mode: " .. tostring(args[4])
+                                    response.ok = false
+                                else
+                                    local item = reaper.GetMediaItemTake_Item(take)
+                                    local ctx = midi_ctx(take, item)
+                                    if not (ctx.ppq_per_qn and ctx.ppq_per_qn > 0) then
+                                        response.error = "Could not determine PPQ-per-quarter-note for take"
+                                        response.ok = false
+                                    else
+                                        local scale_pcs = scale_pitch_classes(args[3], intervals)
+                                        local filt = args[6] or {}
+                                        local res = snap_notes_to_scale_pure(midi_read_notes(take), filt, ctx,
+                                                                             scale_pcs, args[5])
+                                        reaper.Undo_BeginBlock()
+                                        local wok, werr = pcall(function()
+                                            for _, ch in ipairs(res.changes) do
+                                                reaper.MIDI_SetNote(take, ch.index, nil, nil, nil, nil, nil, ch.new_pitch, nil, true)
+                                            end
+                                            reaper.MIDI_Sort(take)
+                                        end)
+                                        reaper.Undo_EndBlock("Snap MIDI notes to scale", 4)
+                                        if wok then
+                                            response.notes = midi_note_list(take, item)
+                                            response.notes_changed = res.notes_changed
+                                            response.clamped = 0
+                                            response.skipped = res.skipped
+                                            response.out_of_bounds = 0
+                                            response.ok = true
+                                        else
+                                            response.error = "Snap to scale failed: " .. tostring(werr)
+                                            response.ok = false
+                                        end
+                                    end
+                                end
+                            end
+                        else
+                            response.error = "SnapMIDINotesToScale requires track_index, item_index, root, mode, direction"
+                            response.ok = false
+                        end
+
+                    elseif fname == "QuantizeMIDINotes" then
+                        -- args: track, item, grid, strength, swing, filter{}  (v1.6.0)
+                        if #args >= 5 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if not take then
+                                response.error = err
+                                response.ok = false
+                            else
+                                local item = reaper.GetMediaItemTake_Item(take)
+                                local ctx = midi_ctx(take, item)
+                                if not (ctx.ppq_per_qn and ctx.ppq_per_qn > 0) then
+                                    response.error = "Could not determine PPQ-per-quarter-note for take"
+                                    response.ok = false
+                                elseif not (args[3] and args[3] > 0) then
+                                    response.error = "grid must be > 0"
+                                    response.ok = false
+                                else
+                                    -- give each note its PROJECT QN + length-in-QN; the grid math is
+                                    -- QN-native (tempo-safe) while the filter still runs on PPQ
+                                    local notes = midi_read_notes(take)
+                                    for _, n in ipairs(notes) do
+                                        n.qn = reaper.MIDI_GetProjQNFromPPQPos(take, n.startppq)
+                                        n.len_qn = reaper.MIDI_GetProjQNFromPPQPos(take, n.endppq) - n.qn
+                                    end
+                                    local filt = args[6] or {}
+                                    local res = quantize_notes(notes, args[3], args[4], args[5], filt, ctx)
+                                    reaper.Undo_BeginBlock()
+                                    local wok, werr = pcall(function()
+                                        for _, ch in ipairs(res.changes) do
+                                            -- a start clamped to the item edge uses the exact item_start_ppq:
+                                            -- round-tripping it through QN could land a hair early, and REAPER
+                                            -- refuses any note before the item start outright [D10].
+                                            local ns = ch.at_item_start and ctx.item_start_ppq
+                                                       or reaper.MIDI_GetPPQPosFromProjQN(take, ch.new_qn)
+                                            local ne = reaper.MIDI_GetPPQPosFromProjQN(take, ch.new_end_qn)
+                                            reaper.MIDI_SetNote(take, ch.index, nil, nil, ns, ne, nil, nil, nil, true)
+                                        end
+                                        reaper.MIDI_Sort(take)
+                                    end)
+                                    reaper.Undo_EndBlock("Quantize MIDI notes", 4)
+                                    if wok then
+                                        response.notes = midi_note_list(take, item)
+                                        response.notes_changed = res.notes_changed
+                                        response.clamped = 0
+                                        response.skipped = 0
+                                        response.out_of_bounds = res.out_of_bounds
+                                        response.ok = true
+                                    else
+                                        response.error = "Quantize failed: " .. tostring(werr)
+                                        response.ok = false
+                                    end
+                                end
+                            end
+                        else
+                            response.error = "QuantizeMIDINotes requires track_index, item_index, grid, strength, swing"
+                            response.ok = false
+                        end
+
+                    elseif fname == "StretchMIDINotes" then
+                        -- args: track, item, factor, opts{pivot_beat?, + the 5 filter keys}  (v1.6.0)
+                        if #args >= 4 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if not take then
+                                response.error = err
+                                response.ok = false
+                            else
+                                local item = reaper.GetMediaItemTake_Item(take)
+                                local ctx = midi_ctx(take, item)
+                                if not (ctx.ppq_per_qn and ctx.ppq_per_qn > 0) then
+                                    response.error = "Could not determine PPQ-per-quarter-note for take"
+                                    response.ok = false
+                                elseif not (args[3] and args[3] > 0) then
+                                    response.error = "factor must be > 0"
+                                    response.ok = false
+                                else
+                                    -- opts doubles as the filter: note_in_filter reads only its own 5
+                                    -- keys and ignores the extra pivot_beat, so one object serves both
+                                    local opts = args[4] or {}
+                                    local pivot_ppq = nil
+                                    if opts.pivot_beat ~= nil then
+                                        pivot_ppq = ctx.item_start_ppq + opts.pivot_beat * ctx.ppq_per_qn
+                                    end
+                                    local res = stretch_notes(midi_read_notes(take), args[3], pivot_ppq, opts, ctx)
+                                    reaper.Undo_BeginBlock()
+                                    local wok, werr = pcall(function()
+                                        for _, ch in ipairs(res.changes) do
+                                            reaper.MIDI_SetNote(take, ch.index, nil, nil, ch.new_start, ch.new_end, nil, nil, nil, true)
+                                        end
+                                        reaper.MIDI_Sort(take)
+                                    end)
+                                    reaper.Undo_EndBlock("Stretch MIDI notes", 4)
+                                    if wok then
+                                        response.notes = midi_note_list(take, item)
+                                        response.notes_changed = res.notes_changed
+                                        response.clamped = 0
+                                        response.skipped = 0
+                                        response.out_of_bounds = res.out_of_bounds
+                                        response.ok = true
+                                    else
+                                        response.error = "Stretch failed: " .. tostring(werr)
+                                        response.ok = false
+                                    end
+                                end
+                            end
+                        else
+                            response.error = "StretchMIDINotes requires track_index, item_index, factor"
+                            response.ok = false
+                        end
+
+                    elseif fname == "LegatoMIDINotes" then
+                        -- args: track, item, mode, voice, max_gap_beats, length_beats, filter{}
+                        if #args >= 6 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if not take then
+                                response.error = err
+                                response.ok = false
+                            else
+                                local item = reaper.GetMediaItemTake_Item(take)
+                                local ctx = midi_ctx(take, item)
+                                if not (ctx.ppq_per_qn and ctx.ppq_per_qn > 0) then
+                                    response.error = "Could not determine PPQ-per-quarter-note for take"
+                                    response.ok = false
+                                else
+                                    local opts = {
+                                        mode = args[3],
+                                        voice = args[4],
+                                        max_gap_ppq = args[5] * ctx.ppq_per_qn,
+                                        length_ppq = args[6] * ctx.ppq_per_qn,
+                                    }
+                                    local filt = args[7] or {}
+                                    local res = legato_pure(midi_read_notes(take), opts, filt, ctx)
+                                    reaper.Undo_BeginBlock()
+                                    local wok, werr = pcall(function()
+                                        for _, ch in ipairs(res.changes) do
+                                            -- end only: legato never moves a start
+                                            reaper.MIDI_SetNote(take, ch.index, nil, nil, nil, ch.new_end, nil, nil, nil, true)
+                                        end
+                                        reaper.MIDI_Sort(take)
+                                    end)
+                                    reaper.Undo_EndBlock("Legato MIDI", 4)
+                                    if wok then
+                                        response.notes = midi_note_list(take, item)
+                                        response.notes_changed = res.notes_changed
+                                        response.clamped = 0
+                                        response.skipped = 0
+                                        response.out_of_bounds = res.out_of_bounds
+                                        response.gaps_preserved = res.gaps_preserved
+                                        response.ok = true
+                                    else
+                                        response.error = "Legato failed: " .. tostring(werr)
+                                        response.ok = false
+                                    end
+                                end
+                            end
+                        else
+                            response.error = "LegatoMIDINotes requires track, item, mode, voice, max_gap_beats, length_beats"
+                            response.ok = false
+                        end
+
+                    elseif fname == "HumanizeMIDINotes" then
+                        -- args: track, item, timing_offsets[] (beats), velocity_offsets[], filter{}
+                        -- Offsets arrive PRE-DRAWN from Python's seeded RNG: no dice here (D8).
+                        if #args >= 4 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if not take then
+                                response.error = err
+                                response.ok = false
+                            else
+                                local item = reaper.GetMediaItemTake_Item(take)
+                                local ctx = midi_ctx(take, item)
+                                if not (ctx.ppq_per_qn and ctx.ppq_per_qn > 0) then
+                                    response.error = "Could not determine PPQ-per-quarter-note for take"
+                                    response.ok = false
+                                else
+                                    local toff_beats = args[3] or {}
+                                    local voff = args[4] or {}
+                                    local filt = args[5] or {}
+                                    local toff_ppq = {}
+                                    for i = 1, #toff_beats do
+                                        toff_ppq[i] = math.floor(toff_beats[i] * ctx.ppq_per_qn + 0.5)
+                                    end
+                                    local recs, stats = humanize_midi_notes_pure(midi_read_notes(take),
+                                                                                 filt, ctx, toff_ppq, voff)
+                                    reaper.Undo_BeginBlock()
+                                    local wok, werr = pcall(function()
+                                        for _, r in ipairs(recs) do
+                                            -- nil for every facet not being changed, so an
+                                            -- untouched start/velocity is left exactly as it was
+                                            reaper.MIDI_SetNote(take, r.index, nil, nil,
+                                                r.timing_changed and r.new_start or nil,
+                                                r.timing_changed and r.new_end or nil,
+                                                nil, nil,
+                                                r.vel_changed and r.new_vel or nil, true)
+                                        end
+                                        reaper.MIDI_Sort(take)
+                                    end)
+                                    reaper.Undo_EndBlock("Humanize MIDI", 4)
+                                    if wok then
+                                        response.notes = midi_note_list(take, item)
+                                        response.notes_changed = stats.notes_changed
+                                        response.clamped = stats.clamped
+                                        response.skipped = 0
+                                        response.out_of_bounds = stats.out_of_bounds
+                                        response.ok = true
+                                    else
+                                        response.error = "Humanize failed: " .. tostring(werr)
+                                        response.ok = false
+                                    end
+                                end
+                            end
+                        else
+                            response.error = "HumanizeMIDINotes requires track, item, timing_offsets, velocity_offsets"
+                            response.ok = false
+                        end
+
+                    elseif fname == "RemoveOverlappingMIDINotes" then
+                        -- args: track, item, mode, min_length_beats, filter{}   (v1.6.0)
+                        -- The only count-CHANGING tool: it deletes notes. Deletes run descending.
+                        if args[1] ~= nil and args[2] ~= nil then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if not take then
+                                response.error = err
+                                response.ok = false
+                            else
+                                local item = reaper.GetMediaItemTake_Item(take)
+                                local ctx = midi_ctx(take, item)
+                                local mode = args[3] or "trim"
+                                if not (ctx.ppq_per_qn and ctx.ppq_per_qn > 0) then
+                                    response.error = "Could not determine PPQ-per-quarter-note for take"
+                                    response.ok = false
+                                elseif mode ~= "trim" and mode ~= "delete" then
+                                    response.error = "mode must be 'trim' or 'delete'"
+                                    response.ok = false
+                                else
+                                    local filt = args[5] or {}
+                                    -- scope FIRST: an out-of-scope note must be invisible to overlap
+                                    -- detection, not merely spared from the edit
+                                    local scoped = {}
+                                    for _, n in ipairs(midi_read_notes(take)) do
+                                        if note_in_filter(n, filt, ctx) then scoped[#scoped + 1] = n end
+                                    end
+                                    local res = remove_overlaps_pure(scoped, {
+                                        mode = mode,
+                                        min_length_ppq = (args[4] or 0) * ctx.ppq_per_qn,
+                                    })
+                                    reaper.Undo_BeginBlock()
+                                    local wok, werr = pcall(function()
+                                        for _, e in ipairs(res.edits) do        -- trims first...
+                                            reaper.MIDI_SetNote(take, e.index, nil, nil, nil, e.new_end, nil, nil, nil, true)
+                                        end
+                                        for _, idx in ipairs(res.removals) do   -- ...then deletes, descending
+                                            reaper.MIDI_DeleteNote(take, idx)
+                                        end
+                                        reaper.MIDI_Sort(take)
+                                    end)
+                                    reaper.Undo_EndBlock("Remove overlapping MIDI notes", 4)
+                                    if wok then
+                                        response.notes = midi_note_list(take, item)
+                                        response.mode = mode
+                                        response.notes_changed = res.trimmed   -- 0 in delete mode
+                                        response.clamped = 0
+                                        response.skipped = 0
+                                        response.out_of_bounds = 0
+                                        response.trimmed = res.trimmed
+                                        response.deduped = res.deduped
+                                        response.deleted = res.deleted
+                                        response.notes_removed = res.deduped + res.deleted
+                                        response.ok = true
+                                    else
+                                        response.error = "Remove overlapping failed: " .. tostring(werr)
+                                        response.ok = false
+                                    end
+                                end
+                            end
+                        else
+                            response.error = "RemoveOverlappingMIDINotes requires track_index, item_index"
                             response.ok = false
                         end
 
@@ -4954,271 +6252,6 @@ local function process_request()
                             response.vel = vel
                         else
                             response.error = "MIDI_GetNote requires 2 arguments"
-                            response.ok = false
-                        end
-                    
-                    elseif fname == "TransposeMIDINotes" then
-                        -- Transpose MIDI notes by item/take indices
-                        if #args >= 4 then
-                            local item_index = args[1]
-                            local take_index = args[2]
-                            local semitones = args[3]
-                            local selected_only = args[4]
-                            
-                            -- Get item
-                            local item = reaper.GetMediaItem(0, item_index)
-                            if not item then
-                                response.error = "Item not found"
-                                response.ok = false
-                            else
-                                -- Get take
-                                local take = reaper.GetMediaItemTake(item, take_index)
-                                if not take then
-                                    response.error = "Take not found"
-                                    response.ok = false
-                                else
-                                    -- Check if MIDI
-                                    if not reaper.TakeIsMIDI(take) then
-                                        response.error = "Take is not MIDI"
-                                        response.ok = false
-                                    else
-                                        -- Count notes
-                                        local retval, notes = reaper.MIDI_CountEvts(take)
-                                        local transposed = 0
-                                        
-                                        -- Transpose each note
-                                        for i = 0, notes - 1 do
-                                            local retval, selected, muted, startppqpos, endppqpos, chan, pitch, vel = reaper.MIDI_GetNote(take, i)
-                                            
-                                            if retval and (not selected_only or selected) then
-                                                local new_pitch = math.max(0, math.min(127, pitch + semitones))
-                                                reaper.MIDI_SetNote(take, i, selected, muted, startppqpos, endppqpos, chan, new_pitch, vel, false)
-                                                transposed = transposed + 1
-                                            end
-                                        end
-                                        
-                                        -- Sort notes
-                                        reaper.MIDI_Sort(take)
-                                        
-                                        response.ok = true
-                                        response.transposed = transposed
-                                        response.notes = notes
-                                    end
-                                end
-                            end
-                        else
-                            response.error = "TransposeMIDINotes requires 4 arguments"
-                            response.ok = false
-                        end
-                    
-                    elseif fname == "QuantizeMIDINotes" then
-                        -- Quantize MIDI notes by item/take indices
-                        if #args >= 4 then
-                            local item_index = args[1]
-                            local take_index = args[2]
-                            local grid_size = args[3]  -- In PPQ
-                            local strength = args[4]
-                            
-                            -- Get item
-                            local item = reaper.GetMediaItem(0, item_index)
-                            if not item then
-                                response.error = "Item not found"
-                                response.ok = false
-                            else
-                                -- Get take
-                                local take = reaper.GetMediaItemTake(item, take_index)
-                                if not take then
-                                    response.error = "Take not found"
-                                    response.ok = false
-                                else
-                                    -- Check if MIDI
-                                    if not reaper.TakeIsMIDI(take) then
-                                        response.error = "Take is not MIDI"
-                                        response.ok = false
-                                    else
-                                        -- Count notes
-                                        local retval, notes = reaper.MIDI_CountEvts(take)
-                                        local quantized = 0
-                                        
-                                        -- Quantize each note
-                                        for i = 0, notes - 1 do
-                                            local retval, selected, muted, startppqpos, endppqpos, chan, pitch, vel = reaper.MIDI_GetNote(take, i)
-                                            
-                                            if retval then
-                                                -- Calculate quantized position
-                                                local nearest_grid = math.floor(startppqpos / grid_size + 0.5) * grid_size
-                                                -- Apply strength
-                                                local new_pos = startppqpos + (nearest_grid - startppqpos) * strength
-                                                -- Calculate new end position (maintain length)
-                                                local length = endppqpos - startppqpos
-                                                local new_end = new_pos + length
-                                                
-                                                reaper.MIDI_SetNote(take, i, selected, muted, new_pos, new_end, chan, pitch, vel, false)
-                                                quantized = quantized + 1
-                                            end
-                                        end
-                                        
-                                        -- Sort notes
-                                        reaper.MIDI_Sort(take)
-                                        
-                                        response.ok = true
-                                        response.quantized = quantized
-                                        response.notes = notes
-                                    end
-                                end
-                            end
-                        else
-                            response.error = "QuantizeMIDINotes requires 4 arguments"
-                            response.ok = false
-                        end
-                    
-                    elseif fname == "HumanizeMIDITiming" then
-                        -- Humanize MIDI notes by item/take indices
-                        if #args >= 4 then
-                            local item_index = args[1]
-                            local take_index = args[2]
-                            local timing_amount = args[3]  -- In seconds
-                            local velocity_amount = args[4]  -- 0-1 range
-                            
-                            -- Get item
-                            local item = reaper.GetMediaItem(0, item_index)
-                            if not item then
-                                response.error = "Item not found"
-                                response.ok = false
-                            else
-                                -- Get take
-                                local take = reaper.GetMediaItemTake(item, take_index)
-                                if not take then
-                                    response.error = "Take not found"
-                                    response.ok = false
-                                else
-                                    -- Check if MIDI
-                                    if not reaper.TakeIsMIDI(take) then
-                                        response.error = "Take is not MIDI"
-                                        response.ok = false
-                                    else
-                                        -- Count notes
-                                        local retval, notes = reaper.MIDI_CountEvts(take)
-                                        local humanized = 0
-                                        
-                                        local ppq_per_quarter = 960
-                                        local max_timing_shift = timing_amount * ppq_per_quarter
-                                        
-                                        -- Humanize each note
-                                        for i = 0, notes - 1 do
-                                            local retval, selected, muted, startppqpos, endppqpos, chan, pitch, vel = reaper.MIDI_GetNote(take, i)
-                                            
-                                            if retval then
-                                                -- Randomize timing
-                                                local timing_shift = (math.random() * 2 - 1) * max_timing_shift
-                                                local new_start = math.max(0, startppqpos + timing_shift)
-                                                local new_end = endppqpos + timing_shift
-                                                
-                                                -- Randomize velocity
-                                                local vel_shift = (math.random() * 2 - 1) * velocity_amount * 127
-                                                local new_vel = math.max(1, math.min(127, math.floor(vel + vel_shift)))
-                                                
-                                                reaper.MIDI_SetNote(take, i, selected, muted, new_start, new_end, chan, pitch, new_vel, false)
-                                                humanized = humanized + 1
-                                            end
-                                        end
-                                        
-                                        -- Sort notes
-                                        reaper.MIDI_Sort(take)
-                                        
-                                        response.ok = true
-                                        response.humanized = humanized
-                                        response.notes = notes
-                                    end
-                                end
-                            end
-                        else
-                            response.error = "HumanizeMIDITiming requires 4 arguments"
-                            response.ok = false
-                        end
-                    
-                    elseif fname == "AnalyzeMIDIPattern" then
-                        -- Analyze MIDI pattern by item/take indices
-                        if #args >= 2 then
-                            local item_index = args[1]
-                            local take_index = args[2]
-                            
-                            -- Get item
-                            local item = reaper.GetMediaItem(0, item_index)
-                            if not item then
-                                response.error = "Item not found"
-                                response.ok = false
-                            else
-                                -- Get take
-                                local take = reaper.GetMediaItemTake(item, take_index)
-                                if not take then
-                                    response.error = "Take not found"
-                                    response.ok = false
-                                else
-                                    -- Check if MIDI
-                                    if not reaper.TakeIsMIDI(take) then
-                                        response.error = "Take is not MIDI"
-                                        response.ok = false
-                                    else
-                                        -- Count notes
-                                        local retval, notes = reaper.MIDI_CountEvts(take)
-                                        
-                                        -- Analyze first few notes for patterns
-                                        local pitches = {}
-                                        local velocities = {}
-                                        local max_notes = math.min(notes, 50)
-                                        
-                                        for i = 0, max_notes - 1 do
-                                            local retval, selected, muted, startppqpos, endppqpos, chan, pitch, vel = reaper.MIDI_GetNote(take, i)
-                                            if retval then
-                                                table.insert(pitches, pitch)
-                                                table.insert(velocities, vel)
-                                            end
-                                        end
-                                        
-                                        if #pitches == 0 then
-                                            response.ok = true
-                                            response.analysis = "No notes to analyze"
-                                        else
-                                            -- Basic pattern analysis
-                                            local min_pitch = math.min(table.unpack(pitches))
-                                            local max_pitch = math.max(table.unpack(pitches))
-                                            local pitch_range = max_pitch - min_pitch
-                                            
-                                            local total_vel = 0
-                                            for _, v in ipairs(velocities) do
-                                                total_vel = total_vel + v
-                                            end
-                                            local avg_velocity = total_vel / #velocities
-                                            
-                                            -- Detect intervals
-                                            local ascending = true
-                                            local descending = true
-                                            for i = 2, #pitches do
-                                                if pitches[i] <= pitches[i-1] then
-                                                    ascending = false
-                                                end
-                                                if pitches[i] >= pitches[i-1] then
-                                                    descending = false
-                                                end
-                                            end
-                                            
-                                            local pattern_type = "mixed"
-                                            if ascending then pattern_type = "ascending"
-                                            elseif descending then pattern_type = "descending"
-                                            end
-                                            
-                                            response.ok = true
-                                            response.notes_analyzed = #pitches
-                                            response.pitch_range = pitch_range
-                                            response.pattern_type = pattern_type
-                                            response.avg_velocity = avg_velocity
-                                        end
-                                    end
-                                end
-                            end
-                        else
-                            response.error = "AnalyzeMIDIPattern requires 2 arguments"
                             response.ok = false
                         end
                     

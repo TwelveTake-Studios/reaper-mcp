@@ -5,6 +5,56 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.0] - 2026-07-17
+
+MIDI Utilities: 13 tools for editing notes that already exist. **The bridge changed — reinstall
+`reaper_mcp_bridge.lua` in REAPER.**
+
+Every new tool takes the same optional filter — a pitch range, an onset window in beats from the
+item start, and a channel — so you can target a phrase without selecting anything by hand. Timing
+is in beats, pitch in semitones, and each tool is a single undo step.
+
+### Added
+- `transpose_midi_notes` — shift pitch. A note pushed outside 0-127 is left where it is and
+  reported in `skipped`; it is never wrapped to another octave or dropped.
+- `snap_midi_notes_to_scale` — snap off-key notes onto a scale. 14 named scales (plus `ionian` /
+  `aeolian` / `natural_minor` aliases) or a custom list of intervals. `nearest` breaks a tie
+  toward the middle of the selection, so a line does not drift; `up`/`down` skip rather than
+  fall back to the other direction.
+- `quantize_midi_notes` — snap onsets to the **project** bar/beat grid, so notes land where the
+  ruler says a 16th is. `strength` tightens partway; `swing` pushes the off-beats late.
+- `nudge_midi_notes` — shift notes in time; lengths preserved.
+- `stretch_midi_notes` — scale timing about a fixed pivot (half-time, double-time, any ratio);
+  the phrase keeps its rhythm while changing speed.
+- `legato_midi_notes` — run each note's end to the next onset, or set every note to one length.
+  Never shortens in `connect` mode, and leaves gaps wider than `max_gap_beats` as rests.
+- `humanize_midi_notes` — seeded gaussian timing + velocity jitter. The RNG runs on the server,
+  not in REAPER, so the same take with the same seed is byte-identical every time.
+- `strum_midi_notes` — roll a chord out into a strum; invents no notes.
+- `ramp_midi_note_velocities` — linear velocity ramp across a phrase; notes sharing an onset get
+  one velocity, so a chord stays a chord.
+- `scale_midi_note_velocities` — multiply, set, or compress velocities toward a pivot.
+- `set_midi_note` — edit one note's pitch, velocity, timing or channel.
+- `get_selected_midi_notes` — read the notes selected in REAPER's editor.
+- `remove_overlapping_midi_notes` — trim or delete overlapping same-pitch notes. The only tool
+  here that removes notes, and the only one flagged `destructive`. Chords, the same pitch on
+  another channel, and notes that merely touch are never treated as overlaps.
+
+### Changed
+- Every MIDI note returned by the server now carries **`start_beat` / `end_beat`** — the note's
+  position in beats from its item's start — alongside the existing `start_time` / `end_time`
+  seconds. These feed the new tools' beat filters exactly, so a position you read back can be
+  passed straight into a filter. Added to `get_midi_notes` too; no existing field was removed.
+- Timing throughout is computed in quarter-notes rather than seconds, so the tools behave
+  correctly on tempo-mapped projects.
+
+### Removed
+- Five dead MIDI handlers that no tool could reach (`QuantizeItem`, `TransposeMIDINotes`,
+  `QuantizeMIDINotes`, `HumanizeMIDITiming`, `AnalyzeMIDIPattern`). They were unreachable from
+  every public entry point, so no shipped behaviour changes. Among them: a "quantize" that
+  returned `ok` without touching a note, and a humanize with a hardcoded PPQ that silently
+  restretched notes.
+
 ## [1.5.1] - 2026-07-05
 
 Documentation release. No changes to the server, tools, or bridge — you do **not** need to

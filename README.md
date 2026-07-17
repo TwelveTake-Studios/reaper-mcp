@@ -2,13 +2,13 @@
 
 A [TwelveTake Studios](https://twelvetake.com) project.
 
-[![Tools](https://img.shields.io/badge/tools-163-blue)](https://github.com/TwelveTake-Studios/reaper-mcp)
+[![Tools](https://img.shields.io/badge/tools-176-blue)](https://github.com/TwelveTake-Studios/reaper-mcp)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow)](https://buymeacoffee.com/twelvetake)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-ff5e5b)](https://ko-fi.com/twelvetake)
 
 A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control REAPER DAW for mixing, mastering, MIDI composition, and full music production workflows.
 
-**Version:** 1.5.1
+**Version:** 1.6.0
 
 ## Why This Server
 
@@ -30,19 +30,21 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
 - **Stock REAPER Lua only** — the bridge script has no dependencies, nothing extra to install in REAPER
 - Copy the script, run it, connect your AI assistant
 
-### 163 Tools Covering Real Production Needs
+### 176 Tools Covering Real Production Needs
 
 - **Full FX control** — add/remove plugins, get/set any parameter by index, manage presets, bypass
 - **FX parameter automation** — automate any plugin knob (flanger depth, filter cutoff, etc.)
 - **Complete routing** — sends, receives, sidechain routing to specific channel pairs
 - **Automation** — create envelopes, add/edit points, set automation modes
 - **MIDI** — create items, add notes individually or in batches, edit velocities
+- **MIDI editing** — transpose, quantize with swing, humanize, snap to a scale, stretch, legato,
+  strum, velocity ramps — each targetable by pitch range, beat window, or channel
 - **Audio items** — import, split, duplicate, fade, position, mute
 - **Markers & regions** — create, edit, navigate, render by region
 
 ## Requirements
 
-- REAPER (any recent version)
+- REAPER (any recent version; full live suite green through **REAPER 7.77**)
 - Python 3.8+ (for the MCP server)
 - An MCP-compatible AI assistant
 
@@ -59,20 +61,72 @@ The bridge script runs inside REAPER and handles communication with the MCP serv
 2. In REAPER: **Actions → Show action list → Load ReaScript**
 3. Select `reaper_mcp_bridge.lua` and click **Run**
 
-You should see "REAPER MCP Bridge started" in REAPER's console.
+You should see "REAPER MCP Bridge (File-based, Full API) started" in REAPER's console.
 
-### 2. Install the MCP Server
+### 2. Install and Configure the MCP Server
 
-```bash
-pip install -r requirements.txt
+The server is published on PyPI as **`twelvetake-reaper-mcp`**. The simplest path is to let your
+MCP client launch it with [`uvx`](https://docs.astral.sh/uv/) (or `pipx`) — nothing to install by hand.
+
+Add it to your MCP client's configuration (e.g. `.mcp.json`, or your client's MCP settings):
+
+```json
+{
+  "mcpServers": {
+    "reaper": {
+      "command": "uvx",
+      "args": ["twelvetake-reaper-mcp"]
+    }
+  }
+}
 ```
 
-Or install dependencies directly:
+> VS Code uses a top-level `servers` key with `"type": "stdio"` instead of `mcpServers`.
+
+To confirm the server starts on its own:
+
 ```bash
-pip install mcp httpx
+uvx twelvetake-reaper-mcp
+# or: pipx run twelvetake-reaper-mcp
 ```
 
-#### Alternative: Nix flake (optional)
+It waits quietly for a client to connect — press Ctrl+C to stop.
+
+### 3. Verify
+
+With REAPER open and the bridge running, ask your assistant **"how many tracks are in my project?"** —
+a number back means the server, bridge, and REAPER are all talking.
+
+---
+
+### Run from source (for development)
+
+To work on the server itself, run it from a clone instead of from PyPI. Install the dependencies:
+
+```bash
+pip install -r requirements.txt   # or: pip install mcp httpx
+```
+
+Point your MCP client at the local script:
+
+```json
+{
+  "mcpServers": {
+    "reaper": {
+      "command": "python",
+      "args": ["path/to/reaper_mcp_server.py"]
+    }
+  }
+}
+```
+
+Then check the connection with:
+
+```bash
+python test_connection.py
+```
+
+#### Nix flake (optional)
 
 If you use [Nix](https://nixos.org/), the repo ships a flake-based dev shell that provides
 Python 3.12 and creates/activates a virtualenv for you:
@@ -86,6 +140,7 @@ direnv allow
 ```
 
 Then install the dependencies as usual:
+
 ```bash
 pip install -r requirements.txt
 ```
@@ -94,27 +149,6 @@ This pins the Python version and keeps dependencies isolated from your system.
 
 > **Note:** the `x86_64-linux` dev shell is tested and working. The macOS (Darwin) shells are
 > provided but have **not** been tested — confirmation from a macOS user is welcome.
-
-### 3. Configure Your AI Assistant
-
-Add to your MCP client's configuration (e.g., `.mcp.json`):
-
-```json
-{
-  "mcpServers": {
-    "reaper": {
-      "command": "python",
-      "args": ["path/to/reaper_mcp_server.py"]
-    }
-  }
-}
-```
-
-### 4. Verify Connection
-
-```bash
-python test_connection.py
-```
 
 ## Communication Modes
 
@@ -362,6 +396,31 @@ Multi-take workflows: list/switch/delete takes, explode/crop, REAPER 7 fixed-lan
 | `delete_midi_note(track, item, note)` | Delete a note |
 | `clear_midi_item(track, item)` | Delete all notes |
 | `set_midi_note_velocity(track, item, note, vel)` | Change note velocity |
+
+### MIDI Utilities (13 tools)
+
+Editing tools for notes that already exist. Every one takes the same optional filter — a pitch
+range, an onset window in beats from the item start, and a channel — so you can target a phrase
+without selecting anything by hand. Timing is in beats, pitch in semitones. Each is one undo step.
+
+| Tool | Description |
+|------|-------------|
+| `transpose_midi_notes(track, item, semitones, ...)` | Shift pitch; notes pushed outside 0-127 are left alone, never wrapped |
+| `snap_midi_notes_to_scale(track, item, root, mode, ...)` | Snap off-key notes onto a scale (named or a custom interval list) |
+| `quantize_midi_notes(track, item, grid, strength, swing, ...)` | Snap onsets to the project grid, with strength and swing |
+| `nudge_midi_notes(track, item, amount_beats, ...)` | Shift notes in time; lengths preserved |
+| `stretch_midi_notes(track, item, factor, pivot_beat, ...)` | Scale timing about a pivot (half-time / double-time) |
+| `legato_midi_notes(track, item, mode, voice, ...)` | Close the gaps in a line, or set every note to one length |
+| `humanize_midi_notes(track, item, timing, velocity, seed, ...)` | Seeded, reproducible timing + velocity jitter |
+| `strum_midi_notes(track, item, spread_beats, direction, ...)` | Roll a chord out into a strum |
+| `ramp_midi_note_velocities(track, item, start_vel, end_vel, ...)` | Linear velocity ramp across a phrase (crescendo) |
+| `scale_midi_note_velocities(track, item, mode, ratio, ...)` | Multiply / set / compress velocities |
+| `set_midi_note(track, item, note, ...)` | Edit one note's pitch, velocity, timing, channel |
+| `get_selected_midi_notes(track, item)` | Read the notes selected in REAPER's editor |
+| `remove_overlapping_midi_notes(track, item, mode, ...)` | Trim or delete overlapping same-pitch notes |
+
+`remove_overlapping_midi_notes` is the only one here that can remove notes; the rest only move
+what is already there. It is flagged `destructive` so a client can prompt first.
 
 ### Audio Items (17 tools)
 
