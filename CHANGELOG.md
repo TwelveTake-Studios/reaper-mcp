@@ -154,10 +154,10 @@ changes.
 ### Changed
 - `requires-python` is now `>=3.10`, and the 3.8/3.9 classifiers are gone. CI has only ever
   tested 3.10 and up; the old claim gave 3.8 users a clean install and a broken runtime.
-- Platform path resolution is now covered by tests that run everywhere, so a `%APPDATA%`-class
-  regression fails a test rather than waiting for a user to report it. A macOS and Windows CI
-  matrix that exercises this on each platform, plus a job asserting the wheel contains the
-  bridge script, is written but not yet enabled on the public repo.
+- Platform path resolution and the packaging declaration are both covered by tests that run in
+  CI, so a `%APPDATA%`-class regression, or a wheel that quietly stops shipping the bridge
+  script, fails a test rather than waiting for a user to hit it. A macOS and Windows runner
+  matrix is planned but not yet enabled.
 - The bridge's JSON decoder, the FX list response shape, and the tools/list payload size are
   now covered by tests that run without REAPER.
 
