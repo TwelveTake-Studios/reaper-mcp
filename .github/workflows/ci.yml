@@ -8,11 +8,20 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
+        os: [ubuntu-latest]
         python-version: ["3.10", "3.11", "3.12", "3.13"]
+        include:
+          # The bridge directory was resolved with a Windows-only %APPDATA% string for a
+          # year, and CI never noticed because CI was Linux only. One job per platform is
+          # enough to catch a path regression; REAPER itself still cannot be driven here.
+          - os: macos-latest
+            python-version: "3.13"
+          - os: windows-latest
+            python-version: "3.13"
 
     steps:
       - uses: actions/checkout@v4
@@ -32,3 +41,26 @@ jobs:
 
       - name: Test (pytest)
         run: pytest -q
+
+      - name: Bridge directory resolves on this platform
+        run: python -c "import os, reaper_mcp_server as s; p = str(s.default_bridge_dir()); assert '%' not in p, p; assert os.path.isabs(p), p; print('resolved:', p)"
+
+  package:
+    # Guards the packaging bug that made the documented install unperformable: the wheel
+    # shipped the server and not the bridge script, so `uvx twelvetake-reaper-mcp` handed
+    # users half the product with no way to get the other half.
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Build the wheel
+        run: |
+          python -m pip install --upgrade pip build
+          python -m build --wheel --outdir dist_check
+
+      - name: Wheel contains the bridge script
+        run: python -c "import glob, zipfile; w = glob.glob('dist_check/*.whl')[0]; n = zipfile.ZipFile(w).namelist(); assert 'reaper_mcp_bridge.lua' in n, n; print('bridge present in', w)"
