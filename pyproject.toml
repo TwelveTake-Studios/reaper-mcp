@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "twelvetake-reaper-mcp"
-version = "1.6.1"
+version = "1.6.2"
 description = "MCP server for controlling REAPER DAW - mixing, mastering, MIDI composition, and full music production"
 readme = "README.md"
 license = "MIT"
@@ -43,7 +43,10 @@ classifiers = [
     "Topic :: Software Development :: Libraries :: Python Modules",
 ]
 dependencies = [
-    "mcp>=1.2.0",
+    # Capped below 2.0: mcp 2.0 moved/removed `mcp.server.fastmcp`, which this server imports
+    # at module scope, so an unbounded constraint resolves to a version that cannot start.
+    # Raise the cap only after porting to whatever 2.x calls FastMCP.
+    "mcp>=1.2.0,<2.0",
     "httpx>=0.25.0",
 ]
 

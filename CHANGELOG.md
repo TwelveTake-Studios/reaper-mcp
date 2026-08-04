@@ -5,6 +5,20 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.2] - 2026-08-04
+
+**Install-breaking fix. If you installed 1.6.1, upgrade.**
+
+### Fixed
+- **A fresh install of 1.6.1 could not start.** The `mcp` dependency was declared as
+  `mcp>=1.2.0` with no upper bound. `mcp` 2.0.0 was published, it moved or removed
+  `mcp.server.fastmcp`, and this server imports that at module scope, so any new install
+  resolved to a version that raised `ModuleNotFoundError: No module named 'mcp.server.fastmcp'`
+  before doing anything at all. Existing installs with an older `mcp` already present were
+  unaffected, which is exactly why it was not noticed: the development environment had 1.28.0
+  pinned. Now capped at `mcp>=1.2.0,<2.0`. *(Lee Saenz ([@fadelabs](https://github.com/fadelabs))
+  capped this in his fork on 2026-07-30, before it broke anything here.)*
+
 ## [1.6.1] - 2026-08-04
 
 Reliability and reach. No new tools; 176 total. **The bridge changed - reinstall
@@ -417,6 +431,7 @@ Total tools: **130**.
 - File-based communication bridge (default) plus optional HTTP mode
   (Lua and Python in-REAPER servers).
 
+[1.6.2]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.6.2
 [1.6.1]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.6.1
 [1.6.0]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.6.0
 [1.5.1]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.5.1

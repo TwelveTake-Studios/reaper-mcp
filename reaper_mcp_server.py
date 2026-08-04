@@ -9,10 +9,10 @@ A TwelveTake Studios project - https://twelvetake.com
 
 Author: TwelveTake Studios LLC
 License: MIT
-Version: 1.6.1
+Version: 1.6.2
 """
 
-__version__ = "1.6.1"
+__version__ = "1.6.2"
 
 import os
 import asyncio
