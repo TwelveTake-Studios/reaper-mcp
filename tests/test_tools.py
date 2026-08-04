@@ -313,3 +313,14 @@ def test_fx_preset_tools_marshalling(reaper):
     assert reaper.last == ("TrackFX_GetPresetList", [0, 1])
     run(srv.save_fx_preset(0, 1, "My Preset"))
     assert reaper.last == ("TrackFX_SavePreset", [0, 1, "My Preset"])
+
+
+def test_track_fx_get_list_calls_dedicated_handler(reaper):
+    """The docstring promises index+name+enabled; GetTrackInfo cannot supply it."""
+    run(srv.track_fx_get_list(0))
+    assert reaper.last == ("GetTrackFXList", [0])
+
+
+def test_track_fx_get_list_master(reaper):
+    run(srv.track_fx_get_list(-1))
+    assert reaper.last == ("GetTrackFXList", [-1])

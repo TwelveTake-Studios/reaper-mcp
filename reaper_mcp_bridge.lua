@@ -281,6 +281,35 @@ local function GetTrackInfo(track_index)
     }
 end
 
+-- Get the FX chain on a track: index, name and bypass state per FX.
+-- GetTrackInfo carries only fx_names (no index, no enabled), which cannot
+-- satisfy track_fx_get_list's documented contract.
+local function GetTrackFXList(track_index)
+    local track = nil
+    if track_index == -1 then
+        track = reaper.GetMasterTrack(0)
+    else
+        track = reaper.GetTrack(0, track_index)
+    end
+
+    if not track then
+        return {ok = false, error = "Track not found"}
+    end
+
+    local fx = as_array({})
+    local fx_count = reaper.TrackFX_GetCount(track)
+    for i = 0, fx_count - 1 do
+        local retval, fx_name = reaper.TrackFX_GetFXName(track, i, "")
+        table.insert(fx, {
+            index = i,
+            name = retval and fx_name or "",
+            enabled = reaper.TrackFX_GetEnabled(track, i)
+        })
+    end
+
+    return {ok = true, fx = fx}
+end
+
 -- Get all tracks with detailed info
 local function GetAllTracksInfo()
     local tracks = as_array({})
@@ -974,6 +1003,7 @@ end
 DSL_FUNCTIONS = {
     -- Track info
     GetTrackInfo = GetTrackInfo,
+    GetTrackFXList = GetTrackFXList,
     GetAllTracksInfo = GetAllTracksInfo,
     GetSelectedTracks = GetSelectedTracks,
     SetTrackNotes = SetTrackNotes,

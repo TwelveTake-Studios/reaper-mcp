@@ -367,8 +367,7 @@ async def track_fx_get_list(track_index: int) -> dict:
     Returns:
         Object with 'fx' array containing each FX's index, name, and enabled state.
     """
-    # Use the DSL function which returns detailed info
-    return await reaper_call("GetTrackInfo", track_index)
+    return await reaper_call("GetTrackFXList", track_index)
 
 
 @mcp.tool()
