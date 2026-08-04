@@ -5,6 +5,136 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.1] - 2026-08-04
+
+Reliability and reach. No new tools; 176 total. **The bridge changed - reinstall
+`reaper_mcp_bridge.lua` in REAPER**, and this release will tell you so instead of failing
+in obscure ways: the server now checks the deployed bridge's version and refuses to run
+against a stale one. `twelvetake-reaper-mcp --install-bridge` does the deploying for you.
+
+**With thanks to [@SNChicago](https://github.com/SNChicago), whose
+[PR #9](https://github.com/TwelveTake-Studios/reaper-mcp/pull/9) diagnosed and fixed two
+contract bugs ported here, and whose report prompted the wider audit behind this release.**
+
+**And to Lee Saenz ([@fadelabs](https://github.com/fadelabs)), whose independent audit in the
+MIT-licensed [fadelabs/reaper-mcp](https://github.com/fadelabs/reaper-mcp) fork found four of
+the bugs fixed below before this project did**, and specified the fixes: `track_fx_get_list`
+returning track info instead of an FX list (naming `GetTrackFXList` and the exact
+`TrackFX_GetCount` + `TrackFX_GetFXName` + `TrackFX_GetEnabled` shape shipped here);
+`create_project`'s `name` parameter being inert, with the recommendation to remove it;
+`insert_audio_file` needing a real bridge handler, which his fork calls `InsertAudioFile` as
+this one now does; and the shifted-argument track naming bug whose remaining cases were
+`create_bus` and `add_parallel_compression`. @SNChicago credited that fork in PR #9, which is
+how it was found. The implementations here were written independently, but the diagnoses were
+his first, and he had never opened an issue or PR here to say so.
+
+**And to Caio Lins ([@caio-soundraw](https://github.com/caio-soundraw)), who identified the
+macOS bridge-path failure in February 2026**, six months before the fix below, working around
+it with a wrapper that resolved `~/Library/Application Support/REAPER/Scripts/mcp_bridge_data`
+and logged the resolved directory, which is the same path and the same diagnostic this release
+builds in. He also independently fixed the MIDI call-path bugs in his fork.
+
+**Breaking:** `create_project`'s `name` parameter is removed. It never had any effect, and
+callers still passing it are ignored rather than errored, but the published input schema
+changes.
+
+### Fixed
+- **macOS and Linux users could not connect at all.** The bridge directory was built from a
+  Windows-only `%APPDATA%` string, which does not expand on POSIX. It collapsed into a single
+  relative directory name, got created in whatever folder the MCP client happened to be in,
+  and the server spent every call talking to a directory REAPER had never heard of. Every
+  call timed out after 5 seconds and the error blamed the bridge script, which was the one
+  thing that was fine. The path is now resolved per platform, mirroring the bridge's own
+  `GetResourcePath()`. The Windows path is byte-identical to before, so existing installs
+  see no change. *(Identified by @caio-soundraw in February 2026, six months before this fix.)*
+- **The wheel did not contain the bridge script.** `uvx twelvetake-reaper-mcp`, the install
+  in the README, handed you a server and no bridge, unpacked into a throwaway cache with no
+  path to dig it out of. Step 1 of the documented install could not be performed by the
+  documented install method.
+- **`track_fx_get_list` did not return an FX list.** It documented an `fx` array of index,
+  name and enabled state, but called `GetTrackInfo`, whose payload carries only `fx_names`:
+  bare strings, no index, no bypass state. Read-before-write on an FX chain was impossible,
+  and a bypassed plugin was indistinguishable from an active one. It now has its own handler
+  returning `fx[{index, name, enabled, offline}]` plus `fx_count`. *(Diagnosed and fixed by
+  @SNChicago in PR #9, who credited @fadelabs' audit, which had named both the bug and this
+  exact fix first.)*
+- **`create_project(name)` ignored the name and saved your project instead.** The name was
+  never sent to REAPER. Worse, passing one triggered a stray `Main_SaveProject`, which is a
+  plain Ctrl+S: on a brand-new untitled project REAPER either raises a modal Save dialog,
+  which blocks the bridge until a human clicks it, or writes a file nobody asked for. The
+  save is gone. *(Diagnosed by @SNChicago in PR #9; @fadelabs' audit independently reached the
+  same recommendation to remove the parameter.)*
+- **`create_bus` and `add_parallel_compression` never named the bus.** A spurious leading
+  argument shifted every other argument along, landing the name where the write flag belongs,
+  where it coerced to false. The call became a silent read: the bus was created, kept its
+  default name, and the tool reported success. Both now report an error if naming fails,
+  including the index of the track they left behind. *(The remaining cases of the shifted-argument
+  bug @fadelabs' audit reported against `insert_track`.)*
+- **`insert_audio_file` ignored `track_index` and `position` entirely.** It called ReaScript's
+  `InsertMedia(file, mode)`, which takes two arguments, with four, so both simply fell off the
+  end. Audio landed on whatever track happened to be selected, at the edit cursor, and the tool
+  reported success. It now has a bridge handler that aims the track and position deliberately
+  and then restores your selection and cursor. *(Diagnosed by @fadelabs, whose fork added an
+  `InsertAudioFile` handler under that same name six weeks before this one.)*
+- **`get_project_name` always returned an empty string.** The bridge read the name out of the
+  second return value, but the underlying call writes into a buffer and returns the name as the
+  first, so both the `ret` and `name` fields were empty for every caller since the tool existed.
+  The `get_project_path` handler two doors down had always done this correctly.
+- **`get_track` never returned the `volume_db` and `pan` it has documented since 1.0.** They
+  were simply absent from the payload, and nothing else exposed single-track volume or pan
+  either: the only way to read them was `get_project_summary`, for the whole project at once.
+  Both are now returned, along with `volume` in linear form.
+- **`add_fx_envelope_point` returned a boolean in a field called `point_index`.** Feeding that
+  into `delete_fx_envelope_point` coerced `true` to `1`, so you deleted envelope point 1 rather
+  than the point you had just added. It now resolves and returns the real index, and reports
+  failure instead of claiming success.
+- **A small number could silently shorten a call.** The bridge's JSON decoder rejected
+  scientific notation, so `1.2e-05` (which is what a -100 dB gain becomes) decoded to nothing,
+  punched a hole in the argument array, and Lua's length operator stopped at the hole. The
+  call arrived with arguments missing rather than failing.
+- **A comma inside a name split one argument into two.** The array scanner was not
+  string-aware, so a track called `Gtr, DI` shifted every argument after it.
+- **A request the bridge could not parse produced silence.** No response was written at all,
+  so the server sat out its full timeout and then reported the wrong cause. Malformed requests
+  now get an immediate, named error.
+- **The bridge stole focus from the arrange view on every call.** `ShowConsoleMsg` raises the
+  console window. Per-call logging is now off by default; errors and the startup banner still
+  print. Set `REAPER_MCP_DEBUG=1` to get it back.
+
+### Known, not fixed
+- The bridge still probes 1000 files per timer tick while idle, roughly 30,000 failed file
+  opens per second on REAPER's UI thread. A directory-enumeration fix was written and then
+  reverted during live testing: it makes the per-tick cost scale with the number of files in
+  the bridge directory, and orphaned `response_N.json` files accumulate there (a timed-out
+  call leaves its response behind until that slot recycles), so round-trip time degraded from
+  0.07s to 0.53s with only 60 stale files present and got worse from there. Fixing this
+  properly means bounding that directory or changing the request-file protocol, and a protocol
+  change has to ship on both halves at once.
+
+### Added
+- `twelvetake-reaper-mcp --install-bridge [DIR]` copies the bridge script into REAPER's
+  Scripts folder, backing up any existing copy. Explicit and opt-in: the server never writes
+  into your REAPER installation on its own. `--version` and `--help` also added.
+- A bridge version handshake. The server probes the deployed script once per session and
+  refuses to run against one older than it needs, naming the fix, rather than failing later
+  with a confusing per-tool error. REAPER being closed is not mistaken for a stale bridge.
+- Timeout errors now include the resolved bridge directory, which turns "it just times out"
+  into a one-look diagnosis.
+- The server refuses to start against a bridge directory that cannot work, and logs the
+  directory it resolved to stderr at startup.
+
+### Changed
+- `requires-python` is now `>=3.10`, and the 3.8/3.9 classifiers are gone. CI has only ever
+  tested 3.10 and up; the old claim gave 3.8 users a clean install and a broken runtime.
+- CI now runs on macOS and Windows as well as Linux, and asserts the resolved bridge
+  directory is absolute and free of unexpanded variables on each. A separate job asserts the
+  wheel contains the bridge script.
+- The bridge's JSON decoder, the FX list response shape, and the tools/list payload size are
+  now covered by tests that run without REAPER.
+
+### Removed
+- `create_project`'s `name` parameter. See the breaking note above.
+
 ## [1.6.0] - 2026-07-17
 
 MIDI Utilities: 13 tools for editing notes that already exist. **The bridge changed — reinstall
@@ -286,6 +416,8 @@ Total tools: **130**.
 - File-based communication bridge (default) plus optional HTTP mode
   (Lua and Python in-REAPER servers).
 
+[1.6.1]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.6.1
+[1.6.0]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.6.0
 [1.5.1]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.5.1
 [1.5.0]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.5.0
 [1.4.2]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.4.2

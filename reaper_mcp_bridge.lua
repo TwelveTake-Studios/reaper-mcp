@@ -4,11 +4,22 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
+local BRIDGE_VERSION = "1.6.1"
+
 local bridge_dir = reaper.GetResourcePath() .. '/Scripts/mcp_bridge_data/'
 
 -- Create bridge directory if it doesn't exist
 local function ensure_dir()
     reaper.RecursiveCreateDirectory(bridge_dir, 0)
+end
+
+-- Per-call console logging is OFF by default. reaper.ShowConsoleMsg raises the console
+-- window, so with it on every single tool call steals focus away from the arrange view.
+-- Startup banners and errors still always print. Flip DEBUG to true here, or launch
+-- REAPER with REAPER_MCP_DEBUG=1, when diagnosing the bridge.
+local DEBUG = (os.getenv and os.getenv("REAPER_MCP_DEBUG") == "1") or false
+local function log(msg)
+    if DEBUG then reaper.ShowConsoleMsg(msg) end
 end
 
 -- Array marker: a table tagged via as_array() always serializes as a JSON array,
@@ -64,7 +75,12 @@ local function decode_json(str)
     if str == "null" then return nil
     elseif str == "true" then return true
     elseif str == "false" then return false
-    elseif str:match("^%-?%d+%.?%d*$") then return tonumber(str)
+    -- Numbers, including scientific notation. The exponent form is not academic:
+    -- db_to_linear(-100) is 1e-05, so any tool sending a small gain hits this branch.
+    -- Without the second pattern such a value decoded to nil, which punched a hole in
+    -- the surrounding args array and silently shortened the call (see decode_array).
+    elseif str:match("^%-?%d+%.?%d*$") or str:match("^%-?%d+%.?%d*[eE][-+]?%d+$") then
+        return tonumber(str)
     elseif str:match('^"(.*)"$') then
         -- Unescape string in a SINGLE pass so '\\' is consumed atomically.
         -- (Sequential gsubs corrupted Windows paths: in "Temp\\reaper" the second
@@ -75,37 +91,63 @@ local function decode_json(str)
         s = s:gsub('\\(.)', function(c) return escapes[c] or c end)
         return s
     elseif str:match("^%[.*%]$") then
-        -- Array - improved parsing
+        -- Array. The scanner is string-aware: a comma or a bracket inside a quoted
+        -- string must not split the element. A track named 'Gtr, DI' used to break
+        -- one argument into two and shift every argument after it.
         local arr = {}
         local content = str:sub(2, -2)
         if content ~= "" then
-            -- Handle nested structures better
             local i = 1
             local pos = 1
             local depth = 0
             local start = 1
-            
+            local in_string = false
+            local escape = false
+            local malformed = false
+
+            -- Decode one element. A nil result for anything but a literal `null`
+            -- means the element did not parse. Storing it would leave a hole, and
+            -- Lua's `#` stops at the first hole, silently shortening the argument
+            -- list. A short arg list is exactly how a bad value turns into a wrong
+            -- REAPER call, so the whole parse fails instead and the caller gets a
+            -- real error rather than a quiet mis-edit.
+            local function take(raw)
+                local text = raw:match("^%s*(.-)%s*$")
+                local value = decode_json(text)
+                if value == nil and text ~= "null" then
+                    malformed = true
+                    return
+                end
+                arr[i] = value
+                i = i + 1
+            end
+
             while pos <= #content do
                 local char = content:sub(pos, pos)
-                if char == '[' or char == '{' then
-                    depth = depth + 1
-                elseif char == ']' or char == '}' then
-                    depth = depth - 1
-                elseif char == ',' and depth == 0 then
-                    -- Found a top-level comma
-                    local value = content:sub(start, pos - 1)
-                    arr[i] = decode_json(value:match("^%s*(.-)%s*$"))
-                    i = i + 1
-                    start = pos + 1
+                if escape then
+                    escape = false
+                elseif char == '\\' then
+                    escape = true
+                elseif char == '"' then
+                    in_string = not in_string
+                elseif not in_string then
+                    if char == '[' or char == '{' then
+                        depth = depth + 1
+                    elseif char == ']' or char == '}' then
+                        depth = depth - 1
+                    elseif char == ',' and depth == 0 then
+                        take(content:sub(start, pos - 1))
+                        start = pos + 1
+                    end
                 end
                 pos = pos + 1
             end
-            
-            -- Don't forget the last element
+
             if start <= #content then
-                local value = content:sub(start)
-                arr[i] = decode_json(value:match("^%s*(.-)%s*$"))
+                take(content:sub(start))
             end
+
+            if malformed then return nil end
         end
         return arr
     elseif str:match("^{.*}$") then
@@ -266,6 +308,17 @@ local function GetTrackInfo(track_index)
         role = notes
     end
     
+    -- volume_db and pan were documented by get_track since 1.0 and never actually
+    -- returned. No tool exposed single-track volume or pan at all: the only way to read
+    -- them was get_project_summary, for the whole project. Same dB conversion the
+    -- summary uses. math.log(x)/math.log(10) rather than math.log(x,10) or math.log10,
+    -- both of which are version-dependent across the Lua REAPER ships.
+    local volume = reaper.GetMediaTrackInfo_Value(track, "D_VOL")
+    local volume_db = -150
+    if volume and volume > 0 then
+        volume_db = 20 * math.log(volume) / math.log(10)
+    end
+
     return {
         ok = true,
         info = {
@@ -275,10 +328,128 @@ local function GetTrackInfo(track_index)
             has_audio = has_audio,
             fx_names = fx_names,
             role = role,
+            volume = volume,
+            volume_db = volume_db,
+            pan = reaper.GetMediaTrackInfo_Value(track, "D_PAN"),
             muted = reaper.GetMediaTrackInfo_Value(track, "B_MUTE") == 1,
             soloed = reaper.GetMediaTrackInfo_Value(track, "I_SOLO") > 0
         }
     }
+end
+
+-- Insert an audio file onto a specific track at a specific position.
+--
+-- ReaScript's InsertMedia(file, mode) takes only two arguments and always drops the
+-- file on the SELECTED track at the EDIT CURSOR. The server used to call it with two
+-- extra arguments, which simply fell off the end: the tool's track_index and position
+-- were never sent anywhere, so audio landed wherever the user happened to be pointing
+-- and the tool still reported success.
+--
+-- So aim both deliberately, then put the user's selection and cursor back exactly as
+-- they were. Their selection is not ours to change as a side effect.
+local function InsertAudioFile(track_index, file_path, position)
+    if type(file_path) ~= "string" or file_path == "" then
+        return {ok = false, error = "file_path is required"}
+    end
+    local track = reaper.GetTrack(0, track_index)
+    if not track then
+        return {ok = false, error = "Track not found"}
+    end
+    position = position or 0
+
+    local saved_cursor = reaper.GetCursorPosition()
+    local total = reaper.CountTracks(0)
+    local saved_selection = {}
+    for i = 0, total - 1 do
+        saved_selection[i] = reaper.IsTrackSelected(reaper.GetTrack(0, i))
+    end
+
+    reaper.PreventUIRefresh(1)
+    for i = 0, total - 1 do
+        reaper.SetTrackSelected(reaper.GetTrack(0, i), false)
+    end
+    reaper.SetTrackSelected(track, true)
+    reaper.SetEditCurPos(position, false, false)
+
+    local before = reaper.CountTrackMediaItems(track)
+    reaper.InsertMedia(file_path, 0)
+    local after = reaper.CountTrackMediaItems(track)
+
+    for i = 0, total - 1 do
+        reaper.SetTrackSelected(reaper.GetTrack(0, i), saved_selection[i] and true or false)
+    end
+    reaper.SetEditCurPos(saved_cursor, false, false)
+    reaper.PreventUIRefresh(-1)
+    reaper.UpdateArrange()
+
+    if after <= before then
+        return {
+            ok = false,
+            error = "No item was created (file missing, or a format REAPER cannot import?)",
+            file_path = file_path
+        }
+    end
+
+    -- Identify the item we just made: the one starting nearest the requested position.
+    local item_index = nil
+    local best = nil
+    for i = 0, after - 1 do
+        local item = reaper.GetTrackMediaItem(track, i)
+        if item then
+            local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+            local distance = math.abs(pos - position)
+            if best == nil or distance < best then
+                best = distance
+                item_index = i
+            end
+        end
+    end
+
+    return {
+        ok = true,
+        track_index = track_index,
+        item_index = item_index,
+        position = position,
+        items_added = after - before
+    }
+end
+
+-- Get the FX chain on a track: index, name, bypass and offline state per FX.
+--
+-- GetTrackInfo carries only fx_names, a flat array of strings with no index and no
+-- enabled state, which cannot satisfy track_fx_get_list's documented contract.
+-- Diagnosed by @SNChicago in PR #9.
+--
+-- The row is emitted even when TrackFX_GetFXName returns false. GetTrackInfo SKIPS
+-- such an FX, which silently shifts every later name down a slot with nothing in the
+-- payload to detect it; here `index` always matches the real chain position.
+--
+-- Covers the normal FX chain only, not input/record FX or master monitoring FX.
+local function GetTrackFXList(track_index)
+    local track = nil
+    if track_index == -1 then
+        track = reaper.GetMasterTrack(0)
+    else
+        track = reaper.GetTrack(0, track_index)
+    end
+
+    if not track then
+        return {ok = false, error = "Track not found"}
+    end
+
+    local fx = as_array({})
+    local fx_count = reaper.TrackFX_GetCount(track)
+    for i = 0, fx_count - 1 do
+        local retval, fx_name = reaper.TrackFX_GetFXName(track, i, "")
+        table.insert(fx, {
+            index = i,
+            name = retval and fx_name or "",
+            enabled = reaper.TrackFX_GetEnabled(track, i),
+            offline = reaper.TrackFX_GetOffline(track, i)
+        })
+    end
+
+    return {ok = true, fx = fx, fx_count = fx_count, ret = fx_count}
 end
 
 -- Get all tracks with detailed info
@@ -756,12 +927,21 @@ local function AddFXEnvelopePoint(track_index, fx_index, param_index, time, valu
     end
 
     -- Add the point (shape: 0=linear, 1=square, 2=slow start/end, 3=fast start, 4=fast end, 5=bezier)
-    local point_index = reaper.InsertEnvelopePoint(envelope, time, value, shape or 0, 0, false, true)
+    --
+    -- InsertEnvelopePoint returns a BOOLEAN, not an index. Assigning it straight to
+    -- point_index meant a caller chaining this into delete_fx_envelope_point handed it
+    -- `true`, which coerces to 1, and deleted point 1 instead of the one just added.
+    -- Resolve the real index AFTER sorting, since sorting is what fixes the position.
+    local inserted = reaper.InsertEnvelopePoint(envelope, time, value, shape or 0, 0, false, true)
     reaper.Envelope_SortPoints(envelope)
+
+    if not inserted then
+        return {ok = false, error = "InsertEnvelopePoint failed", time = time, value = value}
+    end
 
     return {
         ok = true,
-        point_index = point_index,
+        point_index = reaper.GetEnvelopePointByTime(envelope, time),
         time = time,
         value = value,
         shape = shape or 0
@@ -970,10 +1150,24 @@ local function GetProjectSummary()
     }
 end
 
+-- Report the deployed bridge's version so the server can detect a stale script.
+-- REAPER runs whatever copy lives in its Scripts folder and that copy is deployed by
+-- hand, so the two halves drift apart silently. A bridge older than this answers
+-- "Unknown function: GetBridgeVersion", which the server reads as "too old to
+-- identify itself" and turns into an actionable redeploy message.
+local function GetBridgeVersion()
+    return {ok = true, version = BRIDGE_VERSION}
+end
+
 -- Export function table for DSL
 DSL_FUNCTIONS = {
+    -- Bridge metadata
+    GetBridgeVersion = GetBridgeVersion,
+
     -- Track info
     GetTrackInfo = GetTrackInfo,
+    GetTrackFXList = GetTrackFXList,
+    InsertAudioFile = InsertAudioFile,
     GetAllTracksInfo = GetAllTracksInfo,
     GetSelectedTracks = GetSelectedTracks,
     SetTrackNotes = SetTrackNotes,
@@ -1774,7 +1968,18 @@ _G.__MIDI_TEST = {note_in_filter = note_in_filter, transpose_notes_pure = transp
 
 -- Main processing function
 local function process_request()
-    -- Look for any request files with numbered pattern
+    -- Look for any request files with numbered pattern.
+    --
+    -- This is a fixed 1000 io.open probes per defer tick, which is genuinely wasteful
+    -- while idle (roughly 30,000 failed opens per second on REAPER's UI thread) and is
+    -- still worth fixing. It is NOT worth fixing with reaper.EnumerateFiles, which was
+    -- tried in 1.6.1 and reverted after live testing: enumeration makes the per-tick
+    -- cost O(files in the directory) rather than constant, and orphaned response_N.json
+    -- files accumulate (a timed-out call leaves its response behind until that slot
+    -- recycles 999 calls later). Round-trip time degraded from 0.07s to 0.53s with only
+    -- 60 stale files present, and each timeout creates another one, so a long session
+    -- spirals. A real fix has to bound the directory first, or change the file protocol,
+    -- which needs both halves shipped together (see REACH_PLAN trap 2).
     for i = 1, 1000 do
         local numbered_request_file = bridge_dir .. 'request_' .. i .. '.json'
         local numbered_response_file = bridge_dir .. 'response_' .. i .. '.json'
@@ -1785,7 +1990,7 @@ local function process_request()
                 -- Read and process request
                 local request_data = read_file(numbered_request_file)
                 if request_data then
-                    reaper.ShowConsoleMsg("Processing request " .. i .. ": " .. request_data .. "\n")
+                    log("Processing request " .. i .. ": " .. request_data .. "\n")
                     
                     -- Parse the request
                     local request = decode_json(request_data)
@@ -2652,10 +2857,15 @@ local function process_request()
                         end
                     
                     elseif fname == "GetProjectName" then
-                        local retval, project_name = reaper.GetProjectName(args[1] or 0, "", 512)
+                        -- GetProjectName writes into an out-buffer, so Lua returns the name
+                        -- as the FIRST and only value. Unpacking it as the second return
+                        -- left both fields empty for every caller, always. The neighbouring
+                        -- GetProjectPath handler below has always done this correctly.
+                        local project_name = reaper.GetProjectName(args[1] or 0, "")
+                        if type(project_name) ~= "string" then project_name = "" end
                         response.ok = true
-                        response.ret = project_name or ""
-                        response.name = project_name or ""
+                        response.ret = project_name
+                        response.name = project_name
                     
                     elseif fname == "GetProjectPath" then
                         local path = reaper.GetProjectPath("", 2048)
@@ -6857,8 +7067,18 @@ local function process_request()
                     
                     -- Write response
                     local response_json = encode_json(response)
-                    reaper.ShowConsoleMsg("Sending response " .. i .. ": " .. response_json .. "\n")
+                    log("Sending response " .. i .. ": " .. response_json .. "\n")
                     write_file(numbered_response_file, response_json)
+                else
+                    -- The request did not decode. This path used to write nothing at
+                    -- all, so the server sat out its whole timeout and then blamed the
+                    -- bridge script for not running, which was never the problem.
+                    -- Answer immediately and name the real cause.
+                    write_file(numbered_response_file, encode_json({
+                        ok = false,
+                        error = "Malformed request JSON (the bridge could not decode it)",
+                        bridge_version = BRIDGE_VERSION
+                    }))
                 end
             end
             end)

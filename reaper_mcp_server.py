@@ -9,16 +9,18 @@ A TwelveTake Studios project - https://twelvetake.com
 
 Author: TwelveTake Studios LLC
 License: MIT
-Version: 1.6.0
+Version: 1.6.1
 """
 
-__version__ = "1.6.0"
+__version__ = "1.6.1"
 
 import os
 import asyncio
 import json
 import math
 import random
+import shutil
+import sys
 import time
 from pathlib import Path
 from typing import List, Optional, Union
@@ -56,10 +58,73 @@ REAPER_PORT = int(os.getenv("REAPER_PORT", "9000"))
 REAPER_URL = f"http://{REAPER_HOST}:{REAPER_PORT}"
 
 # File-based fallback configuration
-BRIDGE_DIR = Path(os.getenv(
-    "REAPER_BRIDGE_DIR",
-    os.path.expandvars(r"%APPDATA%\REAPER\Scripts\mcp_bridge_data")
-))
+
+def reaper_resource_dir() -> Path:
+    """REAPER's resource directory for this platform: the folder that holds Scripts/.
+
+    This mirrors ``reaper.GetResourcePath()``, which is what the bridge half uses and
+    which is correct on all three platforms.
+
+    Before 1.6.1 this half hardcoded ``os.path.expandvars(r"%APPDATA%\\REAPER\\...")``.
+    On macOS and Linux ``expandvars`` only understands ``$VAR`` and ``${VAR}``, so the
+    string passed through untouched, and because a backslash is a legal filename
+    character on POSIX the whole thing collapsed into ONE relative directory name,
+    created in whatever working directory the MCP client happened to have. The server
+    then talked to a folder REAPER had never heard of: every call sat out its timeout
+    and the error blamed the bridge script, which was the one thing that was fine.
+
+    Override with REAPER_BRIDGE_DIR for portable installs or a non-standard location.
+    """
+    if sys.platform == "win32":
+        # Kept byte-identical to the pre-1.6.1 expression so existing Windows
+        # installs resolve to exactly the same directory they always have.
+        return Path(os.path.expandvars(r"%APPDATA%\REAPER"))
+    home = Path.home()
+    if sys.platform == "darwin":
+        return home / "Library" / "Application Support" / "REAPER"
+    # Linux: modern REAPER uses ~/.config/REAPER; older and portable installs use ~/.reaper.
+    config_dir = home / ".config" / "REAPER"
+    legacy_dir = home / ".reaper"
+    if not config_dir.exists() and legacy_dir.exists():
+        return legacy_dir
+    return config_dir
+
+
+def default_bridge_dir() -> Path:
+    """The bridge's data directory, matching the bridge script's own `bridge_dir`."""
+    return reaper_resource_dir() / "Scripts" / "mcp_bridge_data"
+
+
+def bridge_dir_problem(path: Path) -> Optional[str]:
+    """Return a human-readable reason this bridge directory cannot work, else None.
+
+    A path that still contains a '%' means a Windows-style variable was never expanded,
+    which is precisely the failure that made the server silently unusable off Windows.
+    Refusing loudly beats creating a junk directory and timing out forever.
+    """
+    text = str(path)
+    if "%" in text:
+        return (
+            f"Bridge directory contains an unexpanded variable: {text!r}. "
+            "A Windows-style %VAR% path does not expand on macOS or Linux. "
+            "Set REAPER_BRIDGE_DIR to REAPER's Scripts/mcp_bridge_data folder."
+        )
+    if not os.path.isabs(text):
+        return (
+            f"Bridge directory is not an absolute path: {text!r}. "
+            "Set REAPER_BRIDGE_DIR to REAPER's Scripts/mcp_bridge_data folder."
+        )
+    return None
+
+
+BRIDGE_DIR = Path(os.getenv("REAPER_BRIDGE_DIR") or default_bridge_dir())
+BRIDGE_DIR_PROBLEM = bridge_dir_problem(BRIDGE_DIR)
+
+# The bridge script version this server needs. REAPER runs whatever copy is deployed in
+# its Scripts folder, deployed by hand, so the halves drift. Anything older cannot answer
+# GetBridgeVersion and is reported as out of date instead of failing in obscure ways.
+MIN_BRIDGE_VERSION = "1.6.1"
+
 FILE_TIMEOUT = 5.0
 FILE_POLL_INTERVAL = 0.02
 
@@ -125,6 +190,11 @@ async def reaper_call_http(func: str, args: list) -> dict:
 async def reaper_call_file(func: str, args: list) -> dict:
     """Call a REAPER function via file-based bridge."""
     global request_counter
+
+    # Refuse rather than create a junk directory and then time out against it forever.
+    if BRIDGE_DIR_PROBLEM:
+        return {"ok": False, "error": BRIDGE_DIR_PROBLEM}
+
     request_counter = (request_counter % 999) + 1
 
     # Ensure bridge directory exists
@@ -172,11 +242,95 @@ async def reaper_call_file(func: str, args: list) -> dict:
 
         return {
             "ok": False,
-            "error": "File request timed out",
-            "hint": "Make sure the REAPER bridge script is running"
+            "error": f"File request timed out after {FILE_TIMEOUT:g}s",
+            "bridge_dir": str(BRIDGE_DIR),
+            "hint": (
+                "The request was written to bridge_dir above and REAPER never answered. "
+                "Check in order: (1) REAPER is running; (2) reaper_mcp_bridge.lua is loaded "
+                "and running in REAPER; (3) the directory printed by the bridge on startup "
+                "matches bridge_dir above. If it does not, set REAPER_BRIDGE_DIR to the "
+                "bridge's directory. Deploy the bundled script with: "
+                "twelvetake-reaper-mcp --install-bridge"
+            ),
         }
     except Exception as e:
         return {"ok": False, "error": f"File request failed: {str(e)}"}
+
+
+async def dispatch(func: str, args_list: list) -> dict:
+    """Send one call over the configured transport, with no version gate."""
+    if COMM_MODE == "file":
+        return await reaper_call_file(func, args_list)
+    elif COMM_MODE == "http":
+        return await reaper_call_http(func, args_list)
+    else:  # auto mode
+        result = await reaper_call_http(func, args_list)
+        if result.get("fallback"):
+            # HTTP failed, try file-based
+            return await reaper_call_file(func, args_list)
+        return result
+
+
+def version_tuple(text: str) -> tuple:
+    """Parse a dotted version into a comparable tuple, ignoring any suffix."""
+    parts = []
+    for chunk in str(text).split("."):
+        digits = "".join(c for c in chunk if c.isdigit())
+        parts.append(int(digits) if digits else 0)
+    return tuple(parts)
+
+
+# Cached result of the one-time bridge version probe.
+_bridge_check = {"done": False, "error": None}
+
+_STALE_BRIDGE_HINT = (
+    "REAPER is running a bridge script older than this server needs. REAPER loads the "
+    "copy in its own Scripts folder, so upgrading the Python package does not update it. "
+    "Deploy the bundled script with `twelvetake-reaper-mcp --install-bridge`, then re-run "
+    "reaper_mcp_bridge.lua in REAPER (Actions > Show action list)."
+)
+
+
+async def ensure_bridge_current() -> Optional[dict]:
+    """Probe the deployed bridge once; return an error dict if it is too old.
+
+    Worth the single extra round trip: an older bridge carries JSON decoder bugs that
+    drop a small float or split a name containing a comma, and both of those shorten
+    the argument list rather than failing. A shortened argument list is a wrong edit to
+    the user's project, so a stale bridge is refused rather than used.
+
+    A probe that merely times out (REAPER closed) is NOT cached, so the real call still
+    gets to report the real problem.
+    """
+    if _bridge_check["done"]:
+        return _bridge_check["error"]
+
+    result = await dispatch("GetBridgeVersion", [])
+
+    if result.get("ok") and result.get("version"):
+        deployed = str(result["version"])
+        if version_tuple(deployed) < version_tuple(MIN_BRIDGE_VERSION):
+            _bridge_check["error"] = {
+                "ok": False,
+                "error": f"Bridge script is out of date (deployed {deployed}, need {MIN_BRIDGE_VERSION})",
+                "hint": _STALE_BRIDGE_HINT,
+            }
+        _bridge_check["done"] = True
+        return _bridge_check["error"]
+
+    # A bridge older than 1.6.1 has no GetBridgeVersion handler and says so.
+    if "Unknown function" in str(result.get("error", "")):
+        _bridge_check["done"] = True
+        _bridge_check["error"] = {
+            "ok": False,
+            "error": f"Bridge script is out of date (pre-{MIN_BRIDGE_VERSION}, cannot report its version)",
+            "hint": _STALE_BRIDGE_HINT,
+        }
+        return _bridge_check["error"]
+
+    # Timeout, misconfigured directory, REAPER closed: not a version verdict. Say nothing
+    # and let the real call surface its own (already actionable) error.
+    return None
 
 
 async def reaper_call(func: str, *args) -> dict:
@@ -191,16 +345,12 @@ async def reaper_call(func: str, *args) -> dict:
     """
     args_list = list(args)
 
-    if COMM_MODE == "file":
-        return await reaper_call_file(func, args_list)
-    elif COMM_MODE == "http":
-        return await reaper_call_http(func, args_list)
-    else:  # auto mode
-        result = await reaper_call_http(func, args_list)
-        if result.get("fallback"):
-            # HTTP failed, try file-based
-            return await reaper_call_file(func, args_list)
-        return result
+    if func != "GetBridgeVersion":
+        stale = await ensure_bridge_current()
+        if stale:
+            return stale
+
+    return await dispatch(func, args_list)
 
 
 # --- TRACK OPERATIONS ---
@@ -220,7 +370,8 @@ async def get_track(track_index: int) -> dict:
         track_index: Track index (0-based). Use -1 for the master track.
 
     Returns:
-        Track info including name, volume_db, pan, mute, solo status.
+        Object with 'info': guid, name, volume, volume_db, pan, muted, soloed,
+        has_midi, has_audio, fx_names, role.
     """
     return await reaper_call("GetTrackInfo", track_index)
 
@@ -365,10 +516,11 @@ async def track_fx_get_list(track_index: int) -> dict:
         track_index: Track index (0-based) or -1 for master track.
 
     Returns:
-        Object with 'fx' array containing each FX's index, name, and enabled state.
+        Object with 'fx' array, one entry per FX with index, name, enabled and offline,
+        plus fx_count. 'enabled' is False when the FX is bypassed. Normal FX chain only,
+        not input/record FX or master monitoring FX.
     """
-    # Use the DSL function which returns detailed info
-    return await reaper_call("GetTrackInfo", track_index)
+    return await reaper_call("GetTrackFXList", track_index)
 
 
 @mcp.tool()
@@ -1241,7 +1393,20 @@ async def add_parallel_compression(track_index: int, blend_db: float = -6.0) -> 
 
     # Create parallel compression bus
     await reaper_call("InsertTrackAtIndex", new_track_index, True)
-    await reaper_call("GetSetMediaTrackInfo_String", 0, new_track_index, "P_NAME", "Parallel Comp Bus", True)
+    # Same leading-0 bug insert_track already fixed (see the note at its call site): the
+    # bridge reads args[1] as the track, so an extra 0 shifted every argument along and
+    # setnewvalue received the NAME, which coerces to false. The call was therefore a
+    # read, the bus was never named, and the tool still reported success.
+    rename = await reaper_call("GetSetMediaTrackInfo_String", new_track_index, "P_NAME", "Parallel Comp Bus", True)
+    if not rename.get("ok"):
+        return {
+            "ok": False,
+            "error": (
+                f"Bus track was created at index {new_track_index} but naming it failed: "
+                f"{rename.get('error', 'unknown error')}"
+            ),
+            "bus_track_index": new_track_index,
+        }
 
     # Create send from source to bus
     send_result = await reaper_call("CreateTrackSend", track_index, new_track_index)
@@ -1280,7 +1445,18 @@ async def create_bus(name: str, source_track_indices: list[int]) -> dict:
 
     # Create bus track
     await reaper_call("InsertTrackAtIndex", new_track_index, True)
-    await reaper_call("GetSetMediaTrackInfo_String", 0, new_track_index, "P_NAME", name, True)
+    # See the note in add_parallel_compression: the leading 0 shifted every argument and
+    # made this a read, so the bus silently kept its default name.
+    rename = await reaper_call("GetSetMediaTrackInfo_String", new_track_index, "P_NAME", name, True)
+    if not rename.get("ok"):
+        return {
+            "ok": False,
+            "error": (
+                f"Bus track was created at index {new_track_index} but naming it failed: "
+                f"{rename.get('error', 'unknown error')}"
+            ),
+            "bus_track_index": new_track_index,
+        }
 
     # Create sends from each source track
     sends_created = []
@@ -2312,9 +2488,17 @@ async def insert_audio_file(track_index: int, file_path: str, position: float) -
         position: Position in seconds.
 
     Returns:
-        Object with item info.
+        Object with track_index, item_index of the created item, and position.
     """
-    return await reaper_call("InsertMedia", file_path, 0, track_index, position)
+    problem = _validate_indices(track_index=track_index)
+    if problem:
+        return problem
+    # Was reaper_call("InsertMedia", file_path, 0, track_index, position). ReaScript's
+    # InsertMedia(file, mode) takes TWO arguments, so track_index and position fell off
+    # the end and were never sent: the file landed on whatever track happened to be
+    # selected, at the edit cursor, and the tool reported success. The bridge handler
+    # aims the selection and cursor deliberately, then restores both.
+    return await reaper_call("InsertAudioFile", track_index, file_path, position)
 
 
 @mcp.tool()
@@ -2520,20 +2704,22 @@ async def set_time_signature(numerator: int, denominator: int) -> dict:
 
 
 @mcp.tool()
-async def create_project(name: str = None) -> dict:
+async def create_project() -> dict:
     """
     Create a new REAPER project.
 
-    Args:
-        name: Optional project name.
+    Note: REAPER has no API to name a project that has never been saved, so this server
+    has no way to name one either. The removed `name` parameter never took effect.
 
     Returns:
         Object with success status.
     """
-    result = await reaper_call("Main_OnCommand", 40023, 0)  # File: New project
-    if name:
-        await reaper_call("Main_SaveProject", 0, False)
-    return result
+    # The old `if name:` branch called Main_SaveProject(0, False), which is a plain
+    # Ctrl+S and identical to the save_project tool. On a brand-new untitled project
+    # there is no filename to save to, so REAPER either prompts (a modal that blocks
+    # the bridge's defer loop until a human clicks) or writes somewhere unasked. Both
+    # are unacceptable, so the save is gone regardless of which REAPER does.
+    return await reaper_call("Main_OnCommand", 40023, 0)  # File: New project
 
 
 @mcp.tool()
@@ -3763,10 +3949,154 @@ async def zoom_to_project() -> dict:
     return await reaper_call("Main_OnCommand", 40295, 0)  # Zoom to project
 
 
+# --- SCHEMA SLIMMING ---
+
+# JSON Schema positions whose values are themselves schemas. We walk these rather than every
+# dict in the tree so that a parameter legitimately named "title" is never mistaken for the
+# "title" annotation and deleted.
+_SCHEMA_CHILD_MAPS = ("properties", "$defs", "definitions", "patternProperties")
+_SCHEMA_CHILD_LISTS = ("anyOf", "oneOf", "allOf", "prefixItems")
+_SCHEMA_CHILD_VALUES = ("items", "additionalProperties", "not", "contains", "propertyNames")
+
+
+def _strip_titles(schema) -> None:
+    """Remove JSON Schema 'title' annotations from a schema tree, in place."""
+    if not isinstance(schema, dict):
+        return
+    schema.pop("title", None)
+    for key in _SCHEMA_CHILD_MAPS:
+        child_map = schema.get(key)
+        if isinstance(child_map, dict):
+            for child in child_map.values():
+                _strip_titles(child)
+    for key in _SCHEMA_CHILD_LISTS:
+        child_list = schema.get(key)
+        if isinstance(child_list, list):
+            for child in child_list:
+                _strip_titles(child)
+    for key in _SCHEMA_CHILD_VALUES:
+        _strip_titles(schema.get(key))
+
+
+def slim_tool_schemas() -> int:
+    """
+    Strip auto-generated 'title' annotations from every registered tool's input schema.
+
+    Pydantic emits a title for every parameter ("Track Index" sitting next to track_index)
+    plus a root title per tool. They are annotation-only: they constrain nothing and say
+    strictly less than the key beside them. Across the tool list they cost ~16KB, which
+    every client pays on every turn.
+
+    Returns the number of bytes removed. Safe to call more than once.
+    """
+    manager = getattr(mcp, "_tool_manager", None)
+    if manager is None or not callable(getattr(manager, "list_tools", None)):
+        return 0
+    saved = 0
+    for tool in manager.list_tools():
+        params = getattr(tool, "parameters", None)
+        if not isinstance(params, dict):
+            continue
+        before = len(json.dumps(params))
+        _strip_titles(params)
+        saved += before - len(json.dumps(params))
+    return saved
+
+
+# Run at import so the saving applies however the server is started.
+_SCHEMA_BYTES_SAVED = slim_tool_schemas()
+
+
 # --- MAIN ---
+
+BRIDGE_SCRIPT_NAME = "reaper_mcp_bridge.lua"
+
+USAGE = f"""twelvetake-reaper-mcp {__version__}
+
+  twelvetake-reaper-mcp                      Run the MCP server (stdio).
+  twelvetake-reaper-mcp --install-bridge     Copy {BRIDGE_SCRIPT_NAME} into REAPER's
+                                             Scripts folder, backing up any existing copy.
+  twelvetake-reaper-mcp --install-bridge DIR Install into an explicit folder instead
+                                             (portable installs, non-standard locations).
+  twelvetake-reaper-mcp --version            Print the version.
+
+After installing, load the script in REAPER: Actions > Show action list > Load ReaScript,
+select {BRIDGE_SCRIPT_NAME}, then run it.
+
+Environment:
+  REAPER_BRIDGE_DIR   Override the bridge data directory.
+  REAPER_COMM_MODE    "file" (default), "http", or "auto".
+"""
+
+
+def bundled_bridge_script() -> Optional[Path]:
+    """The bridge script shipped alongside this module, if it is there."""
+    candidate = Path(__file__).resolve().parent / BRIDGE_SCRIPT_NAME
+    return candidate if candidate.is_file() else None
+
+
+def install_bridge(dest_dir: Optional[Path] = None) -> int:
+    """Copy the bundled bridge script into REAPER's Scripts folder. Returns an exit code.
+
+    Deliberately an explicit command rather than something the server does on startup:
+    writing into a user's REAPER installation must never be a hidden side effect. Any
+    existing script is backed up before it is replaced.
+    """
+    source = bundled_bridge_script()
+    if source is None:
+        print(f"error: {BRIDGE_SCRIPT_NAME} was not found next to {Path(__file__).name}.", file=sys.stderr)
+        print("Install version 1.6.1 or newer, or copy the script from the repository.", file=sys.stderr)
+        return 1
+
+    scripts_dir = Path(dest_dir) if dest_dir else reaper_resource_dir() / "Scripts"
+    problem = bridge_dir_problem(scripts_dir)
+    if problem:
+        print(f"error: {problem}", file=sys.stderr)
+        return 1
+    if dest_dir is None and not scripts_dir.parent.exists():
+        print(f"error: REAPER resource directory not found: {scripts_dir.parent}", file=sys.stderr)
+        print("If REAPER is installed elsewhere or portable, pass the folder explicitly:", file=sys.stderr)
+        print("  twelvetake-reaper-mcp --install-bridge <path to REAPER's Scripts folder>", file=sys.stderr)
+        return 1
+
+    scripts_dir.mkdir(parents=True, exist_ok=True)
+    target = scripts_dir / BRIDGE_SCRIPT_NAME
+    if target.exists():
+        backup = target.parent / f"{target.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+        shutil.copy2(target, backup)
+        print(f"Backed up existing script to: {backup}")
+    shutil.copy2(source, target)
+    print(f"Installed {BRIDGE_SCRIPT_NAME} to: {target}")
+    print(f"Bridge data directory: {BRIDGE_DIR}")
+    print("")
+    print("Next, in REAPER: Actions > Show action list > Load ReaScript, select the file")
+    print("above, then run it. Re-run it after every upgrade of this package.")
+    return 0
+
 
 def main():
     """Entry point for the MCP server."""
+    argv = sys.argv[1:]
+
+    if argv and argv[0] in ("--install-bridge", "install-bridge"):
+        raise SystemExit(install_bridge(Path(argv[1]) if len(argv) > 1 else None))
+    if argv and argv[0] in ("--version", "-V"):
+        print(__version__)
+        raise SystemExit(0)
+    if argv and argv[0] in ("--help", "-h", "help"):
+        print(USAGE)
+        raise SystemExit(0)
+
+    # Refuse to start against a bridge directory that cannot work, rather than creating a
+    # junk folder and timing out against it on every call for the rest of the session.
+    if BRIDGE_DIR_PROBLEM and COMM_MODE in ("file", "auto"):
+        print(f"error: {BRIDGE_DIR_PROBLEM}", file=sys.stderr)
+        raise SystemExit(1)
+
+    # stderr, never stdout: stdout carries the MCP JSON-RPC stream. Printing the resolved
+    # directory here is what turns "it just times out" into a one-look diagnosis.
+    print(f"twelvetake-reaper-mcp {__version__} | comm mode: {COMM_MODE} | bridge dir: {BRIDGE_DIR}",
+          file=sys.stderr)
     mcp.run()
 
 

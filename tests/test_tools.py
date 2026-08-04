@@ -308,6 +308,107 @@ def test_render_region_documented_error(reaper):
     assert reaper.calls == []  # never reaches the bridge
 
 
+def test_insert_audio_file_sends_track_and_position(reaper):
+    """It used to call InsertMedia(file, mode), which takes TWO arguments.
+
+    track_index and position fell off the end and were never sent, so the file landed
+    on whatever track was selected, at the edit cursor, and the tool returned ok.
+    """
+    run(srv.insert_audio_file(2, "C:/audio/kick.wav", 1.5))
+    assert reaper.last == ("InsertAudioFile", [2, "C:/audio/kick.wav", 1.5])
+
+
+def test_insert_audio_file_rejects_a_negative_track(reaper):
+    result = run(srv.insert_audio_file(-1, "C:/audio/kick.wav", 0.0))
+    assert result["ok"] is False
+    assert "track_index" in result["error"]
+
+
+def test_track_fx_get_list_calls_the_dedicated_handler(reaper):
+    """It used to call GetTrackInfo, whose payload has fx_names and no index/enabled.
+
+    From @SNChicago's PR #9. This pins the Python side only; the response shape itself
+    is pinned in tests/test_bridge_encoder.py, which runs the real Lua.
+    """
+    run(srv.track_fx_get_list(0))
+    assert reaper.last == ("GetTrackFXList", [0])
+
+
+def test_track_fx_get_list_passes_master_through_unmodified(reaper):
+    """-1 must survive the Python layer; master resolution itself happens in Lua.
+
+    Cheap guard against someone later adding _validate_indices here, which rejects
+    negatives and would break the master case for every FX read.
+    """
+    run(srv.track_fx_get_list(-1))
+    assert reaper.last == ("GetTrackFXList", [-1])
+
+
+def test_create_project_takes_no_name(reaper):
+    import inspect
+    assert "name" not in inspect.signature(srv.create_project).parameters
+
+
+def test_create_project_makes_exactly_one_call_and_never_saves(reaper):
+    """The old body fired a stray Main_SaveProject, which is a plain Ctrl+S.
+
+    Asserting the FULL call list is what makes this test able to fail: asserting only
+    that Main_OnCommand was sent passes identically before and after the fix, because
+    the old body sent that first too.
+    """
+    run(srv.create_project())
+    assert reaper.calls == [("Main_OnCommand", [40023, 0])]
+
+
+def test_create_bus_names_the_bus_with_correct_arity(reaper):
+    """The bridge reads args[1] as the track, so a leading 0 shifted every argument.
+
+    setnewvalue then received the NAME, which coerces to false, making the call a read:
+    the bus was never named and the tool reported success anyway. `ret` is deliberately
+    non-zero here so a correct call is distinguishable from the buggy one.
+    """
+    reaper.response = {"ok": True, "ret": 3}
+    run(srv.create_bus("Drum Bus", [0, 1]))
+    renames = [c for c in reaper.calls if c[0] == "GetSetMediaTrackInfo_String"]
+    assert renames, "create_bus never attempted to name the bus"
+    assert renames[0] == ("GetSetMediaTrackInfo_String", [3, "P_NAME", "Drum Bus", True])
+
+
+def test_add_parallel_compression_names_the_bus_with_correct_arity(reaper):
+    reaper.response = {"ok": True, "ret": 3}
+    run(srv.add_parallel_compression(0))
+    renames = [c for c in reaper.calls if c[0] == "GetSetMediaTrackInfo_String"]
+    assert renames, "add_parallel_compression never attempted to name the bus"
+    assert renames[0] == ("GetSetMediaTrackInfo_String", [3, "P_NAME", "Parallel Comp Bus", True])
+
+
+def test_create_bus_reports_a_failed_rename_instead_of_claiming_success(monkeypatch):
+    async def fake(func, *args):
+        if func == "GetSetMediaTrackInfo_String":
+            return {"ok": False, "error": "Track not found"}
+        return {"ok": True, "ret": 3}
+
+    monkeypatch.setattr(srv, "reaper_call", fake)
+    result = run(srv.create_bus("Drum Bus", [0]))
+    assert result["ok"] is False
+    assert "naming it failed" in result["error"]
+    # The caller still learns which track was left behind.
+    assert result["bus_track_index"] == 3
+
+
+def test_add_parallel_compression_reports_a_failed_rename(monkeypatch):
+    async def fake(func, *args):
+        if func == "GetSetMediaTrackInfo_String":
+            return {"ok": False, "error": "Track not found"}
+        return {"ok": True, "ret": 3}
+
+    monkeypatch.setattr(srv, "reaper_call", fake)
+    result = run(srv.add_parallel_compression(0))
+    assert result["ok"] is False
+    assert "naming it failed" in result["error"]
+    assert result["bus_track_index"] == 3
+
+
 def test_fx_preset_tools_marshalling(reaper):
     run(srv.get_fx_presets(0, 1))
     assert reaper.last == ("TrackFX_GetPresetList", [0, 1])

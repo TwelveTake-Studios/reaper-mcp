@@ -8,7 +8,7 @@ A [TwelveTake Studios](https://twelvetake.com) project.
 
 A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control REAPER DAW for mixing, mastering, MIDI composition, and full music production workflows.
 
-**Version:** 1.6.0
+**Version:** 1.6.1
 
 ## Why This Server
 
@@ -45,7 +45,7 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
 ## Requirements
 
 - REAPER (any recent version; full live suite green through **REAPER 7.77**)
-- Python 3.8+ (for the MCP server)
+- Python 3.10+ (for the MCP server)
 - An MCP-compatible AI assistant
 
 ## Installation
@@ -53,6 +53,19 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
 ### 1. Install the Bridge Script in REAPER
 
 The bridge script runs inside REAPER and handles communication with the MCP server.
+
+The package can deploy it for you:
+
+```bash
+uvx twelvetake-reaper-mcp --install-bridge
+```
+
+That copies `reaper_mcp_bridge.lua` into REAPER's Scripts folder for your platform, backing
+up any existing copy first. It writes nothing else, and the server never touches your REAPER
+installation on its own. Pass a path if REAPER is portable or installed somewhere unusual:
+`--install-bridge "/path/to/REAPER/Scripts"`.
+
+To do it by hand instead:
 
 1. Copy `reaper_mcp_bridge.lua` to your REAPER Scripts folder:
    - Windows: `%APPDATA%\REAPER\Scripts\`
@@ -370,7 +383,7 @@ Multi-take workflows: list/switch/delete takes, explode/crop, REAPER 7 fixed-lan
 |------|-------------|
 | `get_project_summary()` | Get comprehensive project state in one call |
 | `save_project()` | Save current project |
-| `create_project(name)` | Create new project |
+| `create_project()` | Create new project (REAPER cannot name an unsaved project) |
 | `open_project(path)` | Open project file |
 | `get_project_path()` | Get project directory |
 | `get_project_name()` | Get project filename |
@@ -567,9 +580,23 @@ Third-party plugins use their full name as shown in REAPER's FX browser.
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `REAPER_COMM_MODE` | `file` | Communication mode (`file` or `http`) |
-| `REAPER_BRIDGE_DIR` | `%APPDATA%\REAPER\Scripts\mcp_bridge_data` | File bridge directory |
+| `REAPER_BRIDGE_DIR` | REAPER's `Scripts/mcp_bridge_data`, resolved per platform | File bridge directory |
+| `REAPER_MCP_DEBUG` | unset | Set to `1` before launching REAPER for per-call bridge console logging |
 | `REAPER_HOST` | `localhost` | HTTP bridge host |
 | `REAPER_PORT` | `9000` | HTTP bridge port |
+
+## Contributing
+
+See [CONTRIBUTING.md](CONTRIBUTING.md). Read the first section before writing a patch: this
+repo is published from a private working repo through an explicit allowlist, so PRs are ported
+by hand rather than merged, and it is better to know that up front. A well-diagnosed issue is
+worth as much here as a patch and costs you far less.
+
+## Contributors
+
+People outside the project whose work is in this software are listed in
+[CONTRIBUTORS.md](CONTRIBUTORS.md), including several whose diagnoses shipped before anyone
+here thought to look for them.
 
 ## License
 
