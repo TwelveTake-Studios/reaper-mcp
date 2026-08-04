@@ -2519,20 +2519,17 @@ async def set_time_signature(numerator: int, denominator: int) -> dict:
 
 
 @mcp.tool()
-async def create_project(name: str = None) -> dict:
+async def create_project() -> dict:
     """
     Create a new REAPER project.
 
-    Args:
-        name: Optional project name.
+    Note: REAPER has no API to name an unsaved project. Save it with a
+    path via the UI, or use open_project on an existing .rpp.
 
     Returns:
         Object with success status.
     """
-    result = await reaper_call("Main_OnCommand", 40023, 0)  # File: New project
-    if name:
-        await reaper_call("Main_SaveProject", 0, False)
-    return result
+    return await reaper_call("Main_OnCommand", 40023, 0)  # File: New project
 
 
 @mcp.tool()

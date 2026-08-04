@@ -324,3 +324,11 @@ def test_track_fx_get_list_calls_dedicated_handler(reaper):
 def test_track_fx_get_list_master(reaper):
     run(srv.track_fx_get_list(-1))
     assert reaper.last == ("GetTrackFXList", [-1])
+
+
+def test_create_project_takes_no_name(reaper):
+    """The name was never applied -- Main_SaveProject saves an untitled project."""
+    import inspect
+    assert "name" not in inspect.signature(srv.create_project).parameters
+    run(srv.create_project())
+    assert reaper.last == ("Main_OnCommand", [40023, 0])
