@@ -9,13 +9,14 @@ A TwelveTake Studios project - https://twelvetake.com
 
 Author: TwelveTake Studios LLC
 License: MIT
-Version: 1.6.2
+Version: 1.6.3
 """
 
-__version__ = "1.6.2"
+__version__ = "1.6.3"
 
 import os
 import asyncio
+import inspect
 import json
 import math
 import random
@@ -4003,8 +4004,41 @@ def slim_tool_schemas() -> int:
     return saved
 
 
-# Run at import so the saving applies however the server is started.
+def normalize_tool_descriptions() -> int:
+    """Strip the leading indentation Python leaves in docstrings before 3.13.
+
+    Python 3.13 removes each docstring's common leading whitespace at compile time.
+    3.10 through 3.12 do not. Tool descriptions come straight from docstrings, so on
+    those versions every tool ships its own indentation to the model on every turn:
+    measured at 5,364 bytes across this surface, carrying no information at all.
+
+    That also made the payload size differ by interpreter, which is how this was found:
+    the tools/list byte-ceiling test passed on 3.13 and failed on 3.10.
+
+    Returns the number of bytes removed. Safe to call more than once.
+    """
+    manager = getattr(mcp, "_tool_manager", None)
+    if manager is None or not callable(getattr(manager, "list_tools", None)):
+        return 0
+    saved = 0
+    for tool in manager.list_tools():
+        description = getattr(tool, "description", None)
+        if not isinstance(description, str) or not description:
+            continue
+        cleaned = inspect.cleandoc(description)
+        if cleaned != description:
+            saved += len(description) - len(cleaned)
+            try:
+                tool.description = cleaned
+            except (AttributeError, ValueError):
+                # Frozen model on some SDK versions; the payload is merely larger.
+                return saved
+    return saved
+
+
+# Run at import so the savings apply however the server is started.
 _SCHEMA_BYTES_SAVED = slim_tool_schemas()
+_DESCRIPTION_BYTES_SAVED = normalize_tool_descriptions()
 
 
 # --- MAIN ---

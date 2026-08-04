@@ -12,10 +12,18 @@ import json
 
 import reaper_mcp_server as srv
 
-# Measured at 1.6.1: 176 tools, 95,602 bytes (~25,800 tokens), titles already stripped.
+# Measured at 1.6.3: 176 tools, 95,922 bytes (~25,900 tokens), titles stripped and
+# descriptions dedented, which makes this number identical on every supported Python.
+# Before the dedent it was 101,286 on 3.10-3.12 and 95,922 on 3.13, so this test passed
+# and failed depending on the interpreter.
+#
 # The headroom is deliberately modest. It absorbs ordinary docstring edits and a handful
 # of new tools; it does not absorb another 28,000-byte release going unnoticed.
 CEILING_BYTES = 100_000
+
+# Descriptions are ours; schema bytes belong to Pydantic and move when it does. Measured
+# 52,319. This is the ceiling that actually guards against docstring bloat.
+DESCRIPTION_CEILING_BYTES = 56_000
 
 
 def tools_list_payload():
@@ -48,6 +56,39 @@ def test_schema_titles_stay_stripped():
 def test_slimming_is_idempotent():
     """Safe to call more than once: a second pass must find nothing left to remove."""
     assert srv.slim_tool_schemas() == 0
+
+
+def test_descriptions_carry_no_leading_indentation():
+    """Python strips docstring indentation at compile time only from 3.13 onward.
+
+    On 3.10 through 3.12 every tool would otherwise ship its own indentation to the
+    model on every turn: 5,364 bytes across this surface, carrying no information.
+    It also made the payload size differ by interpreter, which is how it was found.
+    """
+    offenders = [
+        t["name"] for t in tools_list_payload()
+        if any(line[:1] in (" ", "\t") for line in t["description"].splitlines()[1:2])
+    ]
+    assert not offenders, f"descriptions still indented (run on <3.13 to see it): {offenders}"
+
+
+def test_description_normalisation_is_idempotent():
+    assert srv.normalize_tool_descriptions() == 0
+
+
+def test_description_bytes_stay_under_ceiling():
+    """The half of the payload this project actually controls.
+
+    Schema bytes come from Pydantic and move when it does. Descriptions come from our
+    own docstrings, so this is the number that catches a v1.6.0-style release adding
+    28,000 bytes without anyone noticing.
+    """
+    total = sum(len(t["description"]) for t in tools_list_payload())
+    assert total < DESCRIPTION_CEILING_BYTES, (
+        f"tool descriptions total {total:,} bytes, over the "
+        f"{DESCRIPTION_CEILING_BYTES:,} byte ceiling. Trim docstrings, or raise the "
+        "ceiling deliberately and explain why in the commit."
+    )
 
 
 def test_every_tool_has_a_description():

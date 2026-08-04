@@ -8,7 +8,7 @@ A [TwelveTake Studios](https://twelvetake.com) project.
 
 A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control REAPER DAW for mixing, mastering, MIDI composition, and full music production workflows.
 
-**Version:** 1.6.2
+**Version:** 1.6.3
 
 ## Why This Server
 
@@ -181,7 +181,16 @@ MCP Server                    REAPER Bridge
     │◄── reads response_N.json ────┤
 ```
 
-**Bridge directory:** `%APPDATA%\REAPER\Scripts\mcp_bridge_data`
+**Bridge directory:** REAPER's own `Scripts/mcp_bridge_data`, resolved per platform:
+
+| Platform | Path |
+|----------|------|
+| Windows | `%APPDATA%\REAPER\Scripts\mcp_bridge_data` |
+| macOS | `~/Library/Application Support/REAPER/Scripts/mcp_bridge_data` |
+| Linux | `~/.config/REAPER/Scripts/mcp_bridge_data` (or `~/.reaper/...` for older installs) |
+
+Override with `REAPER_BRIDGE_DIR` for portable installs. The server prints the directory it
+resolved to stderr on startup, and includes it in any timeout error.
 
 ### HTTP Mode (Deprecated)
 

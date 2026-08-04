@@ -5,6 +5,20 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.3] - 2026-08-04
+
+### Fixed
+- **Every tool shipped its docstring indentation to the model on Python 3.10 through 3.12.**
+  Python strips a docstring's common leading whitespace at compile time only from 3.13 onward,
+  and tool descriptions come straight from docstrings. On older interpreters that was 6,028
+  bytes of pure indentation in the `tools/list` payload, paid on every turn of every session,
+  carrying no information. Descriptions are now dedented explicitly, so the payload is
+  95,258 bytes on every supported Python instead of 101,286 on some of them.
+  This surfaced as the new byte-ceiling test passing on 3.13 and failing on 3.10, which is
+  the test doing its job on its first day.
+- The README's bridge directory section still listed only the Windows path, months after
+  macOS and Linux were supported. It now lists all three, plus the override.
+
 ## [1.6.2] - 2026-08-04
 
 **Install-breaking fix. If you installed 1.6.1, upgrade.**
@@ -431,6 +445,7 @@ Total tools: **130**.
 - File-based communication bridge (default) plus optional HTTP mode
   (Lua and Python in-REAPER servers).
 
+[1.6.3]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.6.3
 [1.6.2]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.6.2
 [1.6.1]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.6.1
 [1.6.0]: https://github.com/TwelveTake-Studios/reaper-mcp/releases/tag/v1.6.0
