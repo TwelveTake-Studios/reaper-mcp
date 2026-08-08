@@ -3,7 +3,7 @@
 Thanks for looking at this. Read the first section before you spend real effort, because
 this repo is set up in a way that is not obvious and will otherwise waste your time.
 
-## This repo is published from a private one, and PRs are not merged here
+## This repo is published from a private one
 
 Development happens in a private working repo. This repo is published from it by a script
 that copies an explicit allowlist of files: a file cannot appear here unless it has been named
@@ -14,23 +14,23 @@ personal cannot reach a public repo by accident, and it is a default-deny design
 nothing is published because someone judged it harmless, only because it was explicitly
 listed.
 
-The consequence for you is real: **anything merged on GitHub is overwritten at the next
-publish.** So PRs are never merged with the merge button, however good they are.
+**PRs are merged here.** Your commits land in this repo's history under your name, and the PR
+reads as merged, because it was. The same change is then brought into the private repo so the
+two agree. That second step is the maintainer's job and it has to happen before the next
+publish, since the publish script treats the private copy as authoritative for file contents.
 
-What happens instead when you open a PR:
+Two things follow from the setup that are worth knowing before you write a patch:
 
-1. Your diff is saved, and the change is ported by hand against current `main`, usually with
-   tests added or strengthened around it.
-2. You are credited in `CHANGELOG.md` by name and handle, with a link to your PR.
-3. You are added as a co-author on the published commit, so the contribution lands under your
-   GitHub account rather than disappearing into a file copy.
-4. Your PR is closed with a link to the release carrying your work.
+- **A PR that adds a new file needs that file added to the publish allowlist.** Mention it in
+  the PR if your change adds one, so it doesn't end up sitting here ungoverned by the sync.
+- **Only part of the test suite is public** (see the next section), so a change sometimes needs
+  follow-up work to satisfy the private live suite. That is the maintainer's problem, not
+  yours, and it is not a reason to hold back a patch.
 
-It is more friction than a normal merge, and worth knowing before you write a patch rather
-than after.
-
-**Opening an issue is often better than opening a PR.** A clear diagnosis with a file and line
-number is worth as much as a patch here, and costs you a lot less.
+Work that arrives some other way, an issue with a diagnosis precise enough to fix from, or a
+fix already sitting in a fork, is credited in `CONTRIBUTORS.md` and as a co-author on the
+commit that carries it. A clear diagnosis with a file and line number is worth as much here as
+a patch, and costs you a lot less.
 
 ## What CI here does and does not cover
 
