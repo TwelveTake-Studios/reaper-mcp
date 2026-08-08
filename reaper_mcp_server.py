@@ -9,10 +9,10 @@ A TwelveTake Studios project - https://twelvetake.com
 
 Author: TwelveTake Studios LLC
 License: MIT
-Version: 1.6.3
+Version: 1.6.4
 """
 
-__version__ = "1.6.3"
+__version__ = "1.6.4"
 
 import os
 import asyncio
@@ -243,15 +243,23 @@ async def reaper_call_file(func: str, args: list) -> dict:
 
         return {
             "ok": False,
-            "error": f"File request timed out after {FILE_TIMEOUT:g}s",
+            "error": f"{func} timed out after {FILE_TIMEOUT:g}s",
             "bridge_dir": str(BRIDGE_DIR),
             "hint": (
-                "The request was written to bridge_dir above and REAPER never answered. "
-                "Check in order: (1) REAPER is running; (2) reaper_mcp_bridge.lua is loaded "
-                "and running in REAPER; (3) the directory printed by the bridge on startup "
-                "matches bridge_dir above. If it does not, set REAPER_BRIDGE_DIR to the "
-                "bridge's directory. Deploy the bundled script with: "
-                "twelvetake-reaper-mcp --install-bridge"
+                "This does NOT mean the work did not happen. The bridge answers only after "
+                "the operation finishes, so anything slower than the timeout (rendering, "
+                "freezing, glueing, normalizing, opening or saving a project) reports a "
+                "timeout while REAPER completes it normally. Renders in particular run at "
+                "close to realtime unless the project's render settings say otherwise. "
+                "Check the expected result before retrying. When retrying a render, do not "
+                "pass overwrite=true to clear a 'target already exists' error: REAPER "
+                "creates the target at zero bytes when a render starts, so that file is the "
+                "render still in progress and overwrite deletes it. "
+                "If nothing happened at all, check in order: (1) REAPER is running; "
+                "(2) reaper_mcp_bridge.lua is loaded and running in REAPER; (3) the "
+                "directory printed by the bridge on startup matches bridge_dir above; if it "
+                "does not, set REAPER_BRIDGE_DIR to the bridge's directory. Deploy the "
+                "bundled script with: twelvetake-reaper-mcp --install-bridge"
             ),
         }
     except Exception as e:

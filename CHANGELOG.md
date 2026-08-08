@@ -5,6 +5,22 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.4] - 2026-08-08
+
+### Fixed
+- **A timed-out call told you the work had not happened, when it usually had.** The bridge
+  replies only once an operation finishes, and rendering blocks REAPER's defer loop for its
+  whole duration, so any render longer than the five second transport timeout came back as a
+  failure while REAPER went on to write a correct file. The old message then asserted that
+  REAPER had never answered and suggested checking that REAPER was running and redeploying
+  the bridge, every word of which is wrong in the one case where the work succeeded. The
+  error now names the call that timed out instead of saying "File request", states plainly
+  that the work may have completed, and warns against clearing the follow-on "target already
+  exists" error with `overwrite=true`: REAPER creates the render target at zero bytes when it
+  starts, so that file is the render you are waiting on, and overwriting deletes it. The
+  original diagnostics for a genuinely dead bridge are still there, below that.
+  *(Reported by @SNChicago in [issue #11](https://github.com/TwelveTake-Studios/reaper-mcp/issues/11).)*
+
 ## [1.6.3] - 2026-08-04
 
 ### Fixed

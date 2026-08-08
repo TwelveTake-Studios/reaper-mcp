@@ -121,6 +121,55 @@ def test_file_transport_refuses_a_broken_bridge_dir(monkeypatch):
     assert result == {"ok": False, "error": "bad bridge dir"}
 
 
+# --- what a timeout is allowed to claim -------------------------------------
+#
+# The bridge answers only after the operation finishes, and Main_OnCommand(42230)
+# blocks the whole defer loop for the length of a render, which on a live 7.77 ran
+# at roughly realtime. So a render longer than FILE_TIMEOUT times out on the client
+# while REAPER writes a correct file. The old payload asserted the opposite ("REAPER
+# never answered", check that REAPER is running), which is wrong in exactly the case
+# where the work succeeded.
+
+@pytest.fixture
+def timing_out_mailbox(tmp_path, monkeypatch):
+    """A bridge directory that nothing is draining, so every call times out fast."""
+    monkeypatch.setattr(srv, "BRIDGE_DIR_PROBLEM", None, raising=False)
+    monkeypatch.setattr(srv, "BRIDGE_DIR", tmp_path)
+    monkeypatch.setattr(srv, "FILE_TIMEOUT", 0.05)
+    return tmp_path
+
+
+def test_timeout_names_the_call_that_timed_out(timing_out_mailbox):
+    """'File request timed out' told the caller nothing about which call it lost."""
+    result = run(srv.reaper_call_file("RenderProject", ["/tmp/x.wav"]))
+    assert result["ok"] is False
+    assert "RenderProject" in result["error"]
+
+
+def test_timeout_does_not_claim_the_work_did_not_happen(timing_out_mailbox):
+    """A timeout here can mean 'everything happened', so it must not assert otherwise."""
+    hint = run(srv.reaper_call_file("RenderProject", ["/tmp/x.wav"]))["hint"]
+    assert "does NOT mean the work did not happen" in hint
+    assert "never answered" not in hint
+
+
+def test_timeout_warns_against_the_destructive_retry(timing_out_mailbox):
+    """REAPER creates the render target at zero bytes, so the 'target already exists'
+    refusal after a timeout points at the render still in flight. Clearing it with
+    overwrite=true deletes it and starts another full realtime render."""
+    hint = run(srv.reaper_call_file("RenderProject", ["/tmp/x.wav"]))["hint"]
+    assert "overwrite=true" in hint
+    assert "zero bytes" in hint
+
+
+def test_timeout_still_explains_a_genuinely_dead_bridge(timing_out_mailbox):
+    """The original diagnostic ladder is still the right answer when nothing ran."""
+    hint = run(srv.reaper_call_file("CountTracks", [0]))["hint"]
+    assert "REAPER is running" in hint
+    assert "REAPER_BRIDGE_DIR" in hint
+    assert "--install-bridge" in hint
+
+
 # --- the version handshake --------------------------------------------------
 
 def _fake_dispatch(response):
