@@ -89,8 +89,33 @@ def test_timeout_cleans_up_its_own_request_file(mailbox):
 # PART B -- needs a running REAPER with the bridge loaded
 # --------------------------------------------------------------------------
 
+_BRIDGE_PROBE = None
+
+
+@pytest.fixture
+def live_bridge():
+    """Skip unless a bridge actually answers.
+
+    The ``live`` marker only LABELS a test -- a plain ``pytest`` run still
+    executes it, and only ``-m "not live"`` deselects it. Enforcing the skip
+    here means these tests are correct under any invocation rather than
+    depending on how the runner was called.
+    """
+    global _BRIDGE_PROBE
+    if _BRIDGE_PROBE is None:
+        original = srv.FILE_TIMEOUT
+        srv.FILE_TIMEOUT = 2.0  # a loaded bridge answers in milliseconds
+        try:
+            probe = run(srv.reaper_call_file("GetAppVersion", []))
+        finally:
+            srv.FILE_TIMEOUT = original
+        _BRIDGE_PROBE = probe if probe.get("ok") else False
+    if _BRIDGE_PROBE is False:
+        pytest.skip("no live REAPER bridge on this machine")
+
+
 @pytest.mark.live
-def test_interleaved_calls_each_get_their_own_answer():
+def test_interleaved_calls_each_get_their_own_answer(live_bridge):
     """Cross-talk returns a well-formed WRONG answer, which is worse than a
     timeout for anything that measures. The two calls have different answer
     TYPES, so a swap shows up as a type error rather than a plausible number.
@@ -115,9 +140,14 @@ def test_interleaved_calls_each_get_their_own_answer():
 
 
 @pytest.mark.live
-def test_stale_response_is_not_mistaken_for_ours(monkeypatch):
+def test_stale_response_is_not_mistaken_for_ours(live_bridge, monkeypatch):
     """An abandoned call leaves its response behind. The mailbox held exactly
     such an orphan for 12 days, so the response is gated on mtime.
+
+    Asserts the real answer arrived, not merely that the poison did not. A
+    bare `ret != "STALE-POISON"` is satisfied by a timeout, which has no `ret`
+    at all -- so it would pass on a machine with no bridge and could never
+    fail for the right reason.
     """
     monkeypatch.setattr(srv, "request_counter", 400)
     poison = srv.BRIDGE_DIR / "response_401.json"
@@ -127,6 +157,8 @@ def test_stale_response_is_not_mistaken_for_ours(monkeypatch):
 
     try:
         result = run(srv.reaper_call_file("CountTracks", [0]))
-        assert result.get("ret") != "STALE-POISON"
+        assert result.get("ok"), result
+        assert result["ret"] != "STALE-POISON"
+        assert isinstance(result["ret"], (int, float)), result
     finally:
         poison.unlink(missing_ok=True)
