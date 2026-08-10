@@ -78,6 +78,30 @@ def test_exhausted_mailbox_refuses_cleanly(mailbox):
     assert "No free bridge request slot" in result["error"]
 
 
+def test_write_fault_is_not_reported_as_a_full_mailbox(mailbox, monkeypatch):
+    """No permission, full disk, read-only mount: that fault hits every slot,
+    not just this one. Reported as "all 999 in use" it sends whoever reads the
+    error hunting for stale request files that are not there.
+
+    ``srv.os`` is swapped for a proxy rather than patching ``os.open`` itself,
+    so only the module under test sees the failure.
+    """
+    class DeniedOS:
+        def __getattr__(self, name):
+            return getattr(os, name)
+
+        def open(self, *args, **kwargs):
+            raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(srv, "os", DeniedOS())
+
+    result = run(srv.reaper_call_file("CountTracks", [0]))
+
+    assert result["ok"] is False
+    assert "No free bridge request slot" not in result["error"], result["error"]
+    assert "Permission denied" in result["error"], result["error"]
+
+
 def test_timeout_cleans_up_its_own_request_file(mailbox):
     """A call that times out must not leave its slot burned forever."""
     run(srv.reaper_call_file("CountTracks", [0]))
@@ -142,7 +166,8 @@ def test_interleaved_calls_each_get_their_own_answer(live_bridge):
 @pytest.mark.live
 def test_stale_response_is_not_mistaken_for_ours(live_bridge, monkeypatch):
     """An abandoned call leaves its response behind. The mailbox held exactly
-    such an orphan for 12 days, so the response is gated on mtime.
+    such an orphan for 12 days. Claiming the slot unlinks whatever response_N
+    is sitting in it, so the orphan is gone before the poll loop can read it.
 
     Asserts the real answer arrived, not merely that the poison did not. A
     bare `ret != "STALE-POISON"` is satisfied by a timeout, which has no `ret`

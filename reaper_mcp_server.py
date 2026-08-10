@@ -221,6 +221,7 @@ async def reaper_call_file(func: str, args: list) -> dict:
     # names would never be seen by the bridge.
     request_file = None
     response_file = None
+    claim_error = None
     for _ in range(999):
         request_counter = (request_counter % 999) + 1
         candidate = BRIDGE_DIR / f"request_{request_counter}.json"
@@ -228,11 +229,20 @@ async def reaper_call_file(func: str, args: list) -> dict:
             fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
         except FileExistsError:
             continue  # another process (or an abandoned call) owns this slot
-        except OSError:
-            continue
+        except OSError as exc:
+            # Only FileExistsError means "taken". Anything else -- no
+            # permission, full disk, read-only mount -- is a fault that will
+            # hit every other slot too, so advancing would burn 998 more
+            # attempts and then report a full mailbox: the wrong diagnosis
+            # for the wrong problem.
+            claim_error = exc
+            break
         request_file = candidate
         response_file = BRIDGE_DIR / f"response_{request_counter}.json"
-        # Safe now that the slot is ours: drop any orphaned response.
+        # The slot is ours, so any response_N sitting here is an orphan from
+        # an abandoned earlier call (the mailbox held exactly such an orphan,
+        # response_21.json, for 12 days). Drop it before writing the request:
+        # this is what stops it being read back as our answer.
         try:
             response_file.unlink(missing_ok=True)
         except OSError:
@@ -244,6 +254,14 @@ async def reaper_call_file(func: str, args: list) -> dict:
         break
 
     if request_file is None:
+        if claim_error is not None:
+            return {
+                "ok": False,
+                "error": f"Cannot claim a bridge request slot: {claim_error}",
+                "bridge_dir": str(BRIDGE_DIR),
+                "hint": "The bridge directory above could not be written to. Check its "
+                        "permissions and that the disk is neither full nor read-only.",
+            }
         return {
             "ok": False,
             "error": "No free bridge request slot (all 999 in use)",
@@ -251,21 +269,12 @@ async def reaper_call_file(func: str, args: list) -> dict:
                     "REAPER bridge script is not draining them",
         }
 
-    # Only accept a response written AFTER our request. Guards against a
-    # stale response_N.json left by an abandoned earlier call being mistaken
-    # for ours (the mailbox held exactly such an orphan, response_21.json,
-    # for 12 days).
-    request_written_at = time.time()
-
     try:
         # Wait for response
         start_time = time.time()
         while time.time() - start_time < FILE_TIMEOUT:
             if response_file.exists():
                 try:
-                    if response_file.stat().st_mtime < request_written_at - 1.0:
-                        await asyncio.sleep(FILE_POLL_INTERVAL)
-                        continue
                     response_text = response_file.read_text()
                     if response_text.strip():
                         response_data = json.loads(response_text)
