@@ -9,10 +9,10 @@ A TwelveTake Studios project - https://twelvetake.com
 
 Author: TwelveTake Studios LLC
 License: MIT
-Version: 1.6.4
+Version: 1.6.5
 """
 
-__version__ = "1.6.4"
+__version__ = "1.6.5"
 
 import os
 import asyncio
@@ -20,6 +20,7 @@ import inspect
 import json
 import math
 import random
+import re
 import shutil
 import sys
 import time
@@ -186,6 +187,59 @@ async def reaper_call_http(func: str, args: list) -> dict:
         return {"ok": False, "error": "HTTP request timed out", "fallback": True}
     except Exception as e:
         return {"ok": False, "error": f"HTTP error: {str(e)}", "fallback": True}
+
+
+# Response files this server may sweep. Covers today's response_<n>.json and the
+# WS4-planned response_<pid>_<n>.json, so the PID-namespacing work does not have to
+# rewrite the sweep. Deliberately NOT request files: an orphaned request is the
+# bridge's to answer, and a live one belongs to another server sharing the mailbox.
+_RESPONSE_FILE_RE = re.compile(r"^response_\d+(?:_\d+)?\.json$")
+
+
+def sweep_orphaned_responses(bridge_dir: Path, older_than: Optional[float] = None) -> int:
+    """Delete orphaned response files no live caller can still be waiting on.
+
+    A timed-out call unlinks only its request file; the response the bridge writes
+    later is cleared by the claim-time unlink when its slot is next reused. Within a
+    process that bounds the mailbox. Across processes it does not: request_counter
+    restarts at 1, so a short session never revisits the high slots a dead process
+    left behind, and the files accumulate forever. Startup, the moment the counter
+    resets, is exactly when those slots become unreachable, so it is the right (and
+    only needed) moment to sweep. Keeping the mailbox bounded is what makes the
+    bridge's directory-enumeration poll safe (see the 331d12f revert).
+
+    The age gate makes this safe with several servers sharing the directory: a
+    response older than the transport timeout can have no live reader, because any
+    client still waiting on it has already given up, and a slow operation's response
+    is newly written when it finally lands. The extra 2s covers FAT32's 2-second
+    mtime resolution.
+
+    Returns the number of files removed. Never raises: a sweep failure must not
+    stop the server from starting.
+    """
+    if older_than is None:
+        # Resolved at call time so monkeypatched FILE_TIMEOUT is honored.
+        older_than = FILE_TIMEOUT + 2.0
+    try:
+        entries = list(bridge_dir.iterdir())
+    except OSError:
+        return 0
+    swept = 0
+    now = time.time()
+    for entry in entries:
+        if not _RESPONSE_FILE_RE.match(entry.name):
+            continue
+        try:
+            # abs(): a response stamped in the FUTURE (written while the clock was
+            # fast, then stepped back — dual-boot RTC mismatch, VM restore, NTP) can
+            # no more have a live reader than an old one, and without this it would
+            # dodge the sweep at every restart until wall time caught up.
+            if abs(now - entry.stat().st_mtime) > older_than:
+                entry.unlink()
+                swept += 1
+        except OSError:
+            continue  # claimed or removed concurrently; not ours to fight over
+    return swept
 
 
 async def reaper_call_file(func: str, args: list) -> dict:
@@ -4134,6 +4188,15 @@ def main():
     if BRIDGE_DIR_PROBLEM and COMM_MODE in ("file", "auto"):
         print(f"error: {BRIDGE_DIR_PROBLEM}", file=sys.stderr)
         raise SystemExit(1)
+
+    # This process starts its slot counter at 1, so orphans a dead process left in
+    # high slots would otherwise sit in the mailbox forever, and every stale file
+    # taxes the bridge's per-tick directory enumeration.
+    if COMM_MODE in ("file", "auto"):
+        swept = sweep_orphaned_responses(BRIDGE_DIR)
+        if swept:
+            print(f"swept {swept} orphaned bridge response file(s) from {BRIDGE_DIR}",
+                  file=sys.stderr)
 
     # stderr, never stdout: stdout carries the MCP JSON-RPC stream. Printing the resolved
     # directory here is what turns "it just times out" into a one-look diagnosis.

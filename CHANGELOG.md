@@ -5,6 +5,59 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.5] - 2026-08-10
+
+**The bridge changed — redeploy `reaper_mcp_bridge.lua`** (`twelvetake-reaper-mcp
+--install-bridge`, then re-run the script in REAPER). The server still accepts a 1.6.1
+bridge, so nothing breaks if you don't, but every fix below except the orphan sweep
+lives in the bridge.
+
+### Fixed
+- **`render_project` rewrote seven of the project's render settings and restored none of
+  them.** Output directory, filename pattern, format, source, and bounds — the user's own
+  settings, silently replaced by whatever the last MCP render used, and saved into the
+  project if the user saved for any other reason. The handler now snapshots all seven keys
+  and restores them on every exit path, including the refusal path, which used to mutate
+  the settings and then not render at all.
+  *(Reported by @SNChicago in [issue #12](https://github.com/TwelveTake-Studios/reaper-mcp/issues/12).)*
+- **`render_project` reported success without checking that a render happened** — and with
+  `overwrite=true` it had already deleted the previous output, so a render that silently
+  did nothing reported success for a file that no longer existed. `Main_OnCommand` signals
+  failure by doing nothing, so the handler now verifies every expected target exists after
+  the render — at more than zero bytes, since REAPER creates the target as a zero-byte
+  stub the moment a render starts — and reports exactly what is missing, including whether
+  an overwrite deleted the previous file first.
+  *([Issue #14](https://github.com/TwelveTake-Studios/reaper-mcp/issues/14).)*
+- **`overwrite=true` now refuses when the existing target cannot be deleted** (typically a
+  file held open by another program on Windows). Before, the failed delete was silent,
+  REAPER's modal overwrite prompt could block the bridge, and the stale old file was then
+  reported as the fresh render output.
+- **A `;` in the output filename no longer confuses the render.** REAPER joins multiple
+  render targets with `;`, which is also a legal filename character; the handler now
+  treats the unsplit string as a single path when it names a real file, so a name like
+  `mix;v2.wav` neither dodges the overwrite refusal nor gets reported as "produced no
+  output" after a successful render.
+- **The bridge burned 26.8% of a core while completely idle**, probing request_1 through
+  request_1000 with io.open on every defer tick — 31,300 failed opens per second, measured
+  by @SNChicago in [issue #13](https://github.com/TwelveTake-Studios/reaper-mcp/issues/13).
+  The poll is now one directory enumeration per tick, touching only files that exist. This
+  is the change 1.6.1 reverted; what makes it safe now is the new server-side sweep below,
+  which bounds the directory the bridge enumerates. `file_exists` also prefers REAPER's
+  native `reaper.file_exists` (1.26x cheaper than an io.open probe) with the old probe as
+  a fallback.
+- **The server now sweeps orphaned response files at startup.** A timed-out call leaves
+  its `response_N.json` behind, and after a process restart the slot counter starts over,
+  so files in high slots were never revisited and accumulated forever. The sweep deletes
+  only response files whose mtime is more than the transport timeout away from now, in
+  either direction — anything inside that window may still have a live reader in another
+  server process sharing the directory, and a file stamped in the future (clock step-back)
+  has no reader at all.
+- **The bridge reaps abandoned responses itself.** A response file continuously present
+  for 30 seconds has no live reader (every server gives up at 5), so the bridge deletes
+  it during its normal tick. This keeps the mailbox bounded even when the deployed bridge
+  is newer than the installed server — the one pairing the startup sweep cannot cover —
+  so the enumeration poll cannot degrade the way the reverted 1.6.1 attempt did.
+
 ## [1.6.4] - 2026-08-08
 
 ### Fixed

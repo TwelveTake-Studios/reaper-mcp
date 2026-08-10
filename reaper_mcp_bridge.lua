@@ -4,7 +4,7 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.6.1"
+local BRIDGE_VERSION = "1.6.5"
 
 local bridge_dir = reaper.GetResourcePath() .. '/Scripts/mcp_bridge_data/'
 
@@ -231,8 +231,15 @@ local function write_file(filepath, content)
     return true
 end
 
--- Check if file exists
+-- Check if file exists. The native call is ~1.26x cheaper than an io.open probe
+-- (#13, measured on 7.78) and behaves the same for directories (false, verified on
+-- 7.77). Hoisted with an io.open fallback because some callers sit outside any
+-- pcall, so a nil-index throw here would stop the bridge permanently.
+local reaper_file_exists = reaper.file_exists
 local function file_exists(filepath)
+    if reaper_file_exists then
+        return reaper_file_exists(filepath)
+    end
     local file = io.open(filepath, "r")
     if file then
         file:close()
@@ -1966,21 +1973,221 @@ _G.__MIDI_TEST = {note_in_filter = note_in_filter, transpose_notes_pure = transp
                   remove_overlaps_pure = remove_overlaps_pure}
 -- ========================================================================
 
+-- Render the master mix via "render using last settings", leaving the project's
+-- render settings exactly as they were found. Extracted from the dispatcher so the
+-- lupa suite can pin its exit paths; the wire name and arguments are unchanged.
+local function RenderProject(path, start_t, end_t, tail, overwrite)
+    local dir = path:match("^(.*)[/\\]") or ""
+    local file = path:match("[^/\\]+$") or path
+    local base = file:gsub("%.[A-Za-z0-9]+$", "")
+    local ext = file:match("%.([A-Za-z0-9]+)$")
+
+    local function target_size(p)
+        local f = io.open(p, "rb")
+        if not f then return nil end
+        local size = f:seek("end")
+        f:close()
+        return size
+    end
+    local function target_exists(p)
+        return target_size(p) ~= nil
+    end
+
+    -- Everything below writes project render settings, which are the user's own
+    -- and persist in the project (#12). Snapshot all seven keys this handler can
+    -- touch, and restore on EVERY exit — including the refusal below, which used
+    -- to mutate the settings and then render nothing.
+    local prev_file     = select(2, reaper.GetSetProjectInfo_String(0, "RENDER_FILE", "", false)) or ""
+    local prev_pattern  = select(2, reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", "", false)) or ""
+    local prev_format   = select(2, reaper.GetSetProjectInfo_String(0, "RENDER_FORMAT", "", false)) or ""
+    local prev_settings = reaper.GetSetProjectInfo(0, "RENDER_SETTINGS", 0, false)
+    local prev_bounds   = reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 0, false)
+    local prev_start    = reaper.GetSetProjectInfo(0, "RENDER_STARTPOS", 0, false)
+    local prev_end      = reaper.GetSetProjectInfo(0, "RENDER_ENDPOS", 0, false)
+    local function restore_render_settings()
+        reaper.GetSetProjectInfo_String(0, "RENDER_FILE", prev_file, true)
+        reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", prev_pattern, true)
+        reaper.GetSetProjectInfo_String(0, "RENDER_FORMAT", prev_format, true)
+        reaper.GetSetProjectInfo(0, "RENDER_SETTINGS", prev_settings, true)
+        reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", prev_bounds, true)
+        reaper.GetSetProjectInfo(0, "RENDER_STARTPOS", prev_start, true)
+        reaper.GetSetProjectInfo(0, "RENDER_ENDPOS", prev_end, true)
+    end
+
+    reaper.GetSetProjectInfo_String(0, "RENDER_FILE", dir, true)
+    reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", base, true)
+    if ext and ext:lower() == "wav" then
+        reaper.GetSetProjectInfo_String(0, "RENDER_FORMAT", "evaw", true)
+    end
+    -- master mix, source = master
+    reaper.GetSetProjectInfo(0, "RENDER_SETTINGS", 0, true)
+    if start_t >= 0 and end_t > start_t then
+        reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 0, true) -- custom bounds
+        reaper.GetSetProjectInfo(0, "RENDER_STARTPOS", start_t, true)
+        reaper.GetSetProjectInfo(0, "RENDER_ENDPOS", end_t + tail, true)
+    elseif tail > 0 then
+        local proj_len = reaper.GetProjectLength(0)
+        reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 0, true)
+        reaper.GetSetProjectInfo(0, "RENDER_STARTPOS", 0, true)
+        reaper.GetSetProjectInfo(0, "RENDER_ENDPOS", proj_len + tail, true)
+    else
+        reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 1, true) -- entire project
+    end
+
+    -- Read back REAPER's own computed output target(s). Must happen inside the
+    -- mutated window: RENDER_TARGETS is derived from the settings written above.
+    local _, targets = reaper.GetSetProjectInfo_String(0, "RENDER_TARGETS", "", false)
+    local expected = {}
+    if targets and targets ~= "" then
+        -- RENDER_TARGETS joins multiple outputs with ";", but ";" is also a legal
+        -- filename character, and a master-mix render has exactly one target. Trust
+        -- the split only when the unsplit string does not name a real file.
+        if not targets:find(";", 1, true) or target_exists(targets) then
+            expected[1] = targets
+        else
+            for t in string.gmatch(targets, "[^;]+") do expected[#expected + 1] = t end
+        end
+    else
+        expected[1] = path
+    end
+
+    -- Existing-target handling is part of the tool contract (overwrite arg). We
+    -- never delete files unless the caller asked, because REAPER's behavior on
+    -- existing files (prompt vs auto-increment) is a user preference we cannot
+    -- assume.
+    local existing = {}
+    for _, t in ipairs(expected) do
+        if target_exists(t) then existing[#existing + 1] = t end
+    end
+    if #existing > 0 and not overwrite then
+        restore_render_settings()
+        return {ok = false, error = "Render target already exists: "
+            .. table.concat(existing, "; ")
+            .. ". Pass overwrite=true to replace it, or render to a "
+            .. "different path. (Rendering onto an existing file may "
+            .. "otherwise pop REAPER's overwrite prompt, which blocks "
+            .. "unattended rendering.)"}
+    end
+    if #existing > 0 then
+        for _, t in ipairs(existing) do
+            os.remove(t)
+            if target_exists(t) then
+                -- A locked target (open in another app) survives os.remove. Rendering
+                -- over it would pop REAPER's modal overwrite prompt, block the defer
+                -- loop, and then report the stale file as fresh output. Refuse instead.
+                restore_render_settings()
+                return {ok = false, error = "Could not delete existing render target"
+                    .. " (file in use by another program?): " .. t}
+            end
+        end
+    end
+
+    -- 42230 = render using last settings, auto-close render dialog.
+    -- (41824 opens the dialog on projects that have never rendered.)
+    -- pcall so the restore runs even when the render throws. Do NOT unwind with
+    -- error(): the per-request handler flattens that into a generic "Bridge
+    -- error" and this structured response is lost.
+    local render_ok, render_err = pcall(reaper.Main_OnCommand, 42230, 0)
+    restore_render_settings()
+    if not render_ok then
+        return {ok = false, error = "Render failed: " .. tostring(render_err)}
+    end
+
+    -- Main_OnCommand signals failure by doing nothing (#14), so the only honest
+    -- success check is the output itself. By this point a render that did not run
+    -- has already deleted the caller's previous file when overwrite=true was
+    -- passed; say so rather than reporting success for a file that is gone.
+    local missing = {}
+    for _, t in ipairs(expected) do
+        -- REAPER creates the target at zero bytes the moment a render starts, so a
+        -- zero-length file is a render that began and died, not output. (A nonzero
+        -- truncated file from a mid-render cancel is not detectable from here.)
+        local size = target_size(t)
+        if not size or size == 0 then missing[#missing + 1] = t end
+    end
+    if #missing > 0 and #expected > 1 and (target_size(targets) or 0) > 0 then
+        -- The fragments were a mis-split single filename containing ";" after all:
+        -- the unsplit string is a real, non-empty file. The render succeeded.
+        missing = {}
+    end
+    if #missing > 0 then
+        local msg = "Render produced no output at: " .. table.concat(missing, "; ")
+            .. ". The render command ran but the expected file never appeared."
+        if #existing > 0 then
+            msg = msg .. " The previously existing target was deleted (overwrite=true) before the render started."
+        end
+        return {ok = false, error = msg}
+    end
+
+    return {ok = true, ret = true, output = path, targets = targets}
+end
+
+-- Scan the mailbox with ONE directory enumeration per tick: collect the request
+-- slots that actually have a file on disk, plus every response file present (for
+-- the reaper below). This replaced a fixed 1000-probe io.open scan that cost 26.8%
+-- of a core while completely idle (#13, measured at 31.3 Hz).
+--
+-- History, because this exact change was reverted once (331d12f): enumeration makes
+-- the per-tick cost O(files in the directory), and in 1.6.1 nothing bounded that
+-- directory — orphaned response_N.json files from timed-out calls piled up across
+-- sessions and round trips degraded 0.07s -> 0.53s with 60 stale files. Two bounds
+-- now hold it down: the server sweeps aged responses at startup
+-- (sweep_orphaned_responses), and this bridge reaps responses nobody claimed
+-- (reap_abandoned_responses below), so the directory stays small even against a
+-- pre-1.7.0 server that never sweeps.
+local function scan_mailbox()
+    reaper.EnumerateFiles(bridge_dir, -1) -- documented way to force a directory re-read
+    local pending, responses = {}, {}
+    local scan = 0
+    local entry = reaper.EnumerateFiles(bridge_dir, scan)
+    while entry do
+        local slot = entry:match("^request_(%d+)%.json$")
+        if slot then pending[#pending + 1] = tonumber(slot) end
+        if entry:match("^response_%d+%.json$") or entry:match("^response_%d+_%d+%.json$") then
+            responses[#responses + 1] = entry
+        end
+        scan = scan + 1
+        entry = reaper.EnumerateFiles(bridge_dir, scan)
+    end
+    -- Ascending slot order keeps multi-request ticks deterministic.
+    table.sort(pending)
+    return pending, responses
+end
+
+-- Reap abandoned responses. A server that times out abandons its response file; the
+-- server-side startup sweep clears those, but only if the USER'S server half is new
+-- enough to have it — the bridge is hand-deployed and outlives pip up/downgrades, so
+-- a 1.7.0 bridge can face a pre-sweep server, and then nothing else bounds the
+-- directory this bridge enumerates every tick (the exact 331d12f failure). So the
+-- bridge bounds it itself: a response file continuously present for longer than
+-- RESPONSE_ORPHAN_TTL has no live reader — every server gives up at FILE_TIMEOUT=5s
+-- — and is deleted. Claimed responses vanish between sightings and are forgotten, so
+-- the bookkeeping table stays as small as the directory.
+local RESPONSE_ORPHAN_TTL = 30 -- seconds; far beyond any server's 5s transport timeout
+local response_first_seen = {}
+local function reap_abandoned_responses(responses)
+    local now = os.time()
+    local present = {}
+    for _, name in ipairs(responses) do
+        present[name] = true
+        local first = response_first_seen[name]
+        if not first then
+            response_first_seen[name] = now
+        elseif now - first > RESPONSE_ORPHAN_TTL then
+            os.remove(bridge_dir .. name)
+            response_first_seen[name] = nil
+        end
+    end
+    for name in pairs(response_first_seen) do
+        if not present[name] then response_first_seen[name] = nil end
+    end
+end
+
 -- Main processing function
 local function process_request()
-    -- Look for any request files with numbered pattern.
-    --
-    -- This is a fixed 1000 io.open probes per defer tick, which is genuinely wasteful
-    -- while idle (roughly 30,000 failed opens per second on REAPER's UI thread) and is
-    -- still worth fixing. It is NOT worth fixing with reaper.EnumerateFiles, which was
-    -- tried in 1.6.1 and reverted after live testing: enumeration makes the per-tick
-    -- cost O(files in the directory) rather than constant, and orphaned response_N.json
-    -- files accumulate (a timed-out call leaves its response behind until that slot
-    -- recycles 999 calls later). Round-trip time degraded from 0.07s to 0.53s with only
-    -- 60 stale files present, and each timeout creates another one, so a long session
-    -- spirals. A real fix has to bound the directory first, or change the file protocol,
-    -- which needs both halves shipped together (see REACH_PLAN trap 2).
-    for i = 1, 1000 do
+    local pending, responses = scan_mailbox()
+    reap_abandoned_responses(responses)
+    for _, i in ipairs(pending) do
         local numbered_request_file = bridge_dir .. 'request_' .. i .. '.json'
         local numbered_response_file = bridge_dir .. 'response_' .. i .. '.json'
         
@@ -5933,75 +6140,14 @@ local function process_request()
 
                     elseif fname == "RenderProject" then
                         -- args: output_path, start_time (-1 = project start), end_time (-1 = project end),
-                        --       tail_seconds. Renders the master mix via "render last settings" (41824).
+                        --       tail_seconds, overwrite. The handler snapshots and restores the
+                        --       project's render settings itself (#12) and verifies the output (#14).
                         if #args >= 1 and type(args[1]) == "string" and args[1] ~= "" then
-                            local path = args[1]
-                            local start_t = tonumber(args[2]) or -1
-                            local end_t = tonumber(args[3]) or -1
-                            local tail = tonumber(args[4]) or 0
-
-                            local dir = path:match("^(.*)[/\\]") or ""
-                            local file = path:match("[^/\\]+$") or path
-                            local base = file:gsub("%.[A-Za-z0-9]+$", "")
-                            local ext = file:match("%.([A-Za-z0-9]+)$")
-
-                            reaper.GetSetProjectInfo_String(0, "RENDER_FILE", dir, true)
-                            reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", base, true)
-                            if ext and ext:lower() == "wav" then
-                                reaper.GetSetProjectInfo_String(0, "RENDER_FORMAT", "evaw", true)
-                            end
-                            -- master mix, source = master
-                            reaper.GetSetProjectInfo(0, "RENDER_SETTINGS", 0, true)
-                            if start_t >= 0 and end_t > start_t then
-                                reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 0, true) -- custom bounds
-                                reaper.GetSetProjectInfo(0, "RENDER_STARTPOS", start_t, true)
-                                reaper.GetSetProjectInfo(0, "RENDER_ENDPOS", end_t + tail, true)
-                            elseif tail > 0 then
-                                local proj_len = reaper.GetProjectLength(0)
-                                reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 0, true)
-                                reaper.GetSetProjectInfo(0, "RENDER_STARTPOS", 0, true)
-                                reaper.GetSetProjectInfo(0, "RENDER_ENDPOS", proj_len + tail, true)
-                            else
-                                reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 1, true) -- entire project
-                            end
-                            -- Read back REAPER's own computed output target(s)
-                            local _, targets = reaper.GetSetProjectInfo_String(0, "RENDER_TARGETS", "", false)
-                            -- Existing-target handling is part of the tool contract (args[5]
-                            -- = overwrite). We never delete files unless the caller asked,
-                            -- because REAPER's behavior on existing files (prompt vs
-                            -- auto-increment) is a user preference we cannot assume.
-                            local existing = {}
-                            local function exists(p)
-                                local f = io.open(p, "rb")
-                                if f then f:close() return true end
-                                return false
-                            end
-                            if targets and targets ~= "" then
-                                for t in string.gmatch(targets, "[^;]+") do
-                                    if exists(t) then existing[#existing + 1] = t end
-                                end
-                            elseif exists(path) then
-                                existing[#existing + 1] = path
-                            end
-                            if #existing > 0 and not args[5] then
-                                response.error = "Render target already exists: "
-                                    .. table.concat(existing, "; ")
-                                    .. ". Pass overwrite=true to replace it, or render to a "
-                                    .. "different path. (Rendering onto an existing file may "
-                                    .. "otherwise pop REAPER's overwrite prompt, which blocks "
-                                    .. "unattended rendering.)"
-                                response.ok = false
-                            else
-                                if #existing > 0 then
-                                    for _, t in ipairs(existing) do os.remove(t) end
-                                end
-                                -- 42230 = render using last settings, auto-close render dialog.
-                                -- (41824 opens the dialog on projects that have never rendered.)
-                                reaper.Main_OnCommand(42230, 0)
-                                response.ret = true
-                                response.output = path
-                                response.targets = targets
-                                response.ok = true
+                            local result = RenderProject(args[1], tonumber(args[2]) or -1,
+                                                         tonumber(args[3]) or -1,
+                                                         tonumber(args[4]) or 0, args[5])
+                            for k, v in pairs(result) do
+                                response[k] = v
                             end
                         else
                             response.error = "RenderProject requires output_path (string)"
