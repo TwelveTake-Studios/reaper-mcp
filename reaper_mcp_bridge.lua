@@ -4,7 +4,7 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.6.5"
+local BRIDGE_VERSION = "1.6.6"
 
 local bridge_dir = reaper.GetResourcePath() .. '/Scripts/mcp_bridge_data/'
 
@@ -2119,6 +2119,19 @@ local function RenderProject(path, start_t, end_t, tail, overwrite)
         return {ok = false, error = msg}
     end
 
+    -- The targets existing is not the same as the caller's file existing. The format
+    -- is forced only for .wav (above), so for any other extension REAPER renders in
+    -- the project's configured format and writes its own filename. Every target can
+    -- then be present while the path the caller asked for was never written, and
+    -- returning ok for that path is a wrong answer about a file that is not there.
+    if (target_size(path) or 0) == 0 then
+        return {ok = false, error = "Render wrote " .. tostring(targets)
+            .. ", not the requested " .. path
+            .. ". Only a .wav extension sets the render format; any other extension"
+            .. " renders in the format the project is already configured for."
+            .. " Ask for a .wav path, or set the project's render format to match."}
+    end
+
     return {ok = true, ret = true, output = path, targets = targets}
 end
 
@@ -2196,6 +2209,15 @@ local function process_request()
             local ok, err = pcall(function()
                 -- Read and process request
                 local request_data = read_file(numbered_request_file)
+                -- An empty request is the server mid-claim, not a bad request. It
+                -- claims its slot with O_CREAT|O_EXCL, which makes request_N.json
+                -- visible here at zero bytes, then clears any stale response_N, and
+                -- only then writes the payload. That order is forced: unlinking the
+                -- stale response after writing the payload would race the answer we
+                -- are about to produce and delete it. So the empty window is real and
+                -- must be waited out. Answering it would hand the caller a false
+                -- "Malformed request JSON" for a request it was still writing.
+                if request_data and request_data:match("^%s*$") then request_data = nil end
                 if request_data then
                     log("Processing request " .. i .. ": " .. request_data .. "\n")
                     

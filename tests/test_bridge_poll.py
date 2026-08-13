@@ -26,6 +26,46 @@ def bridge_src():
     return BRIDGE.read_text(encoding="utf-8")
 
 
+@pytest.fixture(scope="module")
+def mid_claim_guard(bridge_src):
+    """The real guard line that skips a request the server is still writing.
+
+    The server claims its slot with ``O_CREAT|O_EXCL``, so ``request_N.json`` is
+    visible to the enumeration poll at zero bytes while the payload is still being
+    written. Answering that window hands the caller "Malformed request JSON" for a
+    request that was perfectly valid a microsecond later.
+    """
+    m = re.search(
+        r'^\s*(if request_data and request_data:match\(.*?\) then request_data = nil end)\s*$',
+        bridge_src,
+        re.M,
+    )
+    assert m, "the mid-claim guard is gone from process_request"
+    return m.group(1)
+
+
+def run_guard(guard, content):
+    lua = lupa.LuaRuntime(unpack_returned_tuples=True)
+    literal = "nil" if content is None else "[==[" + content + "]==]"
+    return lua.execute(f"local request_data = {literal}\n{guard}\nreturn request_data")
+
+
+@pytest.mark.parametrize("content", ["", " ", "\n", "  \r\n\t "])
+def test_empty_request_is_skipped_not_answered(mid_claim_guard, content):
+    """A zero-byte or all-whitespace request is the claim window, never a request."""
+    assert run_guard(mid_claim_guard, content) is None
+
+
+@pytest.mark.parametrize(
+    "content",
+    ['{"func":"CountTracks","args":[0]}', '  {"func":"GetCursorPosition","args":[]}  ', "garbage"],
+)
+def test_non_empty_request_still_reaches_the_decoder(mid_claim_guard, content):
+    """The guard must not swallow anything with content, including a genuinely
+    malformed request, which still has to be answered rather than left to time out."""
+    assert run_guard(mid_claim_guard, content) == content
+
+
 @pytest.fixture
 def lua_tmp(tmp_path):
     """tmp_path, but only when Lua's io.open can actually address it.

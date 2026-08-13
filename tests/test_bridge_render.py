@@ -164,6 +164,21 @@ def test_render_success_shape_unchanged(render_call, lua_tmp):
     assert out["during_render"]["cmd"] == 42230
 
 
+def test_render_to_non_wav_does_not_claim_a_file_it_never_wrote(render_call, lua_tmp):
+    """Only .wav sets the render format, so REAPER writes its own name for anything
+    else. The targets all exist; the caller's path does not. That is not a success."""
+    asked = (lua_tmp / "mix.mp3").as_posix()
+    written = (lua_tmp / "mix.ogg").as_posix()
+    out = render_call(
+        stub_render_reaper(action_lua=make_file_action(written)),
+        f'RenderProject("{asked}", -1, -1, 0, nil)',
+    )
+    assert out["response"]["ok"] is False
+    assert "not the requested" in out["response"]["error"]
+    assert asked in out["response"]["error"]
+    assert out["settings"] == out["initial"]
+
+
 def test_render_restores_settings_after_success(render_call, lua_tmp):
     """#12: the user's render settings survive a successful render untouched."""
     target = (lua_tmp / "mix.wav").as_posix()

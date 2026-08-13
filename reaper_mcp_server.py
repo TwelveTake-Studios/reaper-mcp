@@ -127,7 +127,17 @@ BRIDGE_DIR_PROBLEM = bridge_dir_problem(BRIDGE_DIR)
 # GetBridgeVersion and is reported as out of date instead of failing in obscure ways.
 MIN_BRIDGE_VERSION = "1.6.1"
 
-FILE_TIMEOUT = 5.0
+# How long to wait for the bridge to answer. Configurable because the bridge answers
+# only after the work finishes and renders run at roughly realtime, so 5s reports a
+# failure for any render longer than five seconds while REAPER completes it normally.
+# Raising this globally also makes a genuinely dead bridge take that long to diagnose,
+# which is why it is a knob rather than a larger default.
+try:
+    FILE_TIMEOUT = float(os.getenv("REAPER_FILE_TIMEOUT", "5.0"))
+    if FILE_TIMEOUT <= 0:
+        raise ValueError
+except ValueError:
+    FILE_TIMEOUT = 5.0
 FILE_POLL_INTERVAL = 0.02
 
 # Communication mode: "file" (default), "http", or "auto" (http with file fallback)
@@ -156,7 +166,7 @@ def get_http_client():
     """Get or create HTTP client."""
     global _http_client
     if _http_client is None and HTTPX_AVAILABLE:
-        _http_client = httpx.Client(timeout=5.0)
+        _http_client = httpx.Client(timeout=FILE_TIMEOUT)
     return _http_client
 
 
@@ -175,7 +185,7 @@ async def reaper_call_http(func: str, args: list) -> dict:
         response = client.post(
             f"{REAPER_URL}/call",
             json={"func": func, "args": args},
-            timeout=5.0
+            timeout=FILE_TIMEOUT
         )
         if response.status_code == 200:
             return response.json()
@@ -276,7 +286,26 @@ async def reaper_call_file(func: str, args: list) -> dict:
     request_file = None
     response_file = None
     claim_error = None
-    for _ in range(999):
+
+    if not _bridge_check["claims_ok"]:
+        # Deployed bridge predates the mid-claim guard (or has not been probed yet).
+        # Claiming would leave request_N.json visible at zero bytes while the stale
+        # response is cleared, and a bridge without the guard answers that window with
+        # "Malformed request JSON" -- a false failure for a valid call. Fall back to
+        # the single-shot write those bridges were built against. It cannot protect
+        # against a second client, which is exactly what it did before 1.6.6, so the
+        # upgrade is never a downgrade for anyone.
+        request_counter = (request_counter % 999) + 1
+        request_file = BRIDGE_DIR / f"request_{request_counter}.json"
+        response_file = BRIDGE_DIR / f"response_{request_counter}.json"
+        try:
+            response_file.unlink(missing_ok=True)
+        except OSError:
+            pass
+        request_file.write_bytes(payload)
+
+    # Skipped entirely when the fallback above already placed the request.
+    for _ in range(999 if request_file is None else 0):
         request_counter = (request_counter % 999) + 1
         candidate = BRIDGE_DIR / f"request_{request_counter}.json"
         try:
@@ -361,6 +390,8 @@ async def reaper_call_file(func: str, args: list) -> dict:
                 "freezing, glueing, normalizing, opening or saving a project) reports a "
                 "timeout while REAPER completes it normally. Renders in particular run at "
                 "close to realtime unless the project's render settings say otherwise. "
+                "Set REAPER_FILE_TIMEOUT to a number of seconds that covers the work you "
+                "are asking for; it defaults to 5.0. "
                 "Check the expected result before retrying. When retrying a render, do not "
                 "pass overwrite=true to clear a 'target already exists' error: REAPER "
                 "creates the target at zero bytes when a render starts, so that file is the "
@@ -400,7 +431,14 @@ def version_tuple(text: str) -> tuple:
 
 
 # Cached result of the one-time bridge version probe.
-_bridge_check = {"done": False, "error": None}
+_bridge_check = {"done": False, "error": None, "claims_ok": False}
+
+# Slot claiming (PR #10) makes request_N.json briefly visible at zero bytes. Only a
+# bridge from this version on knows to wait that window out instead of answering it
+# with "Malformed request JSON", so claiming stays off until the deployed bridge is
+# known to be at least this. Unknown counts as too old: the fallback is what every
+# bridge before it was built against, so nobody is worse off than they were.
+SLOT_CLAIM_BRIDGE_VERSION = "1.6.6"
 
 _STALE_BRIDGE_HINT = (
     "REAPER is running a bridge script older than this server needs. REAPER loads the "
@@ -428,6 +466,9 @@ async def ensure_bridge_current() -> Optional[dict]:
 
     if result.get("ok") and result.get("version"):
         deployed = str(result["version"])
+        _bridge_check["claims_ok"] = (
+            version_tuple(deployed) >= version_tuple(SLOT_CLAIM_BRIDGE_VERSION)
+        )
         if version_tuple(deployed) < version_tuple(MIN_BRIDGE_VERSION):
             _bridge_check["error"] = {
                 "ok": False,

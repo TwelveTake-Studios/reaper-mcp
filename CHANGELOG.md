@@ -5,6 +5,37 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.6] - 2026-08-13
+
+**The bridge changed — redeploy `reaper_mcp_bridge.lua`** (`twelvetake-reaper-mcp
+--install-bridge`, then re-run the script in REAPER).
+
+### Fixed
+- **`render_project` reported success for a file it never wrote.** Only a `.wav`
+  extension sets the render format, so asking for any other extension rendered in
+  whatever format the project was already configured for, under REAPER's own filename.
+  Every render target then existed while the path the caller asked for did not, and the
+  handler returned success with `output` pointing at the missing file. It now fails and
+  names what REAPER actually wrote. Present in every release that had `render_project`.
+- **Renders longer than five seconds no longer have to report a failure.** The bridge
+  answers only once the work finishes, and renders run at roughly realtime, so the fixed
+  5s deadline reported a timeout for work REAPER was completing normally. The deadline is
+  now `REAPER_FILE_TIMEOUT` (default `5.0`), which the timeout message names at the moment
+  you hit it. The HTTP transport's two hardcoded deadlines follow the same value.
+  *(Reported by @SNChicago in [issue #11](https://github.com/TwelveTake-Studios/reaper-mcp/issues/11).)*
+- **A request the server was still writing could come back as "Malformed request JSON".**
+  Claiming a slot by exclusive create makes the request file briefly visible at zero bytes,
+  and the bridge answered that empty window instead of waiting for it. Only reachable
+  between the 1.6.5 poll and the slot claiming below, so no released version shipped both.
+
+### Changed
+- **Request slots are claimed by exclusive create**, so two MCP clients on one machine can
+  no longer allocate the same slot and read each other's answers. Claiming turns itself on
+  only once the deployed bridge reports 1.6.6 or newer; against an older one the server
+  writes the request exactly as it always has, so upgrading the package without redeploying
+  the bridge behaves as it did before rather than failing.
+  *(By Walter [@SNChicago](https://github.com/SNChicago) in [PR #10](https://github.com/TwelveTake-Studios/reaper-mcp/pull/10).)*
+
 ## [1.6.5] - 2026-08-10
 
 **The bridge changed — redeploy `reaper_mcp_bridge.lua`** (`twelvetake-reaper-mcp

@@ -249,3 +249,42 @@ def test_version_probe_itself_is_not_gated(monkeypatch):
     monkeypatch.setattr(srv, "dispatch", fake)
     run(srv.reaper_call("GetBridgeVersion"))
     assert [c[0] for c in fake.calls] == ["GetBridgeVersion"]
+
+
+# --- REAPER_FILE_TIMEOUT ---
+#
+# The bridge answers only after the work finishes, so the deadline has to be raisable:
+# at the 5.0 default any render longer than five seconds reports a failure that did not
+# happen. FILE_TIMEOUT is read at import, so these reload the module.
+
+def _reload_with(monkeypatch, value):
+    import importlib
+    if value is None:
+        monkeypatch.delenv("REAPER_FILE_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("REAPER_FILE_TIMEOUT", value)
+    return importlib.reload(srv)
+
+
+@pytest.fixture(autouse=False)
+def restore_srv():
+    yield
+    import importlib
+    import os
+    os.environ.pop("REAPER_FILE_TIMEOUT", None)
+    importlib.reload(srv)
+
+
+def test_file_timeout_defaults_to_five(monkeypatch, restore_srv):
+    assert _reload_with(monkeypatch, None).FILE_TIMEOUT == 5.0
+
+
+def test_file_timeout_is_configurable(monkeypatch, restore_srv):
+    """A render longer than five seconds is the whole reason this knob exists."""
+    assert _reload_with(monkeypatch, "900").FILE_TIMEOUT == 900.0
+
+
+@pytest.mark.parametrize("bad", ["", "soon", "-1", "0"])
+def test_nonsense_file_timeout_falls_back_to_the_default(monkeypatch, restore_srv, bad):
+    """A typo must not disable the deadline or make every call fail instantly."""
+    assert _reload_with(monkeypatch, bad).FILE_TIMEOUT == 5.0

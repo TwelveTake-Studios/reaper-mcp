@@ -590,6 +590,7 @@ Third-party plugins use their full name as shown in REAPER's FX browser.
 |----------|---------|-------------|
 | `REAPER_COMM_MODE` | `file` | Communication mode (`file` or `http`) |
 | `REAPER_BRIDGE_DIR` | REAPER's `Scripts/mcp_bridge_data`, resolved per platform | File bridge directory |
+| `REAPER_FILE_TIMEOUT` | `5.0` | Seconds to wait for the bridge to answer. The bridge answers only once the work finishes, and renders run at roughly realtime, so a render longer than this reports a timeout while REAPER completes it normally. Raise it when rendering; note that a genuinely unreachable bridge then also takes this long to report. |
 | `REAPER_MCP_DEBUG` | unset | Set to `1` before launching REAPER for per-call bridge console logging |
 | `REAPER_HOST` | `localhost` | HTTP bridge host |
 | `REAPER_PORT` | `9000` | HTTP bridge port |

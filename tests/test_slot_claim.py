@@ -39,7 +39,47 @@ def mailbox(tmp_path, monkeypatch):
     monkeypatch.setattr(srv, "BRIDGE_DIR", tmp_path)
     monkeypatch.setattr(srv, "FILE_TIMEOUT", 0.2)  # nothing will answer; fail fast
     monkeypatch.setattr(srv, "request_counter", 0)
+    # Claiming is gated on the deployed bridge carrying the mid-claim guard, so these
+    # tests declare that bridge. Without it reaper_call_file takes the single-shot
+    # fallback and there is no claim to test.
+    monkeypatch.setitem(srv._bridge_check, "claims_ok", True)
     return tmp_path
+
+
+@pytest.fixture
+def mailbox_old_bridge(mailbox, monkeypatch):
+    """The same mailbox against a bridge that predates the mid-claim guard."""
+    monkeypatch.setitem(srv._bridge_check, "claims_ok", False)
+    return mailbox
+
+
+def test_old_bridge_is_never_sent_the_zero_byte_window(mailbox_old_bridge, monkeypatch):
+    """The exclusive create is what makes request_N.json briefly visible at zero
+    bytes. A bridge without the mid-claim guard answers that window with a false
+    'Malformed request JSON', so against one the claim must not happen at all."""
+    import os as real_os
+    claims = []
+
+    class RecordingOS:
+        def __getattr__(self, name):
+            return getattr(real_os, name)
+
+        def open(self, path, flags, *args, **kwargs):
+            if flags & real_os.O_EXCL:
+                claims.append(path)
+            return real_os.open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(srv, "os", RecordingOS())
+    run(srv.reaper_call_file("CountTracks", [0]))
+    assert claims == [], "claimed a slot against a bridge that cannot tolerate it"
+
+
+def test_old_bridge_still_clears_a_stale_response(mailbox_old_bridge):
+    """The orphan that would otherwise be read back as this call's answer."""
+    (mailbox_old_bridge / "response_1.json").write_text('{"ok": true, "ret": 99}')
+    out = run(srv.reaper_call_file("CountTracks", [0]))
+    assert out["ok"] is False, "a stale orphan was returned as this call's answer"
+    assert not (mailbox_old_bridge / "response_1.json").exists()
 
 
 def occupy(mailbox, lo, hi):
