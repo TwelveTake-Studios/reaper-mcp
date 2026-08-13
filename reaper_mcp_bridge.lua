@@ -2093,7 +2093,7 @@ local function RenderProject(path, start_t, end_t, tail, overwrite)
         return {ok = false, error = "Render failed: " .. tostring(render_err)}
     end
 
-    -- Main_OnCommand signals failure by doing nothing (#14), so the only honest
+    -- Main_OnCommand signals failure by doing nothing, so the only honest
     -- success check is the output itself. By this point a render that did not run
     -- has already deleted the caller's previous file when overwrite=true was
     -- passed; say so rather than reporting success for a file that is gone.
@@ -6141,7 +6141,7 @@ local function process_request()
                     elseif fname == "RenderProject" then
                         -- args: output_path, start_time (-1 = project start), end_time (-1 = project end),
                         --       tail_seconds, overwrite. The handler snapshots and restores the
-                        --       project's render settings itself (#12) and verifies the output (#14).
+                        --       project's render settings itself (#12) and verifies the output.
                         if #args >= 1 and type(args[1]) == "string" and args[1] ~= "" then
                             local result = RenderProject(args[1], tonumber(args[2]) or -1,
                                                          tonumber(args[3]) or -1,

@@ -27,7 +27,6 @@ lives in the bridge.
   the render — at more than zero bytes, since REAPER creates the target as a zero-byte
   stub the moment a render starts — and reports exactly what is missing, including whether
   an overwrite deleted the previous file first.
-  *([Issue #14](https://github.com/TwelveTake-Studios/reaper-mcp/issues/14).)*
 - **`overwrite=true` now refuses when the existing target cannot be deleted** (typically a
   file held open by another program on Windows). Before, the failed delete was silent,
   REAPER's modal overwrite prompt could block the bridge, and the stale old file was then

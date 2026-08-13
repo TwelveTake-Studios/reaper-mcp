@@ -1,9 +1,9 @@
-"""Response-shape tests for the bridge's RenderProject handler (#12 / #14).
+"""Response-shape tests for the bridge's RenderProject handler.
 
 One render_project call used to rewrite seven of the project's render settings and
 restore none of them (#12, reported by @SNChicago), and reported success without
 checking that a file was produced — after ``overwrite=true`` had already deleted the
-previous output (#14). The handler now snapshots the settings, restores them on
+previous output. The handler now snapshots the settings, restores them on
 every exit path, refuses when an existing target cannot be deleted, and refuses to
 claim success for a file that does not exist (or exists at zero bytes, which is the
 husk REAPER leaves when a render starts and dies).
@@ -153,7 +153,7 @@ def make_file_action(path, content="RIFF"):
 
 
 def test_render_success_shape_unchanged(render_call, lua_tmp):
-    """The pre-#14 success shape must survive: ok, ret, output, targets."""
+    """The original success shape must survive: ok, ret, output, targets."""
     target = (lua_tmp / "mix.wav").as_posix()
     out = render_call(
         stub_render_reaper(action_lua=make_file_action(target)),
@@ -223,7 +223,7 @@ def test_render_undeletable_target_is_refused_before_rendering(render_call, lua_
 
 
 def test_render_that_produces_nothing_is_a_failure(render_call, lua_tmp):
-    """#14: Main_OnCommand signals failure by doing nothing; the output is the check."""
+    """Main_OnCommand signals failure by doing nothing; the output is the check."""
     target = (lua_tmp / "mix.wav").as_posix()
     out = render_call(
         stub_render_reaper(),  # render action: nothing
@@ -249,7 +249,7 @@ def test_render_zero_byte_output_is_a_failure(render_call, lua_tmp):
 
 
 def test_render_failure_after_overwrite_names_the_deletion(render_call, lua_tmp):
-    """#14's data-destroying combination: overwrite=true deletes the previous file,
+    """The data-destroying combination: overwrite=true deletes the previous file,
     then the render does not run. The error must say the old file is gone."""
     target = lua_tmp / "mix.wav"
     target.write_bytes(b"precious")
