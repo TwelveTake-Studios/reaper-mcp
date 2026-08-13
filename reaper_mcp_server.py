@@ -250,26 +250,80 @@ async def reaper_call_file(func: str, args: list) -> dict:
     if BRIDGE_DIR_PROBLEM:
         return {"ok": False, "error": BRIDGE_DIR_PROBLEM}
 
-    request_counter = (request_counter % 999) + 1
-
     # Ensure bridge directory exists
     BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
 
-    request_file = BRIDGE_DIR / f"request_{request_counter}.json"
-    response_file = BRIDGE_DIR / f"response_{request_counter}.json"
+    payload = json.dumps({"func": func, "args": args}).encode("utf-8")
 
-    request_data = {"func": func, "args": args}
-
-    try:
-        # Clean up old response file
+    # Claim a slot by EXCLUSIVE CREATE rather than trusting the counter.
+    #
+    # `request_counter` is a per-process global starting at 0, and the mailbox
+    # is shared by every MCP client on this machine. One stdio server is
+    # spawned per client (Claude Desktop and Claude Code each get their own),
+    # so two live servers both allocated request_1.json on their first call and
+    # collided from then on. Observed failure modes: a request silently
+    # overwritten (caller times out), a response deleted by the other process
+    # mid-wait, and worst — CROSS-TALK, where one client reads the answer to
+    # the other client's question and returns it as a success. A well-formed
+    # wrong answer is far more dangerous than a timeout for a measurement
+    # pipeline.
+    #
+    # O_EXCL makes co-selection impossible: only one process can create a given
+    # request_N.json, and the loser advances to the next slot. The Lua bridge
+    # scans a fixed `for i = 1, 1000` range and derives response_N from the same
+    # index, so the filename format MUST stay request_<int>.json — PID-suffixed
+    # names would never be seen by the bridge.
+    request_file = None
+    response_file = None
+    claim_error = None
+    for _ in range(999):
+        request_counter = (request_counter % 999) + 1
+        candidate = BRIDGE_DIR / f"request_{request_counter}.json"
+        try:
+            fd = os.open(candidate, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+        except FileExistsError:
+            continue  # another process (or an abandoned call) owns this slot
+        except OSError as exc:
+            # Only FileExistsError means "taken". Anything else -- no
+            # permission, full disk, read-only mount -- is a fault that will
+            # hit every other slot too, so advancing would burn 998 more
+            # attempts and then report a full mailbox: the wrong diagnosis
+            # for the wrong problem.
+            claim_error = exc
+            break
+        request_file = candidate
+        response_file = BRIDGE_DIR / f"response_{request_counter}.json"
+        # The slot is ours, so any response_N sitting here is an orphan from
+        # an abandoned earlier call (the mailbox held exactly such an orphan,
+        # response_21.json, for 12 days). Drop it before writing the request:
+        # this is what stops it being read back as our answer.
         try:
             response_file.unlink(missing_ok=True)
-        except:
+        except OSError:
             pass
+        try:
+            os.write(fd, payload)
+        finally:
+            os.close(fd)
+        break
 
-        # Write request
-        request_file.write_text(json.dumps(request_data))
+    if request_file is None:
+        if claim_error is not None:
+            return {
+                "ok": False,
+                "error": f"Cannot claim a bridge request slot: {claim_error}",
+                "bridge_dir": str(BRIDGE_DIR),
+                "hint": "The bridge directory above could not be written to. Check its "
+                        "permissions and that the disk is neither full nor read-only.",
+            }
+        return {
+            "ok": False,
+            "error": "No free bridge request slot (all 999 in use)",
+            "hint": "Stale request_*.json files in the bridge directory, or the "
+                    "REAPER bridge script is not draining them",
+        }
 
+    try:
         # Wait for response
         start_time = time.time()
         while time.time() - start_time < FILE_TIMEOUT:
@@ -286,6 +340,8 @@ async def reaper_call_file(func: str, args: list) -> dict:
                             pass
                         return response_data
                 except json.JSONDecodeError:
+                    pass
+                except OSError:
                     pass
             await asyncio.sleep(FILE_POLL_INTERVAL)
 
