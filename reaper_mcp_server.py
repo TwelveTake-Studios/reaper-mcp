@@ -269,10 +269,10 @@ async def reaper_call_file(func: str, args: list) -> dict:
     # pipeline.
     #
     # O_EXCL makes co-selection impossible: only one process can create a given
-    # request_N.json, and the loser advances to the next slot. The Lua bridge
-    # scans a fixed `for i = 1, 1000` range and derives response_N from the same
-    # index, so the filename format MUST stay request_<int>.json — PID-suffixed
-    # names would never be seen by the bridge.
+    # request_N.json, and the loser advances to the next slot. The bridge derives
+    # response_N from the request's own index and matches names against
+    # ^request_(%d+)%.json$, so the filename format MUST stay request_<int>.json:
+    # PID-suffixed names would never be seen by it.
     request_file = None
     response_file = None
     claim_error = None
