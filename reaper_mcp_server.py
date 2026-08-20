@@ -140,6 +140,17 @@ except ValueError:
     FILE_TIMEOUT = 5.0
 FILE_POLL_INTERVAL = 0.02
 
+# Deadline for calls that block the bridge for as long as the work takes. Renders run at
+# roughly realtime, so the 5s transport default reports a failure for anything past five
+# seconds of audio. This is a per-call override rather than a bigger FILE_TIMEOUT: raising
+# the global one makes a genuinely dead bridge take that long to diagnose on EVERY call.
+try:
+    RENDER_TIMEOUT = float(os.getenv("REAPER_RENDER_TIMEOUT", "600.0"))
+    if RENDER_TIMEOUT <= 0:
+        raise ValueError
+except ValueError:
+    RENDER_TIMEOUT = 600.0
+
 # Communication mode: "file" (default), "http", or "auto" (http with file fallback)
 COMM_MODE = os.getenv("REAPER_COMM_MODE", "file").lower()
 
@@ -172,8 +183,12 @@ def get_http_client():
 
 # --- Communication Layer ---
 
-async def reaper_call_http(func: str, args: list) -> dict:
-    """Call a REAPER function via HTTP bridge."""
+async def reaper_call_http(func: str, args: list, timeout: float = None) -> dict:
+    """Call a REAPER function via HTTP bridge.
+
+    Takes the same per-call deadline as the file transport: a render is slow because
+    REAPER is slow, not because of how the request reached it.
+    """
     if not HTTPX_AVAILABLE:
         return {"ok": False, "error": "httpx not installed", "fallback": True}
 
@@ -185,7 +200,7 @@ async def reaper_call_http(func: str, args: list) -> dict:
         response = client.post(
             f"{REAPER_URL}/call",
             json={"func": func, "args": args},
-            timeout=FILE_TIMEOUT
+            timeout=(FILE_TIMEOUT if timeout is None else timeout)
         )
         if response.status_code == 200:
             return response.json()
@@ -252,9 +267,15 @@ def sweep_orphaned_responses(bridge_dir: Path, older_than: Optional[float] = Non
     return swept
 
 
-async def reaper_call_file(func: str, args: list) -> dict:
-    """Call a REAPER function via file-based bridge."""
+async def reaper_call_file(func: str, args: list, timeout: float = None) -> dict:
+    """Call a REAPER function via file-based bridge.
+
+    `timeout` overrides the deadline for this one call. FILE_TIMEOUT is read here at call
+    time rather than bound as a def-time default, because the test fixtures monkeypatch
+    the module global and a bound default would stop seeing it.
+    """
     global request_counter
+    deadline = FILE_TIMEOUT if timeout is None else timeout
 
     # Refuse rather than create a junk directory and then time out against it forever.
     if BRIDGE_DIR_PROBLEM:
@@ -355,7 +376,7 @@ async def reaper_call_file(func: str, args: list) -> dict:
     try:
         # Wait for response
         start_time = time.time()
-        while time.time() - start_time < FILE_TIMEOUT:
+        while time.time() - start_time < deadline:
             if response_file.exists():
                 try:
                     response_text = response_file.read_text()
@@ -382,7 +403,7 @@ async def reaper_call_file(func: str, args: list) -> dict:
 
         return {
             "ok": False,
-            "error": f"{func} timed out after {FILE_TIMEOUT:g}s",
+            "error": f"{func} timed out after {deadline:g}s",
             "bridge_dir": str(BRIDGE_DIR),
             "hint": (
                 "This does NOT mean the work did not happen. The bridge answers only after "
@@ -407,17 +428,17 @@ async def reaper_call_file(func: str, args: list) -> dict:
         return {"ok": False, "error": f"File request failed: {str(e)}"}
 
 
-async def dispatch(func: str, args_list: list) -> dict:
+async def dispatch(func: str, args_list: list, timeout: float = None) -> dict:
     """Send one call over the configured transport, with no version gate."""
     if COMM_MODE == "file":
-        return await reaper_call_file(func, args_list)
+        return await reaper_call_file(func, args_list, timeout=timeout)
     elif COMM_MODE == "http":
-        return await reaper_call_http(func, args_list)
+        return await reaper_call_http(func, args_list, timeout=timeout)
     else:  # auto mode
-        result = await reaper_call_http(func, args_list)
+        result = await reaper_call_http(func, args_list, timeout=timeout)
         if result.get("fallback"):
             # HTTP failed, try file-based
-            return await reaper_call_file(func, args_list)
+            return await reaper_call_file(func, args_list, timeout=timeout)
         return result
 
 
@@ -493,7 +514,7 @@ async def ensure_bridge_current() -> Optional[dict]:
     return None
 
 
-async def reaper_call(func: str, *args) -> dict:
+async def reaper_call(func: str, *args, timeout: float = None) -> dict:
     """
     Call a REAPER function via bridge.
 
@@ -502,6 +523,10 @@ async def reaper_call(func: str, *args) -> dict:
     - "http": HTTP only
     - "file": File-based only
     - "auto": HTTP with file fallback (default)
+
+    `timeout` overrides the deadline for this call only (issue #11). Keyword-only, so
+    every existing positional call site keeps passing REAPER arguments and cannot
+    accidentally donate one to the deadline.
     """
     args_list = list(args)
 
@@ -510,7 +535,7 @@ async def reaper_call(func: str, *args) -> dict:
         if stale:
             return stale
 
-    return await dispatch(func, args_list)
+    return await dispatch(func, args_list, timeout=timeout)
 
 
 # --- TRACK OPERATIONS ---
@@ -2925,6 +2950,10 @@ async def render_project(
     """
     # None -> -1 sentinels: JSON nulls become Lua nils, which corrupt the bridge's
     # positional argument handling.
+    # RenderProject blocks the bridge's defer loop for the whole render, and renders run
+    # at roughly realtime, so the 5s transport default reports a timeout for work REAPER
+    # is completing normally (#11). Give this call its own deadline instead of making the
+    # user raise the global one and slow down every dead-bridge diagnosis with it.
     return await reaper_call(
         "RenderProject",
         output_path,
@@ -2932,6 +2961,7 @@ async def render_project(
         -1 if end_time is None else end_time,
         tail_seconds or 0,
         bool(overwrite),
+        timeout=RENDER_TIMEOUT,
     )
 
 

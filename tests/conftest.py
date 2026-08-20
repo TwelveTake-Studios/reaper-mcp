@@ -39,11 +39,21 @@ class Recorder:
 
     def __init__(self, response=None):
         self.calls = []
+        self.timeouts = []
         self.response = response if response is not None else {"ok": True, "ret": 0}
 
-    async def __call__(self, func, *args):
+    # `timeout` is keyword-only here for the same reason it is on reaper_call: a
+    # positional slot would silently swallow a REAPER argument. Recorded rather than
+    # dropped so a test can assert a tool asked for its own deadline (#11).
+    async def __call__(self, func, *args, timeout=None):
         self.calls.append((func, copy.deepcopy(list(args))))
+        self.timeouts.append(timeout)
         return copy.deepcopy(self.response)
+
+    @property
+    def last_timeout(self):
+        assert self.timeouts, "no reaper_call was made"
+        return self.timeouts[-1]
 
     @property
     def last(self):

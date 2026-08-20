@@ -4,7 +4,7 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.6.6"
+local BRIDGE_VERSION = "1.6.7"
 
 local bridge_dir = reaper.GetResourcePath() .. '/Scripts/mcp_bridge_data/'
 
@@ -2154,16 +2154,28 @@ local function scan_mailbox()
     local scan = 0
     local entry = reaper.EnumerateFiles(bridge_dir, scan)
     while entry do
+        -- Keep the slot TEXT, not just its number. Running it through `tonumber` and
+        -- then rebuilding the name loses zero padding, so request_007.json matched here,
+        -- was looked for as request_7.json, and was never found: enumerated every tick
+        -- forever, never answered, never deleted. Nothing removes such an entry (both
+        -- cleanup paths only touch responses) and the poll's cost is linear in entry
+        -- count, so one stranded name is a permanent tax. Confirmed live 2026-08-20.
         local slot = entry:match("^request_(%d+)%.json$")
-        if slot then pending[#pending + 1] = tonumber(slot) end
+        if slot then
+            pending[#pending + 1] = {order = tonumber(slot), label = slot, name = entry}
+        end
         if entry:match("^response_%d+%.json$") or entry:match("^response_%d+_%d+%.json$") then
             responses[#responses + 1] = entry
         end
         scan = scan + 1
         entry = reaper.EnumerateFiles(bridge_dir, scan)
     end
-    -- Ascending slot order keeps multi-request ticks deterministic.
-    table.sort(pending)
+    -- Ascending slot order keeps multi-request ticks deterministic; the label breaks
+    -- ties so request_7 and request_007 cannot swap places between ticks.
+    table.sort(pending, function(a, b)
+        if a.order ~= b.order then return a.order < b.order end
+        return a.label < b.label
+    end)
     return pending, responses
 end
 
@@ -2200,8 +2212,12 @@ end
 local function process_request()
     local pending, responses = scan_mailbox()
     reap_abandoned_responses(responses)
-    for _, i in ipairs(pending) do
-        local numbered_request_file = bridge_dir .. 'request_' .. i .. '.json'
+    for _, req in ipairs(pending) do
+        -- `i` is the slot TEXT exactly as it appeared on disk, so the request is opened
+        -- under the name that was actually enumerated and the response mirrors its
+        -- padding -- the caller finds the answer where it is waiting for it.
+        local i = req.label
+        local numbered_request_file = bridge_dir .. req.name
         local numbered_response_file = bridge_dir .. 'response_' .. i .. '.json'
         
         if file_exists(numbered_request_file) then

@@ -114,7 +114,11 @@ reaper = {{
         return lua.execute(
             f"{setup}\n{scan_block}\n"
             "local pending, responses = scan_mailbox()\n"
-            "return table.concat(pending, \",\"), table.concat(responses, \",\"),"
+            # pending holds {order, label, name} per entry since the slot-name fix.
+            # The LABEL is joined, not the order, so padding survives into assertions.
+            "local labels = {}\n"
+            "for i, r in ipairs(pending) do labels[i] = r.label end\n"
+            "return table.concat(labels, \",\"), table.concat(responses, \",\"),"
             " table.concat(seen_dirs, \"|\")"
         )
     return _run
@@ -125,6 +129,32 @@ def test_finds_request_slots_in_ascending_order(scan):
     ticks stay deterministic."""
     slots, _, _ = scan("request_7.json", "request_2.json", "request_11.json")
     assert slots == "2,7,11"
+
+
+def test_zero_padded_slot_keeps_its_name(scan):
+    """The slot TEXT survives the scan, so the request can be opened under the name that
+    was actually enumerated.
+
+    Running the slot through `tonumber` and rebuilding the path dropped the padding:
+    request_007.json matched here, was looked for as request_7.json, and was never
+    found -- so it was re-enumerated every tick forever, never answered and never
+    deleted. Nothing removes such an entry (both cleanup paths only touch responses)
+    and the poll's cost is linear in directory entries, so one stranded name is a
+    permanent tax. Confirmed against real REAPER 2026-08-20: it survived 40s+, well
+    past the 30s response TTL, while the bridge served other calls normally.
+    """
+    slots, _, _ = scan("request_007.json")
+    assert slots == "007", (
+        "the padded slot was normalised to a number; the bridge will look for "
+        "request_7.json, never find it, and strand the entry forever"
+    )
+
+
+def test_padded_and_bare_slots_order_deterministically(scan):
+    """Same numeric slot, two spellings: the tie must break the same way every tick."""
+    a, _, _ = scan("request_007.json", "request_7.json")
+    b, _, _ = scan("request_7.json", "request_007.json")
+    assert a == b == "007,7"
 
 
 def test_responses_and_junk_are_not_requests(scan):

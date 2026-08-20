@@ -5,6 +5,36 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.7] - 2026-08-20
+
+**The bridge changed — redeploy `reaper_mcp_bridge.lua`** (`twelvetake-reaper-mcp
+--install-bridge`, then re-run the script in REAPER).
+
+### Fixed
+- **A request slot written with a zero-padded name was never answered and never
+  deleted.** The bridge matched `request_007.json`, converted the slot to a number, then
+  rebuilt the path as `request_7.json` — which does not exist. The entry was skipped and
+  re-enumerated on every tick, forever. Nothing removed it either: the bridge's response
+  reaper and the server's startup sweep both only touch `response_*` files. That matters
+  more than one stray file suggests, because the poll enumerates the whole directory each
+  tick and its cost is linear in the number of entries: measured on REAPER 7.79, an empty
+  mailbox costs about 6% of one core and 2000 stray entries costs about 21%, which is the
+  same territory as the 1000-probe loop that the enumeration replaced. The request is now
+  opened under the name that was actually enumerated, and the response mirrors its
+  padding so the caller finds the answer where it is waiting for it.
+- **A render longer than the transport deadline no longer has to report a failure.**
+  1.6.6 made the deadline configurable, but a single global value is the wrong shape for
+  this: raising it high enough for a realtime render also makes a genuinely dead bridge
+  take that long to diagnose on every other call. `render_project` now carries its own
+  deadline (`REAPER_RENDER_TIMEOUT`, default 600s) while everything else keeps the fast
+  `REAPER_FILE_TIMEOUT` default of 5s.
+  *(Reported by @SNChicago in [issue #11](https://github.com/TwelveTake-Studios/reaper-mcp/issues/11).)*
+
+### Changed
+- `reaper_call` accepts a keyword-only `timeout` that overrides the deadline for a single
+  call, threaded through both the file and HTTP transports so the deadline no longer
+  depends on which one is in use.
+
 ## [1.6.6] - 2026-08-13
 
 **The bridge changed — redeploy `reaper_mcp_bridge.lua`** (`twelvetake-reaper-mcp

@@ -173,10 +173,14 @@ def test_timeout_still_explains_a_genuinely_dead_bridge(timing_out_mailbox):
 # --- the version handshake --------------------------------------------------
 
 def _fake_dispatch(response):
-    async def _dispatch(func, args):
+    # `timeout` is accepted (and recorded) because reaper_call forwards a per-call
+    # deadline through dispatch since #11; a signature without it fails every caller.
+    async def _dispatch(func, args, timeout=None):
         _dispatch.calls.append((func, args))
+        _dispatch.timeouts.append(timeout)
         return response
     _dispatch.calls = []
+    _dispatch.timeouts = []
     return _dispatch
 
 
