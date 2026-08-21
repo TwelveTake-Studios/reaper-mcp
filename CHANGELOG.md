@@ -5,6 +5,29 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.6.8] - 2026-08-21
+
+**No bridge change.** The bridge stays at 1.6.7; if you redeployed for 1.6.7 you are done.
+
+### Fixed
+- **`--version`, the `--help` header and the startup banner under-reported by two
+  releases.** `__version__` was a literal that stopped tracking `pyproject.toml` after
+  1.6.5, so 1.6.6 and 1.6.7 both shipped a server that announced itself as 1.6.5. The
+  banner exists to turn "it just times out" into a one-look diagnosis, and the stale-bridge
+  check beside it assumes the server and bridge versions are comparable facts. Someone who
+  redeployed the 1.6.7 bridge, restarted, and read `1.6.5` in the log had every reason to
+  conclude the upgrade had not taken.
+  *(Reported by @SNChicago in [issue #15](https://github.com/TwelveTake-Studios/reaper-mcp/issues/15).)*
+
+### Changed
+- **A release whose version facts disagree now fails the test suite.** Six of them are
+  hand-edited across four files: `__version__` against `pyproject.toml`, the newest
+  CHANGELOG entry against `pyproject.toml`, `BRIDGE_VERSION` never ahead of the package it
+  ships inside, `MIN_BRIDGE_VERSION` and `SLOT_CLAIM_BRIDGE_VERSION` never above the
+  bundled bridge, and a redeploy notice whenever the bridge was bumped for that release.
+  A `MIN_BRIDGE_VERSION` above the bundled bridge would make every tool refuse and cache
+  the refusal, so that one is a bigger hazard than the version string this started with.
+
 ## [1.6.7] - 2026-08-20
 
 **The bridge changed — redeploy `reaper_mcp_bridge.lua`** (`twelvetake-reaper-mcp
