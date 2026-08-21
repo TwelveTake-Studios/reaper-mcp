@@ -4,6 +4,7 @@ These verify the two things every glue tool must get right: the REAPER function 
 argument marshalling it sends, and that it returns the bridge response unchanged.
 """
 
+import re
 import asyncio
 
 import pytest
@@ -302,9 +303,20 @@ def test_render_project_none_becomes_sentinels(reaper):
 
 
 def test_render_region_documented_error(reaper):
+    """Fails usefully without reaching the bridge, and names no version.
+
+    It used to promise the render suite "for v1.9". The roadmap said v1.9 in two places,
+    the renumbering moved the render suite to a different minor, and this test pinned the
+    promise rather than the behaviour, so the stale version shipped to users on every
+    call with a green suite. A roadmap slot is not a contract; the workaround is.
+    """
     result = run(srv.render_region(0, "C:/tmp/r.wav"))
     assert result["ok"] is False
-    assert "v1.9" in result["error"]
+    assert "not implemented" in result["error"].lower()
+    assert "get_regions" in result["error"] and "render_project" in result["error"]
+    assert not re.search(r"v?\d+\.\d+", result["error"]), (
+        f"names a version that will drift: {result['error']}"
+    )
     assert reaper.calls == []  # never reaches the bridge
 
 

@@ -12,7 +12,7 @@ License: MIT
 Version: 1.6.5
 """
 
-__version__ = "1.6.8"
+__version__ = "1.7.0"
 
 import os
 import asyncio
@@ -24,6 +24,7 @@ import re
 import shutil
 import sys
 import time
+import uuid
 from pathlib import Path
 from typing import List, Optional, Union
 from mcp.server.fastmcp import FastMCP
@@ -157,7 +158,34 @@ COMM_MODE = os.getenv("REAPER_COMM_MODE", "file").lower()
 # Create MCP server
 mcp = FastMCP(
     "twelvetake-reaper-mcp",
+    # Conventions stated ONCE here instead of repeated in 176 docstrings. Every client pays
+    # for the tool list on every turn of every session, and "Track index (0-based)." alone
+    # was written out 56 times. Paying ~700 bytes here is what makes deleting those safe:
+    # if a convention is cut from the docstrings it MUST be stated below, or the model is
+    # guessing at arguments for something editing the user's project.
     instructions="""TwelveTake REAPER MCP Server - Controls REAPER DAW for mixing, mastering, and music production.
+
+CONVENTIONS (apply to every tool unless its own description says otherwise):
+- All *_index arguments are 0-based.
+- track_index accepts -1 for the master track.
+- item_index, take_index and fx_index are positions WITHIN their parent (item_index is the
+  item's position on that track, not a project-wide item number).
+- Every tool returns an object with an `ok` status; when `ok` is false an `error` explains
+  why. Some tools report a REAPER return value as `ret`.
+- MIDI tools that accept a note filter share it: pitch_low/pitch_high (0-127 inclusive),
+  start_beat/end_beat, and channel (0-15, or -1 for every channel). start_beat/end_beat
+  bound a note's ONSET, so a note that begins earlier and sustains into the range is NOT
+  matched. Omitted filters match everything, and a filter matching no notes is a success
+  with nothing changed.
+- REAPER refuses notes placed before the item start, so timing tools clamp to it rather
+  than failing, and report the count in `clamped`.
+- MIDI note lists are large: a 256-note item is roughly 44,000 bytes, because each note
+  carries index, pitch, velocity, channel, selected, muted and its timing in BOTH seconds
+  (start_time/end_time) and beats (start_beat/end_beat). Two opt-outs, both defaulting to
+  the full list: pass fields=["pitch","start_beat"] to keep only the keys you need (asking
+  for beats and dropping selected/muted roughly halves it), or return_notes=False on a
+  write you are not reading back. An unrecognised field name is reported in
+  `fields_ignored` and changes nothing.
 
 IMPORTANT: This server uses FILE-BASED communication by default. The REAPER bridge script must be running in REAPER for tools to work. If a tool returns a timeout error, ensure:
 1. REAPER is running
@@ -166,8 +194,18 @@ IMPORTANT: This server uses FILE-BASED communication by default. The REAPER brid
 Use get_project_summary() first to get complete project context in one call."""
 )
 
-# Request counter for file-based fallback
-request_counter = 0
+# Where this process starts in the 999-slot ring.
+#
+# It used to be 0 in every process, so the first call of EVERY server picked
+# request_1.json. One stdio server is spawned per MCP client, and @SNChicago counted ten
+# live server processes against one mailbox minutes after a single client restart (#16).
+# Ten processes whose first unslotted write all target slot 1 is not an unlucky
+# collision, it is a scheduled one.
+#
+# Exclusive-create claiming already makes co-selection impossible, but the fallback path
+# below does not claim, so the seed is what keeps those processes apart there. PID rather
+# than random so a mailbox is reproducible while debugging.
+request_counter = os.getpid() % 999
 
 # HTTP client (reused for connection pooling)
 _http_client = None
@@ -256,7 +294,7 @@ def sweep_orphaned_responses(bridge_dir: Path, older_than: Optional[float] = Non
             continue
         try:
             # abs(): a response stamped in the FUTURE (written while the clock was
-            # fast, then stepped back — dual-boot RTC mismatch, VM restore, NTP) can
+            # fast, then stepped back - dual-boot RTC mismatch, VM restore, NTP) can
             # no more have a live reader than an old one, and without this it would
             # dodge the sweep at every restart until wall time caught up.
             if abs(now - entry.stat().st_mtime) > older_than:
@@ -284,7 +322,19 @@ async def reaper_call_file(func: str, args: list, timeout: float = None) -> dict
     # Ensure bridge directory exists
     BRIDGE_DIR.mkdir(parents=True, exist_ok=True)
 
-    payload = json.dumps({"func": func, "args": args}).encode("utf-8")
+    # Every request carries an id and the bridge echoes it back. Claiming makes the slot
+    # provably ours, but the fallback path below does not claim, and a response read out
+    # of a slot we do not own is a well-formed WRONG ANSWER rather than a timeout -- the
+    # failure mode claiming was introduced to kill (#16). The id is what makes that loud.
+    # It also closes the abandonment case: a slot reclaimed after a timeout could still
+    # read the previous call's answer, because the stale response is newer than the new
+    # request and nothing distinguished them.
+    #
+    # uuid rather than pid+counter: a pid is reused after a process dies and a restarted
+    # process starts its counter over, so pid+counter repeats across restarts, which is
+    # exactly when abandoned responses are lying around.
+    request_id = uuid.uuid4().hex[:16]
+    payload = json.dumps({"func": func, "args": args, "id": request_id}).encode("utf-8")
 
     # Claim a slot by EXCLUSIVE CREATE rather than trusting the counter.
     #
@@ -294,7 +344,7 @@ async def reaper_call_file(func: str, args: list, timeout: float = None) -> dict
     # so two live servers both allocated request_1.json on their first call and
     # collided from then on. Observed failure modes: a request silently
     # overwritten (caller times out), a response deleted by the other process
-    # mid-wait, and worst — CROSS-TALK, where one client reads the answer to
+    # mid-wait, and worst - CROSS-TALK, where one client reads the answer to
     # the other client's question and returns it as a success. A well-formed
     # wrong answer is far more dangerous than a timeout for a measurement
     # pipeline.
@@ -382,7 +432,19 @@ async def reaper_call_file(func: str, args: list, timeout: float = None) -> dict
                     response_text = response_file.read_text()
                     if response_text.strip():
                         response_data = json.loads(response_text)
-                        # Clean up
+                        answered = response_data.get("id")
+                        if answered is not None and answered != request_id:
+                            # Someone else's answer is sitting in this slot. Do not
+                            # return it: a well-formed wrong answer is far worse than a
+                            # timeout for anything editing a project. Do not delete it
+                            # either -- the process that asked for it is still waiting.
+                            # Time out instead and let the caller retry into a fresh slot.
+                            await asyncio.sleep(FILE_POLL_INTERVAL)
+                            continue
+                        # No id at all means a bridge older than the echo, or the
+                        # malformed-JSON path which never decoded an id to echo. Both are
+                        # safe to take: the first is exactly today's behaviour, and the
+                        # second hands back an error rather than a plausible answer.
                         try:
                             request_file.unlink(missing_ok=True)
                             response_file.unlink(missing_ok=True)
@@ -551,9 +613,6 @@ async def get_track(track_index: int) -> dict:
     """
     Get information about a track.
 
-    Args:
-        track_index: Track index (0-based). Use -1 for the master track.
-
     Returns:
         Object with 'info': guid, name, volume, volume_db, pan, muted, soloed,
         has_midi, has_audio, fx_names, role.
@@ -621,7 +680,6 @@ async def set_track_name(track_index: int, name: str) -> dict:
     Set the name of a track.
 
     Args:
-        track_index: Track index (0-based) or -1 for master track.
         name: New name for the track.
     """
     return await reaper_call("GetSetMediaTrackInfo_String", track_index, "P_NAME", name, True)
@@ -633,7 +691,6 @@ async def set_track_volume(track_index: int, volume_db: float) -> dict:
     Set the volume of a track in decibels.
 
     Args:
-        track_index: Track index (0-based) or -1 for master track.
         volume_db: Volume in dB (0 = unity gain, -inf to +12 typical range).
     """
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "D_VOL", db_to_linear(volume_db))
@@ -645,7 +702,6 @@ async def set_track_pan(track_index: int, pan: float) -> dict:
     Set the pan position of a track.
 
     Args:
-        track_index: Track index (0-based) or -1 for master track.
         pan: Pan position from -1.0 (full left) to 1.0 (full right). 0 = center.
     """
     pan = max(-1.0, min(1.0, pan))
@@ -658,7 +714,6 @@ async def set_track_mute(track_index: int, mute: bool) -> dict:
     Set the mute state of a track.
 
     Args:
-        track_index: Track index (0-based) or -1 for master track.
         mute: True to mute, False to unmute.
     """
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "B_MUTE", 1 if mute else 0)
@@ -670,7 +725,6 @@ async def set_track_solo(track_index: int, solo: bool) -> dict:
     Set the solo state of a track.
 
     Args:
-        track_index: Track index (0-based) or -1 for master track.
         solo: True to solo, False to unsolo.
     """
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "I_SOLO", 1 if solo else 0)
@@ -683,9 +737,6 @@ async def track_fx_get_count(track_index: int) -> dict:
     """
     Get the number of FX plugins on a track.
 
-    Args:
-        track_index: Track index (0-based) or -1 for master track.
-
     Returns:
         Object with 'ret' field containing count.
     """
@@ -696,9 +747,6 @@ async def track_fx_get_count(track_index: int) -> dict:
 async def track_fx_get_list(track_index: int) -> dict:
     """
     Get list of all FX plugins on a track.
-
-    Args:
-        track_index: Track index (0-based) or -1 for master track.
 
     Returns:
         Object with 'fx' array, one entry per FX with index, name, enabled and offline,
@@ -714,7 +762,6 @@ async def track_fx_add_by_name(track_index: int, fx_name: str, position: int = -
     Add an FX plugin to a track by name.
 
     Args:
-        track_index: Track index (0-based) or -1 for master track.
         fx_name: Name of the FX plugin to add (e.g., "ReaEQ", "ReaComp", "ReaLimit").
                  Use the exact plugin name as it appears in REAPER's FX browser.
         position: Optional insertion position (0-based) in the FX chain.
@@ -736,7 +783,6 @@ async def track_fx_move(track_index: int, fx_index: int, new_position: int) -> d
     Move an FX plugin to a new position within the same track's FX chain.
 
     Args:
-        track_index: Track index (0-based) or -1 for master track.
         fx_index: Current FX index (0-based) in the FX chain.
         new_position: Target position (0-based). 0 = beginning of the chain.
     """
@@ -753,9 +799,6 @@ async def track_fx_delete(track_index: int, fx_index: int) -> dict:
     """
     Remove an FX plugin from a track.
 
-    Args:
-        track_index: Track index (0-based) or -1 for master track.
-        fx_index: FX index (0-based) in the FX chain.
     """
     return await reaper_call("TrackFX_Delete", track_index, fx_index)
 
@@ -765,9 +808,6 @@ async def track_fx_get_name(track_index: int, fx_index: int) -> dict:
     """
     Get the name of an FX plugin.
 
-    Args:
-        track_index: Track index (0-based) or -1 for master track.
-        fx_index: FX index (0-based) in the FX chain.
     """
     return await reaper_call("TrackFX_GetFXName", track_index, fx_index, "")
 
@@ -776,10 +816,6 @@ async def track_fx_get_name(track_index: int, fx_index: int) -> dict:
 async def track_fx_get_enabled(track_index: int, fx_index: int) -> dict:
     """
     Get the enabled state of an FX plugin.
-
-    Args:
-        track_index: Track index (0-based) or -1 for master track.
-        fx_index: FX index (0-based) in the FX chain.
 
     Returns:
         Object with 'ret' field (boolean).
@@ -793,8 +829,6 @@ async def track_fx_set_enabled(track_index: int, fx_index: int, enabled: bool) -
     Enable or disable an FX plugin.
 
     Args:
-        track_index: Track index (0-based) or -1 for master track.
-        fx_index: FX index (0-based) in the FX chain.
         enabled: True to enable, False to bypass.
     """
     return await reaper_call("TrackFX_SetEnabled", track_index, fx_index, enabled)
@@ -805,9 +839,6 @@ async def track_fx_get_num_params(track_index: int, fx_index: int) -> dict:
     """
     Get the number of parameters for an FX plugin.
 
-    Args:
-        track_index: Track index (0-based) or -1 for master track.
-        fx_index: FX index (0-based) in the FX chain.
     """
     return await reaper_call("TrackFX_GetNumParams", track_index, fx_index)
 
@@ -817,10 +848,6 @@ async def track_fx_get_param_name(track_index: int, fx_index: int, param_index: 
     """
     Get the name of an FX parameter.
 
-    Args:
-        track_index: Track index (0-based) or -1 for master track.
-        fx_index: FX index (0-based) in the FX chain.
-        param_index: Parameter index (0-based).
     """
     return await reaper_call("TrackFX_GetParamName", track_index, fx_index, param_index, "")
 
@@ -829,11 +856,6 @@ async def track_fx_get_param_name(track_index: int, fx_index: int, param_index: 
 async def track_fx_get_param(track_index: int, fx_index: int, param_index: int) -> dict:
     """
     Get a specific parameter value of an FX plugin.
-
-    Args:
-        track_index: Track index (0-based) or -1 for master track.
-        fx_index: FX index (0-based) in the FX chain.
-        param_index: Parameter index (0-based).
 
     Returns:
         Object with value, min, max for the parameter.
@@ -847,9 +869,6 @@ async def track_fx_set_param(track_index: int, fx_index: int, param_index: int, 
     Set a parameter value on an FX plugin.
 
     Args:
-        track_index: Track index (0-based) or -1 for master track.
-        fx_index: FX index (0-based) in the FX chain.
-        param_index: Parameter index (0-based).
         value: New value for the parameter (typically normalized 0-1, check min/max).
     """
     return await reaper_call("TrackFX_SetParam", track_index, fx_index, param_index, value)
@@ -865,11 +884,6 @@ async def take_fx_get_count(track_index: int, item_index: int, take_index: int) 
     """
     Get the number of FX plugins on a take.
 
-    Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
-        take_index: Take index within the item (0-based).
-
     Returns:
         Object with 'ret' field containing the FX count.
     """
@@ -883,11 +897,6 @@ async def take_fx_get_count(track_index: int, item_index: int, take_index: int) 
 async def take_fx_get_list(track_index: int, item_index: int, take_index: int) -> dict:
     """
     Get a list of all FX plugins on a take.
-
-    Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
-        take_index: Take index within the item (0-based).
 
     Returns:
         Object with 'fx' array, each entry having index, name, and enabled state.
@@ -906,9 +915,6 @@ async def take_fx_add_by_name(
     Add an FX plugin to a take by name.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
-        take_index: Take index within the item (0-based).
         fx_name: Name of the FX plugin to add (e.g., "ReaEQ", "ReaComp"). Use the exact
                  plugin name as it appears in REAPER's FX browser.
 
@@ -929,9 +935,6 @@ async def take_fx_delete(
     Remove an FX plugin from a take.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
-        take_index: Take index within the item (0-based).
         fx_index: FX index (0-based) in the take's FX chain.
     """
     err = _validate_indices(
@@ -950,9 +953,6 @@ async def take_fx_get_name(
     Get the name of an FX plugin on a take.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
-        take_index: Take index within the item (0-based).
         fx_index: FX index (0-based) in the take's FX chain.
     """
     err = _validate_indices(
@@ -971,9 +971,6 @@ async def take_fx_get_enabled(
     Get the enabled (not bypassed) state of an FX plugin on a take.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
-        take_index: Take index within the item (0-based).
         fx_index: FX index (0-based) in the take's FX chain.
 
     Returns:
@@ -995,9 +992,6 @@ async def take_fx_set_enabled(
     Enable or bypass an FX plugin on a take.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
-        take_index: Take index within the item (0-based).
         fx_index: FX index (0-based) in the take's FX chain.
         enabled: True to enable, False to bypass.
     """
@@ -1019,9 +1013,6 @@ async def take_fx_get_num_params(
     Get the number of parameters for an FX plugin on a take.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
-        take_index: Take index within the item (0-based).
         fx_index: FX index (0-based) in the take's FX chain.
     """
     err = _validate_indices(
@@ -1040,11 +1031,7 @@ async def take_fx_get_param_name(
     Get the name of a parameter on a take's FX plugin.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
-        take_index: Take index within the item (0-based).
         fx_index: FX index (0-based) in the take's FX chain.
-        param_index: Parameter index (0-based).
     """
     err = _validate_indices(
         track_index=track_index, item_index=item_index, take_index=take_index,
@@ -1065,11 +1052,7 @@ async def take_fx_get_param(
     Get a parameter value on a take's FX plugin.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
-        take_index: Take index within the item (0-based).
         fx_index: FX index (0-based) in the take's FX chain.
-        param_index: Parameter index (0-based).
 
     Returns:
         Object with 'value', 'min', and 'max' for the parameter.
@@ -1094,11 +1077,7 @@ async def take_fx_set_param(
     Set a parameter value on a take's FX plugin.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
-        take_index: Take index within the item (0-based).
         fx_index: FX index (0-based) in the take's FX chain.
-        param_index: Parameter index (0-based).
         value: New value (typically normalized 0-1; check min/max via take_fx_get_param).
     """
     err = _validate_indices(
@@ -1121,10 +1100,6 @@ async def get_takes(track_index: int, item_index: int) -> dict:
     """
     List all takes of a media item.
 
-    Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
-
     Returns:
         Object with 'takes' array (each entry: index, name, is_active) and 'ret' = take count.
     """
@@ -1138,10 +1113,6 @@ async def get_takes(track_index: int, item_index: int) -> dict:
 async def get_active_take(track_index: int, item_index: int) -> dict:
     """
     Get the index of the active take of a media item.
-
-    Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
 
     Returns:
         Object with 'ret' = active take index (-1 if the item has no active take).
@@ -1158,8 +1129,6 @@ async def set_active_take(track_index: int, item_index: int, take_index: int) ->
     Set the active take of a media item (which take plays).
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
         take_index: Take index to activate (0-based).
     """
     err = _validate_indices(track_index=track_index, item_index=item_index, take_index=take_index)
@@ -1173,9 +1142,6 @@ async def explode_takes(track_index: int, item_index: int) -> dict:
     """
     Explode all takes of a media item in place (each take becomes its own overlapping item).
 
-    Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
     """
     err = _validate_indices(track_index=track_index, item_index=item_index)
     if err:
@@ -1188,9 +1154,6 @@ async def crop_to_active_take(track_index: int, item_index: int) -> dict:
     """
     Crop a media item to its active take, discarding all other takes.
 
-    Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
     """
     err = _validate_indices(track_index=track_index, item_index=item_index)
     if err:
@@ -1204,8 +1167,6 @@ async def delete_take(track_index: int, item_index: int, take_index: int) -> dic
     Delete a specific take from a media item.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Media item index on that track (0-based).
         take_index: Take index to delete (0-based). The take is activated first, then removed.
     """
     err = _validate_indices(track_index=track_index, item_index=item_index, take_index=take_index)
@@ -1223,7 +1184,6 @@ async def select_comp_lane(track_index: int, lane_index: int) -> dict:
     error if it is not, or if the lane index is out of range.
 
     Args:
-        track_index: Track index (0-based).
         lane_index: Fixed lane index to play exclusively (0-based).
     """
     err = _validate_indices(track_index=track_index, lane_index=lane_index)
@@ -1269,7 +1229,6 @@ async def set_send_volume(track_index: int, send_index: int, volume_db: float) -
 
     Args:
         track_index: Source track index (0-based).
-        send_index: Send index (0-based).
         volume_db: Send volume in dB.
     """
     return await reaper_call("SetTrackSendUIVol", track_index, send_index, db_to_linear(volume_db), 0)
@@ -1280,8 +1239,6 @@ async def get_track_num_sends(track_index: int) -> dict:
     """
     Get the number of sends from a track.
 
-    Args:
-        track_index: Track index (0-based).
     """
     # GetTrackNumSends(track, category) - category 0 = sends
     return await reaper_call("GetTrackNumSends", track_index, 0)
@@ -1294,12 +1251,9 @@ async def set_send_dest_channels(track_index: int, send_index: int, dest_chan: i
 
     Args:
         track_index: Source track index (0-based).
-        send_index: Send index (0-based).
         dest_chan: Destination channel pair (0=1-2 main, 2=3-4 sidechain, 4=5-6, etc.).
                    For sidechain compression, use 2 to route to channels 3-4.
 
-    Returns:
-        Object with success status.
     """
     # SetTrackSendInfo_Value(track, category, send_idx, param_name, value)
     # category 0 = sends, I_DSTCHAN sets destination channels
@@ -1313,11 +1267,8 @@ async def set_send_source_channels(track_index: int, send_index: int, src_chan: 
 
     Args:
         track_index: Source track index (0-based).
-        send_index: Send index (0-based).
         src_chan: Source channel (-1=none, 0=stereo 1-2, 1024+n=mono from channel n).
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetTrackSendInfo_Value", track_index, 0, send_index, "I_SRCCHAN", src_chan)
 
@@ -1666,9 +1617,6 @@ async def add_eq(track_index: int) -> dict:
     """
     Add ReaEQ to a track.
 
-    Args:
-        track_index: Track index (0-based) or -1 for master track.
-
     Returns:
         Object with fx_index.
     """
@@ -1680,9 +1628,6 @@ async def add_compressor(track_index: int) -> dict:
     """
     Add ReaComp to a track.
 
-    Args:
-        track_index: Track index (0-based) or -1 for master track.
-
     Returns:
         Object with fx_index.
     """
@@ -1693,9 +1638,6 @@ async def add_compressor(track_index: int) -> dict:
 async def add_limiter(track_index: int) -> dict:
     """
     Add ReaLimit (brickwall limiter) to a track.
-
-    Args:
-        track_index: Track index (0-based) or -1 for master track.
 
     Returns:
         Object with fx_index.
@@ -1711,7 +1653,6 @@ async def create_midi_item(track_index: int, position: float, length: float) -> 
     Create an empty MIDI item on a track.
 
     Args:
-        track_index: Track index (0-based).
         position: Start position in seconds.
         length: Length in seconds.
 
@@ -1727,10 +1668,6 @@ async def create_midi_item(track_index: int, position: float, length: float) -> 
 async def get_midi_item(track_index: int, item_index: int) -> dict:
     """
     Get information about a MIDI item.
-
-    Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based) on the track.
 
     Returns:
         Object with item info including position, length, note count.
@@ -1759,8 +1696,6 @@ async def add_midi_note(
     Add a MIDI note to an item using musical timing (beats).
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based) on the track.
         pitch: MIDI note number (0-127, 60 = middle C).
         velocity: Note velocity (1-127).
         start_beat: Start position in beats from the item start (0 = first beat).
@@ -1790,8 +1725,6 @@ async def add_midi_notes_batch(
     Add multiple MIDI notes to an item in one call, using musical timing (beats).
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based).
         notes: List of note dicts with keys: pitch, velocity, start_beat, length_beats,
                channel (optional).
 
@@ -1820,18 +1753,15 @@ async def add_midi_notes_batch(
 
 
 @mcp.tool()
-async def get_midi_notes(track_index: int, item_index: int) -> dict:
+async def get_midi_notes(track_index: int, item_index: int, fields: Optional[List[str]] = None) -> dict:
     """
     Get all MIDI notes from an item.
-
-    Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based).
 
     Returns:
         Object with list of notes.
     """
-    return await reaper_call("GetMIDINotes", track_index, item_index)
+    return _shape_notes(await reaper_call("GetMIDINotes", track_index, item_index),
+                        fields=fields)
 
 
 @mcp.tool()
@@ -1839,13 +1769,6 @@ async def delete_midi_note(track_index: int, item_index: int, note_index: int) -
     """
     Delete a MIDI note from an item.
 
-    Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based).
-        note_index: Note index (0-based).
-
-    Returns:
-        Object with success status.
     """
     return await reaper_call("MIDI_DeleteNote", track_index, item_index, note_index)
 
@@ -1854,10 +1777,6 @@ async def delete_midi_note(track_index: int, item_index: int, note_index: int) -
 async def clear_midi_item(track_index: int, item_index: int) -> dict:
     """
     Delete all MIDI notes from an item.
-
-    Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based).
 
     Returns:
         Object with count of notes deleted.
@@ -1876,13 +1795,8 @@ async def set_midi_note_velocity(
     Set the velocity of a MIDI note.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based).
-        note_index: Note index (0-based).
         velocity: New velocity (1-127).
 
-    Returns:
-        Object with success status.
     """
     # Dedicated bridge handler resolves the take and sets only the velocity. The old
     # raw MIDI_SetNote path passed indices where a take pointer is required and collapsed
@@ -1891,6 +1805,49 @@ async def set_midi_note_velocity(
 
 
 # --- v1.6.0 MIDI UTILITIES (note transforms) ---
+
+# Return Shape H: every key a note carries. Pinned in tests/live/conftest.py because live
+# tests once asserted an effect without ever checking the shape the contract promised.
+NOTE_FIELDS = ("index", "pitch", "velocity", "channel", "selected", "muted",
+               "start_time", "end_time", "start_beat", "end_beat")
+
+
+def _shape_notes(res, return_notes: bool = True, fields=None):
+    """Trim the echoed note list to what the caller actually asked for.
+
+    Full Shape H is 172 bytes a note, so a 256-note item (eight bars of sixteenths, an
+    ordinary part) answers in about 43,000 bytes, roughly 11,700 tokens, for ONE call.
+    Measured against REAPER 2026-08-21.
+
+    Both knobs are opt-in and default to the existing response, so no caller changes:
+      return_notes=False   drop the list entirely
+      fields=[...]         keep only these keys. start_time/end_time duplicate
+                           start_beat/end_beat in the other unit, and selected/muted are
+                           almost always false, so dropping those five halves the payload.
+
+    An unknown field name is REPORTED in `fields_ignored`, never fatal. These wrap write
+    tools: the edit has already happened by the time this runs, and turning a successful
+    edit into a reported failure over a typo in an output filter would be a lie about
+    what REAPER did.
+    """
+    if not isinstance(res, dict) or "notes" not in res:
+        return res
+    if not return_notes:
+        res.pop("notes", None)
+        return res
+    if fields:
+        keep = [f for f in fields if f in NOTE_FIELDS]
+        unknown = [f for f in fields if f not in NOTE_FIELDS]
+        if unknown:
+            res["fields_ignored"] = unknown
+        if keep:
+            wanted = set(keep)
+            res["notes"] = [{k: v for k, v in n.items() if k in wanted}
+                            for n in res["notes"] or []]
+    return res
+
+
+
 
 def _midi_note_filter(
     pitch_low: Optional[int] = 0,
@@ -1902,7 +1859,7 @@ def _midi_note_filter(
     """Build the shared v1.6.0 note-filter object, omit-when-unbounded.
 
     Only constraining values are included; a missing key means "unbounded/all" on the
-    bridge side. This avoids positional nulls and sentinel magic numbers — a real
+    bridge side. This avoids positional nulls and sentinel magic numbers - a real
     negative ``start_beat`` stays expressible, and all-defaults sends ``{}``.
     """
     filt: dict = {}
@@ -1929,28 +1886,23 @@ async def transpose_midi_notes(
     start_beat: Optional[float] = None,
     end_beat: Optional[float] = None,
     channel: int = -1,
+    return_notes: bool = True,
+    fields: Optional[List[str]] = None
 ) -> dict:
-    """
-    Transpose MIDI notes by a number of semitones (octave = 12).
+    """    Transpose MIDI notes by a number of semitones (12 = an octave).
 
-    Operates on the active take of (track_index, item_index). By default every note is
-    shifted; narrow the target with the optional value filter (pitch range, an onset
-    window in beats-from-item-start, channel). A note pushed outside 0-127 is left at its
-    original pitch and counted in `skipped` — never clamped, never dropped.
+    A note that would land outside pitch 0-127 keeps its original pitch and is counted in
+    `skipped` instead.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based) on the track.
-        semitones: Signed semitone shift (12 = up an octave, -12 = down). 0 = no-op.
-        pitch_low: Only transpose notes with original pitch >= this (0-127, inclusive).
-        pitch_high: Only transpose notes with original pitch <= this (0-127, inclusive).
-        start_beat: Only notes whose onset is at/after this beat from item start.
-        end_beat: Only notes whose onset is at/before this beat from item start.
-        channel: Only this MIDI channel (0-15); -1 = all channels.
+        semitones: Signed shift; positive is up, negative is down. 0 = no-op.
+        pitch_low / pitch_high: inclusive pitch bounds for the filter, 0-127.
+        start_beat / end_beat: onset window in beats from the item start.
+        channel: MIDI channel 0-15; -1 = all channels.
 
     Returns:
-        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]} — the full note
-        list after the transform (note indices re-sync after the internal sort).
+        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}, where `notes` is
+        the full note list after the transform, re-indexed.
     """
     if track_index < 0 or item_index < 0:
         return {"ok": False, "error": "track_index and item_index must be >= 0"}
@@ -1959,7 +1911,7 @@ async def transpose_midi_notes(
     if not (0 <= pitch_low <= 127) or not (0 <= pitch_high <= 127):
         return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
     filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
-    return await reaper_call("TransposeMIDINotes", track_index, item_index, int(round(semitones)), filt)
+    return _shape_notes(await reaper_call("TransposeMIDINotes", track_index, item_index, int(round(semitones)), filt), return_notes, fields)
 
 
 @mcp.tool()
@@ -1972,24 +1924,20 @@ async def nudge_midi_notes(
     start_beat: Optional[float] = None,
     end_beat: Optional[float] = None,
     channel: int = -1,
+    return_notes: bool = True,
+    fields: Optional[List[str]] = None
 ) -> dict:
-    """
-    Shift MIDI notes in time by a number of beats (+ = later, - = earlier).
+    """    Shift MIDI notes in time by a number of beats (+ = later, - = earlier).
 
-    Each matched note's start and end move by the same amount, so note lengths are
-    preserved. Notes pushed before the item start or past the item end are kept (never
-    clamped) and reported in `out_of_bounds`. Narrow the target with the optional value
-    filter (pitch range, an onset window in beats-from-item-start, channel).
+    Start and end move together, so note lengths are preserved. A note pushed before the
+    item start clamps to it and one pushed past the item end is left there; both count in
+    `out_of_bounds`, not `clamped`.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based) on the track.
         amount_beats: Signed beat shift (0.25 = a 16th later, -1.0 = a beat earlier). 0 = no-op.
-        pitch_low: Only nudge notes with pitch >= this (0-127, inclusive).
-        pitch_high: Only nudge notes with pitch <= this (0-127, inclusive).
-        start_beat: Only notes whose onset is at/after this beat from item start.
-        end_beat: Only notes whose onset is at/before this beat from item start.
-        channel: Only this MIDI channel (0-15); -1 = all channels.
+        pitch_low / pitch_high: inclusive pitch bounds for the filter, 0-127.
+        start_beat / end_beat: onset window in beats from the item start.
+        channel: MIDI channel 0-15; -1 = all channels.
 
     Returns:
         {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
@@ -2001,11 +1949,11 @@ async def nudge_midi_notes(
     if not (0 <= pitch_low <= 127) or not (0 <= pitch_high <= 127):
         return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
     filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
-    return await reaper_call("NudgeMIDINotes", track_index, item_index, float(amount_beats), filt)
+    return _shape_notes(await reaper_call("NudgeMIDINotes", track_index, item_index, float(amount_beats), filt), return_notes, fields)
 
 
 @mcp.tool()
-async def get_selected_midi_notes(track_index: int, item_index: int) -> dict:
+async def get_selected_midi_notes(track_index: int, item_index: int, fields: Optional[List[str]] = None) -> dict:
     """
     Read the MIDI notes currently SELECTED in REAPER's editor for the active take.
 
@@ -2013,18 +1961,15 @@ async def get_selected_midi_notes(track_index: int, item_index: int) -> dict:
     call this to see which they are, then translate that into an explicit value filter
     (pitch range / beat window / channel) for the transform tools. Read-only, no undo.
 
-    Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based) on the track.
-
     Returns:
-        {ok, notes:[...], ret} — the selected notes, same shape as get_midi_notes (each note
+        {ok, notes:[...], ret} - the selected notes, same shape as get_midi_notes (each note
         carries item-relative start_beat/end_beat). `index` is REAPER's absolute PPQ-sorted
         note index, so a partial selection is non-contiguous. Empty selection -> notes:[].
     """
     if track_index < 0 or item_index < 0:
         return {"ok": False, "error": "track_index and item_index must be >= 0"}
-    return await reaper_call("GetSelectedMIDINotes", track_index, item_index)
+    return _shape_notes(await reaper_call("GetSelectedMIDINotes", track_index, item_index),
+                        fields=fields)
 
 
 @mcp.tool()
@@ -2036,31 +1981,25 @@ async def set_midi_note(
     start_beat: Optional[float] = None,
     length_beats: Optional[float] = None,
     channel: Optional[int] = None,
+    return_notes: bool = True,
+    fields: Optional[List[str]] = None
 ) -> dict:
-    """
-    Edit one existing MIDI note in place, addressed by its index.
+    """    Edit one existing MIDI note in place: pitch, start, length and/or channel. Only the
+    fields you pass change, and at least one is required. (Velocity: set_midi_note_velocity.)
 
-    The per-note editor: change a single note's pitch, start (beats from item start),
-    length, and/or channel. Only the fields you pass change; the rest are left as-is. At
-    least one field is required. (Velocity is set with set_midi_note_velocity, not here.)
-
-    `note_index` is REAPER's PPQ-sorted note index from get_midi_notes / get_selected_midi_notes
-    and is UNSTABLE — re-read after the edit, since the returned list reflects the new order.
+    note_index is REAPER's PPQ-sorted index from get_midi_notes / get_selected_midi_notes and
+    is unstable - re-read after the edit, since the returned list reflects the new order.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based) on the track.
-        note_index: Note to edit (0-based, PPQ-sort order).
-        pitch: New pitch (0-127). Out of range -> error, no write.
-        start_beat: New start in beats from item start (moves the note; length preserved). A
-            value before the item start clamps there (REAPER floors notes at the item start),
-            reported in out_of_bounds.
-        length_beats: New length in beats (> 0; resizes from the current start). <= 0 -> error.
-        channel: New MIDI channel (0-15). Out of range -> error.
+        pitch: New pitch (0-127).
+        start_beat: New start in beats from item start; length is preserved. A start before
+            the item start clamps there and is counted in out_of_bounds, not clamped.
+        length_beats: New length in beats (> 0), resized from the current start.
+        channel: New MIDI channel (0-15).
 
     Returns:
-        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]} on success, or
-        {ok:false, error} for a bad index / empty edit / invalid value (no write).
+        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}, or {ok:false, error}
+        for a bad index, an empty edit, or an out-of-range value (nothing is written).
     """
     if track_index < 0 or item_index < 0 or note_index < 0:
         return {"ok": False, "error": "track_index, item_index, note_index must be >= 0"}
@@ -2086,7 +2025,7 @@ async def set_midi_note(
         edits["channel"] = channel
     if not edits:
         return {"ok": False, "error": "set_midi_note needs at least one of pitch/start_beat/length_beats/channel"}
-    return await reaper_call("SetMIDINote", track_index, item_index, note_index, edits)
+    return _shape_notes(await reaper_call("SetMIDINote", track_index, item_index, note_index, edits), return_notes, fields)
 
 
 @mcp.tool()
@@ -2100,25 +2039,20 @@ async def ramp_midi_note_velocities(
     start_beat: Optional[float] = None,
     end_beat: Optional[float] = None,
     channel: int = -1,
+    return_notes: bool = True,
+    fields: Optional[List[str]] = None
 ) -> dict:
-    """
-    Apply a linear velocity ramp (crescendo / decrescendo) across MIDI notes.
+    """    Apply a linear velocity ramp (crescendo / decrescendo) across MIDI notes.
 
-    Velocities interpolate by each note's onset: the earliest note in the filtered set gets
-    start_velocity, the latest gets end_velocity, everything between is linear. Notes sharing
-    an onset (a chord) get the same velocity. Results clamp to 1-127 (reported in `clamped`).
-    Narrow the target with the optional filter (pitch range, onset window, channel).
+    Velocities interpolate by onset: the earliest note in the filtered set gets
+    start_velocity, the latest gets end_velocity, everything between is linear. Notes
+    sharing an onset (a chord) get the same velocity. Results clamp to 1-127. Only notes
+    within pitch_low / pitch_high (inclusive, 0-127), within the onset window start_beat /
+    end_beat (beats from item start), and on channel (0-15, or -1 for all) are ramped.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based) on the track.
-        start_velocity: Velocity at the earliest onset (1-127; out of range clamps, not rejected).
-        end_velocity: Velocity at the latest onset (1-127). May be below start (decrescendo).
-        pitch_low: Only ramp notes with pitch >= this (0-127, inclusive).
-        pitch_high: Only ramp notes with pitch <= this (0-127, inclusive).
-        start_beat: Only notes whose onset is at/after this beat from item start.
-        end_beat: Only notes whose onset is at/before this beat from item start.
-        channel: Only this MIDI channel (0-15); -1 = all channels.
+        start_velocity: Velocity at the earliest onset (1-127; out of range clamps, not an error).
+        end_velocity: Velocity at the latest onset (1-127).
 
     Returns:
         {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
@@ -2130,8 +2064,8 @@ async def ramp_midi_note_velocities(
     if not (0 <= pitch_low <= 127) or not (0 <= pitch_high <= 127):
         return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
     filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
-    return await reaper_call("RampMIDINoteVelocities", track_index, item_index,
-                             int(start_velocity), int(end_velocity), filt)
+    return _shape_notes(await reaper_call("RampMIDINoteVelocities", track_index, item_index,
+                             int(start_velocity), int(end_velocity), filt), return_notes, fields)
 
 
 @mcp.tool()
@@ -2147,27 +2081,22 @@ async def scale_midi_note_velocities(
     start_beat: Optional[float] = None,
     end_beat: Optional[float] = None,
     channel: Optional[int] = None,
+    return_notes: bool = True,
+    fields: Optional[List[str]] = None
 ) -> dict:
-    """
-    Scale MIDI note velocities: multiply, set to a fixed value, or compress toward a pivot.
-
-    - multiply: new = velocity * ratio (ratio >= 0, no upper cap; results clamp to 1-127).
-    - set: every matched note's velocity becomes `value` (1-127).
-    - compress: pull velocities toward a pivot — new = pivot + (velocity - pivot) * ratio, with
-      ratio in [0,1] (0 collapses to the pivot, 1 = unchanged). Use multiply to boost.
-      pivot -1 (default) auto-picks the rounded mean of the filtered notes' velocities.
-
-    Narrow the target with the optional filter (pitch range, onset window, channel).
+    """    Scale MIDI note velocities: multiply, set to a fixed value, or compress toward a pivot.
+    Results clamp to 1-127. Only notes within pitch_low / pitch_high (inclusive, 0-127),
+    within the onset window start_beat / end_beat (beats from item start), and on channel
+    (0-15, or -1 for all) are touched.
 
     Args:
-        track_index / item_index: 0-based; active take must be MIDI.
-        mode: "multiply" | "set" | "compress".
-        ratio: multiply/compress factor (see above).
-        value: target velocity for `set` mode (1-127).
-        pivot: compress pivot (1-127), or -1 to auto-pick the filtered mean.
-        pitch_low / pitch_high: pitch filter (0-127, inclusive).
-        start_beat / end_beat: onset window in beats from item start.
-        channel: MIDI channel (0-15); None/-1 = all.
+        mode: "multiply" (velocity * ratio), "set" (velocity becomes `value`), or "compress"
+            (pivot + (velocity - pivot) * ratio).
+        ratio: Multiply factor (>= 0, no upper cap), or compress amount (0.0-1.0, where 0
+            collapses every note onto the pivot and 1.0 changes nothing).
+        value: Target velocity for "set" mode (1-127).
+        pivot: What compress pulls toward (1-127), or -1 for the rounded mean of the matched
+            notes' velocities (reported as pivot_used).
 
     Returns:
         {ok, notes_changed, clamped, skipped, out_of_bounds, pivot_used, notes:[...]}.
@@ -2191,8 +2120,8 @@ async def scale_midi_note_velocities(
     if not (0 <= pl <= 127) or not (0 <= ph <= 127):
         return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
     filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
-    return await reaper_call("ScaleMIDINoteVelocities", track_index, item_index,
-                             mode, float(ratio), int(value), int(pivot), filt)
+    return _shape_notes(await reaper_call("ScaleMIDINoteVelocities", track_index, item_index,
+                             mode, float(ratio), int(value), int(pivot), filt), return_notes, fields)
 
 
 @mcp.tool()
@@ -2207,22 +2136,21 @@ async def strum_midi_notes(
     start_beat: Optional[float] = None,
     end_beat: Optional[float] = None,
     channel: Optional[int] = None,
+    return_notes: bool = True,
+    fields: Optional[List[str]] = None
 ) -> dict:
-    """
-    Strum chords: stagger the onsets of simultaneous notes so each chord rolls out.
+    """    Strum chords: stagger the onsets of simultaneous notes so each chord rolls out.
 
-    Notes sharing an onset (a chord) are spread over `spread_beats` (total first-to-last span);
-    `up` strikes the lowest note first, `down` the highest. Only re-times existing notes (invents
-    nothing); note lengths are preserved. Narrow the target with the optional filter.
+    Only onsets move; note lengths are preserved.
 
     Args:
-        track_index / item_index: 0-based; active take must be MIDI.
         spread_beats: Total first-to-last onset span within each chord (>= 0; 0 = no-op).
-        direction: "up" (lowest first) or "down" (highest first).
-        chord_window_beats: Onset tolerance for grouping notes into a chord (0 = exact same onset).
-        pitch_low / pitch_high: pitch filter (0-127, inclusive).
-        start_beat / end_beat: onset window in beats from item start.
-        channel: MIDI channel (0-15); None/-1 = all.
+        direction: "up" strikes the lowest note of a chord first, "down" the highest.
+        chord_window_beats: Onset tolerance for grouping notes into one chord (0 = exact
+            same onset).
+        pitch_low / pitch_high: inclusive pitch bounds for the filter, 0-127.
+        start_beat / end_beat: onset window in beats from the item start.
+        channel: MIDI channel 0-15; None or -1 = all channels.
 
     Returns:
         {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
@@ -2242,8 +2170,8 @@ async def strum_midi_notes(
     if not (0 <= pl <= 127) or not (0 <= ph <= 127):
         return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
     filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
-    return await reaper_call("StrumMIDINotes", track_index, item_index,
-                             float(spread_beats), direction, float(chord_window_beats), filt)
+    return _shape_notes(await reaper_call("StrumMIDINotes", track_index, item_index,
+                             float(spread_beats), direction, float(chord_window_beats), filt), return_notes, fields)
 
 
 # Scale names the bridge's MODE_INTERVALS table accepts (documented here for the tool
@@ -2265,35 +2193,30 @@ async def snap_midi_notes_to_scale(
     start_beat: Optional[float] = None,
     end_beat: Optional[float] = None,
     channel: int = -1,
+    return_notes: bool = True,
+    fields: Optional[List[str]] = None
 ) -> dict:
-    """
-    Snap off-key MIDI notes onto a scale (fix a wrong note, force a part into a key).
+    """    Snap off-key MIDI notes onto a scale (fix a wrong note, force a part into a key).
 
-    Notes already in the scale are left alone. Each off-scale note moves to the nearest
-    in-scale pitch; with `nearest`, a tie (the note sits exactly between two scale tones)
-    resolves toward the middle of the selection, which keeps a line from drifting. A note
-    with no in-scale pitch left inside 0-127 is left where it is and counted in `skipped`
-    — it is never dropped and never wrapped to another octave.
+    Notes already in the scale are left alone; each off-scale note moves to the nearest
+    in-scale pitch, and under `nearest` a tie resolves toward the middle of the selection.
+    A note with no in-scale pitch left inside 0-127 stays put and is counted in `skipped`.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based) on the track.
         root: Root pitch class, 0-11 (0=C, 1=C#, 2=D ... 11=B).
-        mode: Scale name — one of major, minor, harmonic_minor, melodic_minor, dorian,
-            phrygian, lydian, mixolydian, locrian, major_pentatonic, minor_pentatonic,
-            blues, whole_tone, chromatic (aliases: ionian, aeolian, natural_minor) — OR a
-            custom list of semitone intervals from the root, each 0-11 (e.g. [0,2,4,7,9]).
-        direction: "nearest" (closest scale tone), "up" (only upward), "down" (only downward).
-            `up`/`down` never fall back to the other direction; they skip instead.
-        pitch_low: Only snap notes with pitch >= this (0-127, inclusive). None = no bound.
-        pitch_high: Only snap notes with pitch <= this (0-127, inclusive). None = no bound.
-        start_beat: Only notes whose onset is at/after this beat from item start.
-        end_beat: Only notes whose onset is at/before this beat from item start.
-        channel: Only this MIDI channel (0-15); -1 = all channels.
+        mode: Scale name: major, minor, harmonic_minor, melodic_minor, dorian, phrygian,
+            lydian, mixolydian, locrian, major_pentatonic, minor_pentatonic, blues,
+            whole_tone, chromatic (aliases: ionian, aeolian, natural_minor). Or a custom
+            list of semitone intervals from the root, each 0-11 (e.g. [0,2,4,7,9]).
+        direction: "nearest" (closest scale tone), "up" or "down" (that way only, skipping
+            a note rather than falling back to the other direction).
+        pitch_low / pitch_high: Pitch bounds, 0-127 inclusive.
+        start_beat / end_beat: Bound the note onset, in beats from the item start.
+        channel: 0-15, or -1 for every channel.
 
     Returns:
-        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]} — the full note
-        list after the transform (note indices re-sync after the internal sort).
+        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}; `notes` is the
+        post-transform list, with indices re-synced after the sort.
     """
     if track_index < 0 or item_index < 0:
         return {"ok": False, "error": "track_index and item_index must be >= 0"}
@@ -2316,8 +2239,8 @@ async def snap_midi_notes_to_scale(
     if pitch_high is not None and not (0 <= pitch_high <= 127):
         return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
     filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
-    return await reaper_call("SnapMIDINotesToScale", track_index, item_index,
-                             int(root), mode, direction, filt)
+    return _shape_notes(await reaper_call("SnapMIDINotesToScale", track_index, item_index,
+                             int(root), mode, direction, filt), return_notes, fields)
 
 
 @mcp.tool()
@@ -2332,30 +2255,25 @@ async def quantize_midi_notes(
     start_beat: Optional[float] = None,
     end_beat: Optional[float] = None,
     channel: int = -1,
+    return_notes: bool = True,
+    fields: Optional[List[str]] = None
 ) -> dict:
-    """
-    Quantize MIDI note onsets onto the grid (tighten sloppy timing, add swing).
+    """    Quantize MIDI note onsets onto the grid (tighten sloppy timing, add swing).
 
-    Onsets snap to the PROJECT bar/beat grid, so notes land where the ruler says a 16th is —
-    not at an offset from the item's own start. Note lengths are preserved: start and end move
-    together. Use `strength` to tighten only part of the way and keep some human feel, and
-    `swing` to push the off-beats late for a shuffle. Notes pushed past the item end are kept
-    and reported in `out_of_bounds`; a note that would land before the item start is placed at
-    the item start instead (REAPER refuses anything earlier) and also reported there.
+    Onsets snap to the PROJECT bar/beat grid, not to an offset from the item's own start,
+    and note lengths are preserved: start and end move together. Notes that land past the
+    item end are kept, and one that would land before the item start is placed at it; both
+    are counted in `out_of_bounds` (`clamped` stays 0 here).
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based) on the track.
-        grid: Grid spacing in beats — 0.25 = 1/16, 0.5 = 1/8, 1.0 = 1/4. Must be > 0.
-        strength: 0.0-1.0. 1.0 snaps exactly onto the grid; 0.5 moves each note halfway there;
-            0.0 is a no-op.
-        swing: 0.0-1.0. 0.0 = straight; 1.0 = full triplet feel (off-beats at 66.7%); values
-            between scale linearly. Only the off-beat (odd) grid cells are delayed.
-        pitch_low: Only quantize notes with pitch >= this (0-127, inclusive).
-        pitch_high: Only quantize notes with pitch <= this (0-127, inclusive).
-        start_beat: Only notes whose onset is at/after this beat from item start.
-        end_beat: Only notes whose onset is at/before this beat from item start.
-        channel: Only this MIDI channel (0-15); -1 = all channels.
+        grid: Grid spacing in beats: 0.25 = 1/16, 0.5 = 1/8, 1.0 = 1/4. Must be > 0.
+        strength: 0.0-1.0. 1.0 snaps exactly onto the grid, 0.5 moves each note halfway
+            there, 0.0 is a no-op.
+        swing: 0.0-1.0. 0.0 = straight, 1.0 = full triplet feel (off-beats at 66.7%),
+            scaling linearly between. Only the off-beat (odd) grid cells are delayed.
+        pitch_low / pitch_high: Pitch bounds, 0-127 inclusive.
+        start_beat / end_beat: Bound the note onset, in beats from the item start.
+        channel: 0-15, or -1 for every channel.
 
     Returns:
         {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
@@ -2373,8 +2291,8 @@ async def quantize_midi_notes(
     if not (0 <= pitch_low <= 127) or not (0 <= pitch_high <= 127):
         return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
     filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
-    return await reaper_call("QuantizeMIDINotes", track_index, item_index,
-                             float(grid), float(strength), float(swing), filt)
+    return _shape_notes(await reaper_call("QuantizeMIDINotes", track_index, item_index,
+                             float(grid), float(strength), float(swing), filt), return_notes, fields)
 
 
 @mcp.tool()
@@ -2388,32 +2306,25 @@ async def stretch_midi_notes(
     start_beat: Optional[float] = None,
     end_beat: Optional[float] = None,
     channel: int = -1,
+    return_notes: bool = True,
+    fields: Optional[List[str]] = None
 ) -> dict:
-    """
-    Stretch or compress MIDI timing (half-time, double-time, or any ratio).
+    """    Stretch or compress MIDI timing (half-time, double-time, or any ratio).
 
     Each targeted note scales as a rigid unit about one fixed pivot: its distance from the
-    pivot AND its length both multiply by `factor`, so the phrase's rhythm is preserved while
-    its overall speed changes. 2.0 = half-time (twice as long), 0.5 = double-time. The pivot
-    stays put; by default it is the first targeted note, so a phrase grows or shrinks away from
-    its own downbeat.
-
-    Notes pushed past the item end are kept and reported in `out_of_bounds` (the item is not
-    auto-extended). A note pushed before the item start is placed at the item start — REAPER
-    refuses anything earlier — keeping its scaled end, so it comes out shorter than `factor`
-    alone implies; it is reported in `out_of_bounds` too.
+    pivot and its own length both multiply by `factor`, so the rhythm is preserved and only
+    the speed changes. Notes that land past the item end are kept as-is; one pushed before
+    the item start begins at the item start but keeps its scaled end, so it comes out
+    shorter. Both are counted in `out_of_bounds` (`clamped` stays 0 here).
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based) on the track.
-        factor: Time scale ratio, must be > 0. 2.0 = twice as long/slow, 0.5 = half/fast.
-        pivot_beat: The fixed point, in beats from item start. None = the earliest targeted
-            onset. May be negative, and may sit outside the targeted notes.
-        pitch_low: Only stretch notes with pitch >= this (0-127, inclusive).
-        pitch_high: Only stretch notes with pitch <= this (0-127, inclusive).
-        start_beat: Only notes whose onset is at/after this beat from item start.
-        end_beat: Only notes whose onset is at/before this beat from item start.
-        channel: Only this MIDI channel (0-15); -1 = all channels.
+        factor: Time scale ratio, must be > 0. 2.0 = twice as long (half-time), 0.5 = half
+            as long (double-time).
+        pivot_beat: The fixed point, in beats from the item start; may be negative. None =
+            the earliest targeted onset.
+        pitch_low / pitch_high: Pitch bounds, 0-127 inclusive.
+        start_beat / end_beat: Bound the note onset, in beats from the item start.
+        channel: 0-15, or -1 for every channel.
 
     Returns:
         {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
@@ -2433,7 +2344,7 @@ async def stretch_midi_notes(
     opts = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
     if pivot_beat is not None:
         opts["pivot_beat"] = float(pivot_beat)
-    return await reaper_call("StretchMIDINotes", track_index, item_index, float(factor), opts)
+    return _shape_notes(await reaper_call("StretchMIDINotes", track_index, item_index, float(factor), opts), return_notes, fields)
 
 
 @mcp.tool()
@@ -2449,35 +2360,28 @@ async def legato_midi_notes(
     start_beat: Optional[float] = None,
     end_beat: Optional[float] = None,
     channel: int = -1,
+    return_notes: bool = True,
+    fields: Optional[List[str]] = None
 ) -> dict:
-    """
-    Close the gaps in a MIDI line (legato), or set every note to one length.
+    """    Close the gaps in a MIDI line (legato), or set every note to one length.
 
-    Only note ENDS move — starts are never touched, so the rhythm of the part is preserved.
-
-    `connect` runs each note's end forward to the next note's onset, so the line plays
-    seamlessly. A note that already reaches (or overlaps) the next one is left alone — this
-    never shortens anything. A gap wider than `max_gap_beats` is treated as a rest you meant
-    to be there: left alone and counted in `gaps_preserved`. The last note is left alone.
-
-    `fixed` ignores all that and simply sets every targeted note's length to `length_beats`.
-
-    Notes whose new end passes the item end are kept and reported in `out_of_bounds`.
+    Only note ends move; starts are never touched. "connect" extends each note's end to the
+    next onset and never shortens anything; a gap wider than max_gap_beats is left as a rest
+    and counted in gaps_preserved, and the last note is left alone. "fixed" instead sets every
+    targeted note's length to length_beats. Notes whose new end passes the item end are kept
+    and reported in out_of_bounds.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based) on the track.
         mode: "connect" (extend each end to the next onset) or "fixed" (set every length).
         voice: connect only. "chordal" extends to the next onset of any note, so a chord's
             notes move together; "per_pitch" extends to the next note of the SAME pitch and
-            channel, which keeps interleaved voices independent.
+            channel, keeping interleaved voices independent.
         max_gap_beats: connect only. Gaps wider than this are left as rests (>= 0).
         length_beats: fixed only. The length every targeted note is set to (> 0).
-        pitch_low: Only affect notes with pitch >= this (0-127, inclusive). None = no bound.
-        pitch_high: Only affect notes with pitch <= this (0-127, inclusive). None = no bound.
-        start_beat: Only notes whose onset is at/after this beat from item start.
-        end_beat: Only notes whose onset is at/before this beat from item start.
-        channel: Only this MIDI channel (0-15); -1 = all channels.
+        pitch_low, pitch_high: The shared pitch filter under this tool's names, 0-127
+            inclusive. start_beat/end_beat bound the note's ONSET, counted from the item
+            start; channel is 0-15,
+            -1 = all.
 
     Returns:
         {ok, notes_changed, clamped, skipped, out_of_bounds, gaps_preserved, notes:[...]}.
@@ -2499,8 +2403,8 @@ async def legato_midi_notes(
     if not (0 <= pl <= 127) or not (0 <= ph <= 127):
         return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
     filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
-    return await reaper_call("LegatoMIDINotes", track_index, item_index, mode, voice,
-                             float(max_gap_beats), float(length_beats), filt)
+    return _shape_notes(await reaper_call("LegatoMIDINotes", track_index, item_index, mode, voice,
+                             float(max_gap_beats), float(length_beats), filt), return_notes, fields)
 
 
 # Offsets are rounded to this many decimals before they cross the wire. Not cosmetic: the
@@ -2526,38 +2430,32 @@ async def humanize_midi_notes(
     end_beat: Optional[float] = None,
     channel: int = -1,
     max_sigma: float = 2.0,
+    return_notes: bool = True,
+    fields: Optional[List[str]] = None
 ) -> dict:
-    """
-    Humanize MIDI: nudge timing and velocity by small random amounts, reproducibly.
+    """    Humanize MIDI: nudge timing and velocity by small random amounts, reproducibly.
 
-    Takes the machine-perfect edge off a programmed part. Each note gets its own random
-    timing and velocity offset drawn from a bell curve, so most notes move a little and a few
-    move more — the way a player does. Note lengths are preserved (start and end move
-    together), and pitches are never touched.
+    Each note gets its own timing and velocity offset drawn from a bell curve. Note lengths
+    are preserved (start and end move together) and pitches are never touched. The randomness
+    is seeded, so the same take with the same seed and settings gives identical results every
+    time. Velocities are clamped to 1-127 and counted in clamped; notes pushed past the item
+    end are kept and reported in out_of_bounds.
 
-    The randomness is SEEDED and computed here, not in REAPER: the same take with the same
-    seed and settings gives byte-identical results every time. Change `seed` for a different
-    feel; keep it to reproduce one.
-
-    Notes pushed past the item end are kept and reported in `out_of_bounds`; a note pushed
-    before the item start is placed at the item start (REAPER refuses anything earlier),
-    keeping its length, and reported there too. Velocities are clamped to 1-127 and counted
-    in `clamped` — a humanized note never drops to 0 (silent).
+    Unlike the other timing tools, a note pushed before the item start is placed at the
+    item start and counted in out_of_bounds, not clamped; clamped here counts only the
+    velocity clamp.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based) on the track.
-        timing: Timing spread in beats (standard deviation). 0.02 is a subtle human feel;
-            0.0 = leave timing alone and only touch velocity.
-        velocity: Velocity spread (standard deviation, in velocity units). 0.0 = timing only.
-        seed: Any integer. Same seed + same settings + same take = same result.
-        pitch_low: Only humanize notes with pitch >= this (0-127, inclusive).
-        pitch_high: Only humanize notes with pitch <= this (0-127, inclusive).
-        start_beat: Only notes whose onset is at/after this beat from item start.
-        end_beat: Only notes whose onset is at/before this beat from item start.
-        channel: Only this MIDI channel (0-15); -1 = all channels.
-        max_sigma: Cap on how far any single note may stray, in multiples of the spread.
-            Stops one freak draw from throwing a note far out of place.
+        timing: Timing spread in beats (standard deviation); 0.02 is a subtle human feel,
+            0.0 leaves timing alone.
+        velocity: Velocity spread (standard deviation, in velocity units); 0.0 leaves
+            velocity alone.
+        seed: Any integer. The same seed, settings and take give the same result.
+        pitch_low, pitch_high: The shared pitch filter under this tool's names, 0-127
+            inclusive. start_beat/end_beat bound the note's ONSET, counted from the item
+            start; channel is 0-15,
+            -1 = all.
+        max_sigma: Cap on how far one note may stray, in multiples of the spread.
 
     Returns:
         {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
@@ -2594,8 +2492,8 @@ async def humanize_midi_notes(
         velocity_offsets.append(round(max(-v_lim, min(v_lim, v)), _WIRE_DECIMALS))
 
     filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
-    return await reaper_call("HumanizeMIDINotes", track_index, item_index,
-                             timing_offsets, velocity_offsets, filt)
+    return _shape_notes(await reaper_call("HumanizeMIDINotes", track_index, item_index,
+                             timing_offsets, velocity_offsets, filt), return_notes, fields)
 
 
 # The only v1.6.0 tool that removes notes rather than moving them, so it is the only one
@@ -2611,39 +2509,34 @@ async def remove_overlapping_midi_notes(
     start_beat: Optional[float] = None,
     end_beat: Optional[float] = None,
     channel: int = -1,
+    return_notes: bool = True,
+    fields: Optional[List[str]] = None
 ) -> dict:
-    """
-    Clean up overlapping MIDI notes (same pitch stacked on itself).
+    """    Clean up overlapping MIDI notes (same pitch stacked on itself).
 
-    Two notes only conflict if they share a pitch AND a channel AND actually overlap in time.
-    A chord is never a conflict, the same pitch on two channels is never a conflict, and notes
-    that merely touch (one ends exactly where the next begins) are left alone.
-
-    `trim` (default) is the safe one: it shortens the earlier note so it stops where the next
-    begins. Nothing is lost — the notes just stop fighting. `delete` instead drops one note of
+    Two notes conflict only if they share a pitch AND a channel AND overlap in time, so a
+    chord is never a conflict and notes that merely touch are left alone. "trim" shortens the
+    earlier note to stop where the next begins, losing nothing; "delete" drops one note of
     each overlapping pair, keeping the louder (ties go to the longer note).
 
-    NOTE: this tool can REMOVE notes. Even in `trim` mode, notes stacked on the exact same
-    onset are collapsed to one (the loudest), because there is nothing to trim between them —
-    and a trim left shorter than `min_length_beats` is removed rather than left as a click.
-    Everything removed is reported in `notes_removed`. It is undoable in REAPER as one step.
+    Either mode can remove notes: notes stacked on the exact same onset collapse to the
+    loudest, since there is nothing to trim between them, and a trim left shorter than
+    min_length_beats is removed rather than left as a click.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based) on the track.
         mode: "trim" (shorten the earlier note) or "delete" (drop the quieter note).
-        min_length_beats: A trimmed note left shorter than this is removed instead of leaving
-            an inaudible click. Default 1/128 of a beat. 0 disables it.
-        pitch_low: Only consider notes with pitch >= this (0-127, inclusive). Notes outside the
-            filter are invisible: never touched, and never counted as an overlap partner.
-        pitch_high: Only consider notes with pitch <= this (0-127, inclusive).
-        start_beat: Only notes whose onset is at/after this beat from item start.
-        end_beat: Only notes whose onset is at/before this beat from item start.
-        channel: Only this MIDI channel (0-15); -1 = all channels.
+        min_length_beats: A trimmed note left shorter than this is removed instead. Default
+            1/128 of a beat; 0 disables it.
+        pitch_low, pitch_high: The shared pitch filter under this tool's names, 0-127
+            inclusive. Notes outside the filter are invisible: never touched, and never
+            counted as an overlap partner. start_beat/end_beat bound the note's ONSET, counted from the item
+            start, so a note beginning earlier and sustaining into the range is not
+            matched;
+            channel is 0-15, -1 = all.
 
     Returns:
         {ok, mode, notes_changed, clamped, skipped, out_of_bounds, notes_removed, trimmed,
-        deduped, deleted, notes:[...]} — `notes_removed` = deduped + deleted.
+        deduped, deleted, notes:[...]} where notes_removed = deduped + deleted.
     """
     if track_index < 0 or item_index < 0:
         return {"ok": False, "error": "track_index and item_index must be >= 0"}
@@ -2656,8 +2549,8 @@ async def remove_overlapping_midi_notes(
     if not (0 <= pitch_low <= 127) or not (0 <= pitch_high <= 127):
         return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
     filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
-    return await reaper_call("RemoveOverlappingMIDINotes", track_index, item_index,
-                             mode, float(min_length_beats), filt)
+    return _shape_notes(await reaper_call("RemoveOverlappingMIDINotes", track_index, item_index,
+                             mode, float(min_length_beats), filt), return_notes, fields)
 
 
 # --- AUDIO ITEM OPERATIONS ---
@@ -2668,7 +2561,6 @@ async def insert_audio_file(track_index: int, file_path: str, position: float) -
     Insert an audio file onto a track.
 
     Args:
-        track_index: Track index (0-based).
         file_path: Full path to the audio file.
         position: Position in seconds.
 
@@ -2691,9 +2583,6 @@ async def get_track_items(track_index: int) -> dict:
     """
     Get all media items on a track.
 
-    Args:
-        track_index: Track index (0-based).
-
     Returns:
         Object with list of items.
     """
@@ -2704,10 +2593,6 @@ async def get_track_items(track_index: int) -> dict:
 async def get_item_info(track_index: int, item_index: int) -> dict:
     """
     Get information about a media item.
-
-    Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based).
 
     Returns:
         Object with item properties (position, length, take info, etc.).
@@ -2721,12 +2606,8 @@ async def set_item_position(track_index: int, item_index: int, position: float) 
     Set the position of a media item.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based).
         position: New position in seconds.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetMediaItemInfo_Value", track_index, item_index, "D_POSITION", position)
 
@@ -2737,12 +2618,8 @@ async def set_item_length(track_index: int, item_index: int, length: float) -> d
     Set the length of a media item.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based).
         length: New length in seconds.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetMediaItemInfo_Value", track_index, item_index, "D_LENGTH", length)
 
@@ -2752,12 +2629,6 @@ async def delete_item(track_index: int, item_index: int) -> dict:
     """
     Delete a media item.
 
-    Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based).
-
-    Returns:
-        Object with success status.
     """
     return await reaper_call("DeleteTrackMediaItem", track_index, item_index)
 
@@ -2766,10 +2637,6 @@ async def delete_item(track_index: int, item_index: int) -> dict:
 async def duplicate_item(track_index: int, item_index: int) -> dict:
     """
     Duplicate a media item.
-
-    Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based).
 
     Returns:
         Object with new item info.
@@ -2783,8 +2650,6 @@ async def split_item(track_index: int, item_index: int, position: float) -> dict
     Split a media item at a position.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based).
         position: Split position in seconds (absolute project time).
 
     Returns:
@@ -2799,12 +2664,8 @@ async def set_item_mute(track_index: int, item_index: int, mute: bool) -> dict:
     Mute or unmute a media item.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based).
         mute: True to mute, False to unmute.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetMediaItemInfo_Value", track_index, item_index, "B_MUTE", 1 if mute else 0)
 
@@ -2815,12 +2676,8 @@ async def set_item_volume(track_index: int, item_index: int, volume_db: float) -
     Set the volume of a media item.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based).
         volume_db: Volume in dB.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetMediaItemInfo_Value", track_index, item_index, "D_VOL", db_to_linear(volume_db))
 
@@ -2831,12 +2688,8 @@ async def set_item_fade_in(track_index: int, item_index: int, length: float) -> 
     Set the fade-in length of a media item.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based).
         length: Fade-in length in seconds.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetMediaItemInfo_Value", track_index, item_index, "D_FADEINLEN", length)
 
@@ -2847,12 +2700,8 @@ async def set_item_fade_out(track_index: int, item_index: int, length: float) ->
     Set the fade-out length of a media item.
 
     Args:
-        track_index: Track index (0-based).
-        item_index: Item index (0-based).
         length: Fade-out length in seconds.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetMediaItemInfo_Value", track_index, item_index, "D_FADEOUTLEN", length)
 
@@ -2867,8 +2716,6 @@ async def set_tempo(bpm: float) -> dict:
     Args:
         bpm: Tempo in beats per minute.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetCurrentBPM", 0, bpm, True)
 
@@ -2882,8 +2729,6 @@ async def set_time_signature(numerator: int, denominator: int) -> dict:
         numerator: Beats per measure (e.g., 4 for 4/4).
         denominator: Beat unit (e.g., 4 for quarter note).
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetTimeSignature", numerator, denominator)
 
@@ -2896,8 +2741,6 @@ async def create_project() -> dict:
     Note: REAPER has no API to name a project that has never been saved, so this server
     has no way to name one either. The removed `name` parameter never took effect.
 
-    Returns:
-        Object with success status.
     """
     # The old `if name:` branch called Main_SaveProject(0, False), which is a plain
     # Ctrl+S and identical to the save_project tool. On a brand-new untitled project
@@ -2915,8 +2758,6 @@ async def open_project(path: str) -> dict:
     Args:
         path: Full path to the .rpp file.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("Main_openProject", path)
 
@@ -2968,21 +2809,19 @@ async def render_project(
 @mcp.tool()
 async def render_region(region_index: int, output_path: str) -> dict:
     """
-    Render a specific region to an audio file.
-
-    NOT YET IMPLEMENTED — returns an explanatory error. A full region-render suite
-    (render matrix, stems) is planned for v1.9. Use render_project with explicit
-    start_time/end_time as a workaround.
+    NOT IMPLEMENTED. Use render_project with the region's start/end from get_regions.
 
     Args:
-        region_index: Region index (0-based).
         output_path: Full path for output file.
     """
     return {
         "ok": False,
-        "error": "render_region is not yet implemented (planned for the v1.9 render suite). "
-                 "Workaround: get the region bounds via get_regions, then call "
-                 "render_project with start_time/end_time.",
+        # No version named here on purpose: the roadmap said v1.9 in two places, the
+        # renumbering moved the render suite, and a stale promise shipped to users on
+        # every call is worse than no promise at all.
+        "error": "render_region is not implemented yet. Workaround: get the region "
+                 "bounds via get_regions, then call render_project with "
+                 "start_time/end_time.",
     }
 
 
@@ -3048,11 +2887,6 @@ async def delete_marker(marker_index: int) -> dict:
     """
     Delete a marker by index.
 
-    Args:
-        marker_index: Marker index.
-
-    Returns:
-        Object with success status.
     """
     return await reaper_call("DeleteProjectMarker", 0, marker_index, False)
 
@@ -3062,11 +2896,6 @@ async def delete_region(region_index: int) -> dict:
     """
     Delete a region by index.
 
-    Args:
-        region_index: Region index.
-
-    Returns:
-        Object with success status.
     """
     return await reaper_call("DeleteProjectMarker", 0, region_index, True)
 
@@ -3076,11 +2905,6 @@ async def go_to_marker(marker_index: int) -> dict:
     """
     Move the edit cursor to a marker.
 
-    Args:
-        marker_index: Marker index.
-
-    Returns:
-        Object with success status.
     """
     return await reaper_call("GoToMarker", 0, marker_index, False)
 
@@ -3090,11 +2914,6 @@ async def go_to_region(region_index: int) -> dict:
     """
     Move the edit cursor to a region start.
 
-    Args:
-        region_index: Region index.
-
-    Returns:
-        Object with success status.
     """
     return await reaper_call("GoToRegion", 0, region_index, False)
 
@@ -3107,7 +2926,6 @@ async def get_track_envelope(track_index: int, envelope_name: str) -> dict:
     Get a track envelope by name.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         envelope_name: Envelope name (e.g., "Volume", "Pan", "Mute").
 
     Returns:
@@ -3122,7 +2940,6 @@ async def get_envelope_point_count(track_index: int, envelope_name: str) -> dict
     Get the number of points in an envelope.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         envelope_name: Envelope name.
 
     Returns:
@@ -3143,7 +2960,6 @@ async def add_envelope_point(
     Add a point to an envelope.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         envelope_name: Envelope name.
         time: Time position in seconds.
         value: Envelope value (0.0-1.0 for most envelopes).
@@ -3161,7 +2977,6 @@ async def get_envelope_points(track_index: int, envelope_name: str) -> dict:
     Get all points from an envelope.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         envelope_name: Envelope name.
 
     Returns:
@@ -3176,12 +2991,8 @@ async def delete_envelope_point(track_index: int, envelope_name: str, point_inde
     Delete an envelope point.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         envelope_name: Envelope name.
-        point_index: Point index (0-based).
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("DeleteEnvelopePoint", track_index, envelope_name, point_index)
 
@@ -3192,11 +3003,8 @@ async def clear_envelope(track_index: int, envelope_name: str) -> dict:
     Delete all points from an envelope.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         envelope_name: Envelope name.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("ClearEnvelope", track_index, envelope_name)
 
@@ -3207,11 +3015,8 @@ async def set_track_automation_mode(track_index: int, mode: int) -> dict:
     Set the automation mode for a track.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         mode: 0=trim/read, 1=read, 2=touch, 3=write, 4=latch.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "I_AUTOMODE", mode)
 
@@ -3222,12 +3027,9 @@ async def arm_track_envelope(track_index: int, envelope_name: str, arm: bool = T
     Arm or disarm an envelope for recording.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         envelope_name: Envelope name.
         arm: True to arm, False to disarm.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetEnvelopeArm", track_index, envelope_name, arm)
 
@@ -3243,8 +3045,6 @@ async def get_fx_envelope(track_index: int, fx_index: int, param_index: int) -> 
     The envelope is created if it doesn't exist.
 
     Args:
-        track_index: Track index (0-based) or -1 for master track.
-        fx_index: FX index (0-based) in the FX chain.
         param_index: Parameter index (0-based). Use track_fx_get_num_params() to find available parameters.
 
     Returns:
@@ -3266,9 +3066,6 @@ async def add_fx_envelope_point(
     Add an automation point to an FX parameter envelope.
 
     Args:
-        track_index: Track index (0-based) or -1 for master track.
-        fx_index: FX index (0-based) in the FX chain.
-        param_index: Parameter index (0-based).
         time: Time position in seconds.
         value: Parameter value (typically 0.0-1.0, normalized).
         shape: Point shape (0=linear, 1=square, 2=slow start/end, 3=fast start, 4=fast end, 5=bezier).
@@ -3283,11 +3080,6 @@ async def add_fx_envelope_point(
 async def get_fx_envelope_points(track_index: int, fx_index: int, param_index: int) -> dict:
     """
     Get all automation points from an FX parameter envelope.
-
-    Args:
-        track_index: Track index (0-based) or -1 for master track.
-        fx_index: FX index (0-based) in the FX chain.
-        param_index: Parameter index (0-based).
 
     Returns:
         Object with list of points (time, value, shape, tension, selected).
@@ -3306,13 +3098,8 @@ async def delete_fx_envelope_point(
     Delete an automation point from an FX parameter envelope.
 
     Args:
-        track_index: Track index (0-based) or -1 for master track.
-        fx_index: FX index (0-based) in the FX chain.
-        param_index: Parameter index (0-based).
         point_index: Point index (0-based) to delete.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("DeleteFXEnvelopePoint", track_index, fx_index, param_index, point_index)
 
@@ -3321,11 +3108,6 @@ async def delete_fx_envelope_point(
 async def clear_fx_envelope(track_index: int, fx_index: int, param_index: int) -> dict:
     """
     Clear all automation points from an FX parameter envelope.
-
-    Args:
-        track_index: Track index (0-based) or -1 for master track.
-        fx_index: FX index (0-based) in the FX chain.
-        param_index: Parameter index (0-based).
 
     Returns:
         Object with deleted_count.
@@ -3374,11 +3156,8 @@ async def select_track(track_index: int, exclusive: bool = True) -> dict:
     Select a track.
 
     Args:
-        track_index: Track index (0-based).
         exclusive: If True, deselect other tracks first.
 
-    Returns:
-        Object with success status.
     """
     if exclusive:
         await reaper_call("Main_OnCommand", 40297, 0)  # Unselect all tracks
@@ -3390,8 +3169,6 @@ async def select_all_tracks() -> dict:
     """
     Select all tracks.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("Main_OnCommand", 40296, 0)  # Select all tracks
 
@@ -3401,8 +3178,6 @@ async def unselect_all_tracks() -> dict:
     """
     Unselect all tracks.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("Main_OnCommand", 40297, 0)  # Unselect all tracks
 
@@ -3423,8 +3198,6 @@ async def select_all_items() -> dict:
     """
     Select all media items.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("Main_OnCommand", 40182, 0)  # Select all items
 
@@ -3434,8 +3207,6 @@ async def unselect_all_items() -> dict:
     """
     Unselect all media items.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("Main_OnCommand", 40289, 0)  # Unselect all items
 
@@ -3456,8 +3227,6 @@ async def copy_selected_items() -> dict:
     """
     Copy selected items to clipboard.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("Main_OnCommand", 40057, 0)  # Copy items
 
@@ -3467,8 +3236,6 @@ async def cut_selected_items() -> dict:
     """
     Cut selected items to clipboard.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("Main_OnCommand", 40059, 0)  # Cut items
 
@@ -3478,8 +3245,6 @@ async def paste_items() -> dict:
     """
     Paste items from clipboard at edit cursor.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("Main_OnCommand", 40058, 0)  # Paste items
 
@@ -3489,8 +3254,6 @@ async def delete_selected_items() -> dict:
     """
     Delete all selected items.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("Main_OnCommand", 40006, 0)  # Remove items
 
@@ -3504,8 +3267,6 @@ async def set_time_selection(start: float, end: float) -> dict:
         start: Start time in seconds.
         end: End time in seconds.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetTimeSelection", start, end)
 
@@ -3526,8 +3287,6 @@ async def clear_time_selection() -> dict:
     """
     Clear the time selection.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("Main_OnCommand", 40635, 0)  # Remove time selection
 
@@ -3540,11 +3299,8 @@ async def set_track_phase(track_index: int, invert: bool) -> dict:
     Set the phase inversion of a track.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         invert: True to invert phase, False for normal.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "B_PHASE", 1 if invert else 0)
 
@@ -3555,11 +3311,8 @@ async def set_track_width(track_index: int, width: float) -> dict:
     Set the stereo width of a track.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         width: Width value (0=mono, 1=stereo, 2=200% width).
 
-    Returns:
-        Object with success status.
     """
     width = max(0.0, min(2.0, width))
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "D_WIDTH", width)
@@ -3571,11 +3324,8 @@ async def set_track_as_folder(track_index: int, folder_depth: int) -> dict:
     Set a track as a folder parent or child.
 
     Args:
-        track_index: Track index (0-based).
         folder_depth: 0=normal, 1=folder parent, -1=end of folder.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "I_FOLDERDEPTH", folder_depth)
 
@@ -3586,11 +3336,8 @@ async def arm_track(track_index: int, arm: bool = True) -> dict:
     Arm or disarm a track for recording.
 
     Args:
-        track_index: Track index (0-based).
         arm: True to arm, False to disarm.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "I_RECARM", 1 if arm else 0)
 
@@ -3601,11 +3348,8 @@ async def set_track_input(track_index: int, input_index: int) -> dict:
     Set the record input for a track.
 
     Args:
-        track_index: Track index (0-based).
         input_index: Input index (-1=no input, 0+=hardware inputs, 4096+=virtual MIDI).
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "I_RECINPUT", input_index)
 
@@ -3616,11 +3360,8 @@ async def set_track_monitor(track_index: int, monitor: int) -> dict:
     Set the monitor mode for a track.
 
     Args:
-        track_index: Track index (0-based).
         monitor: 0=off, 1=normal, 2=not when playing.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "I_RECMON", monitor)
 
@@ -3631,13 +3372,10 @@ async def set_track_color(track_index: int, r: int, g: int, b: int) -> dict:
     Set the color of a track.
 
     Args:
-        track_index: Track index (0-based).
         r: Red component (0-255).
         g: Green component (0-255).
         b: Blue component (0-255).
 
-    Returns:
-        Object with success status.
     """
     # REAPER uses native OS color format
     color = (r | (g << 8) | (b << 16)) | 0x1000000
@@ -3650,7 +3388,6 @@ async def get_track_peak(track_index: int, channel: int = 0) -> dict:
     Get the current peak level of a track.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         channel: Channel (0=left, 1=right).
 
     Returns:
@@ -3665,10 +3402,9 @@ async def get_track_peak_hold(track_index: int, channel: int = 0) -> dict:
     Get the peak hold level of a track (highest peak since meters were last reset).
 
     Returns the max peak from a previous playback without needing to be actively
-    playing — play the project, stop, then call this for gain staging.
+    playing - play the project, stop, then call this for gain staging.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         channel: Channel (0=left, 1=right).
 
     Returns:
@@ -3693,9 +3429,6 @@ async def get_track_master_send(track_index: int) -> dict:
     """
     Get the master/parent send state of a track.
 
-    Args:
-        track_index: Track index (0-based) or -1 for master.
-
     Returns:
         Object with 'ret' field (1 = enabled, 0 = disabled).
     """
@@ -3712,7 +3445,6 @@ async def set_track_master_send(track_index: int, enabled: bool) -> dict:
     through its sends (e.g., routed exclusively to a bus).
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         enabled: True to enable, False to disable.
     """
     return await reaper_call(
@@ -3730,8 +3462,6 @@ async def run_action(action_id: int) -> dict:
     Args:
         action_id: REAPER action/command ID number.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("Main_OnCommand", action_id, 0)
 
@@ -3750,7 +3480,7 @@ async def run_action_by_name(action_name: str) -> dict:
         action_name: Named command id (e.g. "_RS12345") or a numeric command id string.
 
     Returns:
-        Object with success status. If the named command cannot be resolved,
+        If the named command cannot be resolved,
         returns {"ok": False, "error": ...} without firing any action.
     """
     name = action_name.strip()
@@ -3777,10 +3507,6 @@ async def get_fx_presets(track_index: int, fx_index: int) -> dict:
     """
     Get list of presets available for an FX.
 
-    Args:
-        track_index: Track index (0-based) or -1 for master.
-        fx_index: FX index (0-based).
-
     Returns:
         Object with list of preset names.
     """
@@ -3791,10 +3517,6 @@ async def get_fx_presets(track_index: int, fx_index: int) -> dict:
 async def get_fx_preset(track_index: int, fx_index: int) -> dict:
     """
     Get the current preset name of an FX.
-
-    Args:
-        track_index: Track index (0-based) or -1 for master.
-        fx_index: FX index (0-based).
 
     Returns:
         Object with current preset name.
@@ -3808,12 +3530,8 @@ async def set_fx_preset(track_index: int, fx_index: int, preset_name: str) -> di
     Set the preset of an FX.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
-        fx_index: FX index (0-based).
         preset_name: Preset name.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("TrackFX_SetPreset", track_index, fx_index, preset_name)
 
@@ -3824,12 +3542,8 @@ async def save_fx_preset(track_index: int, fx_index: int, preset_name: str) -> d
     Save the current FX settings as a preset.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
-        fx_index: FX index (0-based).
         preset_name: Name for the new preset.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("TrackFX_SavePreset", track_index, fx_index, preset_name)
 
@@ -3874,7 +3588,6 @@ async def get_eq_bands(track_index: int, fx_index: int) -> dict:
     Get all ReaEQ band settings in one structured call.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         fx_index: FX index (0-based) of ReaEQ in the FX chain.
 
     Returns:
@@ -3924,7 +3637,6 @@ async def set_eq_band(track_index: int, fx_index: int, bandtype: int, bandidx: i
     curve internally; freq and Q are sent raw.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         fx_index: FX index (0-based) of ReaEQ.
         bandtype: -1=master gain, 0=hipass, 1=loshelf, 2=band, 3=notch,
                   4=hishelf, 5=lopass, 6=bandpass, 7=parallel bandpass.
@@ -3933,8 +3645,6 @@ async def set_eq_band(track_index: int, fx_index: int, bandtype: int, bandidx: i
         value: The value, in real units unless is_normalized=True.
         is_normalized: If True, value is a raw 0-1 normalized value written directly.
 
-    Returns:
-        Object with success status (ok).
     """
     if is_normalized:
         return await reaper_call("TrackFX_SetEQParam", track_index, fx_index,
@@ -3956,7 +3666,6 @@ async def get_eq_band_enabled(track_index: int, fx_index: int, bandtype: int,
     Check whether a ReaEQ band is enabled.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         fx_index: FX index (0-based) of ReaEQ.
         bandtype: Band type (0=hipass, 1=loshelf, 2=band, 3=notch, 4=hishelf, 5=lopass).
         bandidx: Band index within that type (0=first).
@@ -3974,14 +3683,11 @@ async def set_eq_band_enabled(track_index: int, fx_index: int, bandtype: int,
     Enable or disable a ReaEQ band.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         fx_index: FX index (0-based) of ReaEQ.
         bandtype: Band type (0=hipass, 1=loshelf, 2=band, 3=notch, 4=hishelf, 5=lopass).
         bandidx: Band index within that type (0=first).
         enabled: True to enable, False to disable.
 
-    Returns:
-        Object with success status (ok).
     """
     return await reaper_call("TrackFX_SetEQBandEnabled", track_index, fx_index, bandtype, bandidx, enabled)
 
@@ -3992,7 +3698,6 @@ async def find_eq(track_index: int, instantiate: bool = False) -> dict:
     Find ReaEQ on a track, optionally adding it if absent.
 
     Args:
-        track_index: Track index (0-based) or -1 for master.
         instantiate: If True and ReaEQ is not present, add it.
 
     Returns:
@@ -4008,10 +3713,6 @@ async def get_track_fx_chunk(track_index: int, fx_index: int) -> dict:
 
     Useful for reading VSTi state data like Toontrack EZkeys chord progressions.
     The chunk contains the full serialized state of the plugin.
-
-    Args:
-        track_index: Track index (0-based) or -1 for master.
-        fx_index: FX index (0-based) in the FX chain.
 
     Returns:
         Object with 'chunk' containing the FX state data string.
@@ -4078,8 +3779,6 @@ async def record() -> dict:
     """
     Start recording in REAPER.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("OnRecordButton")
 
@@ -4089,8 +3788,6 @@ async def pause() -> dict:
     """
     Pause playback in REAPER.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("OnPauseButton")
 
@@ -4122,8 +3819,6 @@ async def zoom_to_selection() -> dict:
     """
     Zoom the arrange view to the time selection.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("Main_OnCommand", 40031, 0)  # Zoom to time selection
 
@@ -4133,8 +3828,6 @@ async def zoom_to_project() -> dict:
     """
     Zoom the arrange view to show the entire project.
 
-    Returns:
-        Object with success status.
     """
     return await reaper_call("Main_OnCommand", 40295, 0)  # Zoom to project
 

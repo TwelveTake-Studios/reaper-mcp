@@ -40,12 +40,22 @@ def bridge_version() -> str:
 
 
 def changelog_top() -> str:
-    """The newest released version heading, skipping an Unreleased section if present."""
+    """The newest RELEASED version heading.
+
+    A section for work in progress carries an unreleased date and is skipped: the next
+    version is written up as it is built, and the alternative is either an undocumented
+    release or bumping every version fact to a number that does not exist yet just to
+    keep this green. Only a dated entry counts as shipped.
+    """
     for line in CHANGELOG.read_text(encoding="utf-8").splitlines():
-        m = re.match(rf"##\s*\[({SEMVER})\]", line.strip())
-        if m:
-            return m.group(1)
-    raise AssertionError("no '## [x.y.z]' heading found in CHANGELOG.md")
+        stripped = line.strip()
+        m = re.match(rf"##\s*\[({SEMVER})\]", stripped)
+        if not m:
+            continue
+        if re.search(r"unreleased|tbd|in progress", stripped, re.I):
+            continue
+        return m.group(1)
+    raise AssertionError("no released '## [x.y.z] - <date>' heading found in CHANGELOG.md")
 
 
 def changelog_section(version: str) -> str:

@@ -292,3 +292,25 @@ def test_file_timeout_is_configurable(monkeypatch, restore_srv):
 def test_nonsense_file_timeout_falls_back_to_the_default(monkeypatch, restore_srv, bad):
     """A typo must not disable the deadline or make every call fail instantly."""
     assert _reload_with(monkeypatch, bad).FILE_TIMEOUT == 5.0
+
+
+def test_startup_banner_names_the_bridge_version():
+    """REAPER runs the DEPLOYED copy and no package upgrade updates it.
+
+    Without the version in the banner there is no way to see which bridge is actually
+    running short of opening the file. That is the same blind spot that let the server's
+    own version sit two releases stale (#15), and it is worse here because the deployed
+    script routinely differs from the one in the repo.
+
+    Asserted against the source rather than a running REAPER: the banner is in the main
+    chunk, so importing it would start a defer loop.
+    """
+    bridge = Path(__file__).resolve().parent.parent / "reaper_mcp_bridge.lua"
+    src = bridge.read_text(encoding="utf-8")
+    banner = [ln for ln in src.splitlines()
+              if "ShowConsoleMsg" in ln and "Bridge" in ln and "started" in ln]
+    assert banner, "the startup banner line is gone or was reworded past recognition"
+    assert any("BRIDGE_VERSION" in ln for ln in banner), (
+        "the startup banner no longer names BRIDGE_VERSION, so a user cannot tell which "
+        "bridge REAPER is running without opening the deployed file"
+    )

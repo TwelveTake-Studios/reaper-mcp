@@ -4,7 +4,7 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.6.7"
+local BRIDGE_VERSION = "1.7.0"
 
 local bridge_dir = reaper.GetResourcePath() .. '/Scripts/mcp_bridge_data/'
 
@@ -2221,6 +2221,10 @@ local function process_request()
         local numbered_response_file = bridge_dir .. 'response_' .. i .. '.json'
         
         if file_exists(numbered_request_file) then
+            -- Echoed back on every exit path so the server can prove the answer in a
+            -- slot is the answer to ITS question. Declared out here because the error
+            -- handler below lives outside the pcall closure and needs it too.
+            local request_id = nil
             -- Wrap in pcall to catch any errors
             local ok, err = pcall(function()
                 -- Read and process request
@@ -2239,6 +2243,7 @@ local function process_request()
                     
                     -- Parse the request
                     local request = decode_json(request_data)
+                    if request then request_id = request.id end
                     if request and request.func then
                         local fname = request.func
                         local args = request.args or {}
@@ -7250,6 +7255,7 @@ local function process_request()
                     end
                     
                     -- Write response
+                    response.id = request_id
                     local response_json = encode_json(response)
                     log("Sending response " .. i .. ": " .. response_json .. "\n")
                     write_file(numbered_response_file, response_json)
@@ -7261,7 +7267,8 @@ local function process_request()
                     write_file(numbered_response_file, encode_json({
                         ok = false,
                         error = "Malformed request JSON (the bridge could not decode it)",
-                        bridge_version = BRIDGE_VERSION
+                        bridge_version = BRIDGE_VERSION,
+                        id = request_id
                     }))
                 end
             end
@@ -7270,7 +7277,8 @@ local function process_request()
             if not ok then
                 -- Error occurred, write error response
                 reaper.ShowConsoleMsg("ERROR processing request " .. i .. ": " .. tostring(err) .. "\n")
-                local error_response = {ok = false, error = "Bridge error: " .. tostring(err)}
+                local error_response = {ok = false, error = "Bridge error: " .. tostring(err),
+                                       id = request_id}
                 write_file(numbered_response_file, encode_json(error_response))
             end
             
@@ -7282,7 +7290,11 @@ end
 
 -- Main loop
 ensure_dir()
-reaper.ShowConsoleMsg("REAPER MCP Bridge (File-based, Full API) started\n")
+-- The version goes in the banner because REAPER runs the DEPLOYED copy of this script
+-- and no package upgrade updates it. Without it there is no way to see which bridge is
+-- actually running short of opening the file, which is exactly how the server's own
+-- version came to be two releases stale without anyone noticing (#15).
+reaper.ShowConsoleMsg("REAPER MCP Bridge " .. BRIDGE_VERSION .. " (File-based, Full API) started\n")
 reaper.ShowConsoleMsg("Bridge directory: " .. bridge_dir .. "\n")
 
 function main()

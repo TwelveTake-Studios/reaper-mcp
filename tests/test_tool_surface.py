@@ -12,18 +12,25 @@ import json
 
 import reaper_mcp_server as srv
 
-# Measured at 1.6.3: 176 tools, 95,922 bytes (~25,900 tokens), titles stripped and
+# Re-measured for the 1.7.0 optimization pass: 176 tools, 78,588 bytes (~21,200 tokens),
+# down from 95,258. The cut came from hoisting conventions into the server `instructions`
+# block and then deleting the repetition: 51 no-op "Object with success status" Returns
+# blocks, 201 tautological "<x>_index: <X> index (0-based)." Args lines, and the twelve
+# oversized MIDI docstrings. Headroom here is ~3,400 bytes, deliberately tight: it absorbs
+# ordinary docstring edits and a few new tools, not another release quietly adding 28,000.
+#
+# Historical, for context: measured at 1.6.3: 176 tools, 95,922 bytes, titles stripped and
 # descriptions dedented, which makes this number identical on every supported Python.
 # Before the dedent it was 101,286 on 3.10-3.12 and 95,922 on 3.13, so this test passed
 # and failed depending on the interpreter.
 #
 # The headroom is deliberately modest. It absorbs ordinary docstring edits and a handful
 # of new tools; it does not absorb another 28,000-byte release going unnoticed.
-CEILING_BYTES = 100_000
+CEILING_BYTES = 82_000
 
 # Descriptions are ours; schema bytes belong to Pydantic and move when it does. Measured
 # 52,319. This is the ceiling that actually guards against docstring bloat.
-DESCRIPTION_CEILING_BYTES = 56_000
+DESCRIPTION_CEILING_BYTES = 38_000
 
 
 def tools_list_payload():

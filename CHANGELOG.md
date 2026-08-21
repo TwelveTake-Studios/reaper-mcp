@@ -5,6 +5,52 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.0] - 2026-08-21
+
+**The bridge changed — redeploy `reaper_mcp_bridge.lua`** (`twelvetake-reaper-mcp
+--install-bridge`, then re-run the script in REAPER).
+
+### Fixed
+- **A response could be read out of a slot the caller did not own, and nothing noticed.**
+  Exclusive-create claiming makes a slot provably yours, but the transport falls back to
+  an unclaimed write whenever the bridge version probe has no verdict yet — REAPER still
+  starting, a machine under load, a bridge script not re-run after an upgrade — and the
+  response carried nothing to check the answer against. Every request now carries an id
+  and the bridge echoes it on every exit path; an answer bearing someone else's id is
+  left alone for its owner rather than returned. A well-formed wrong answer is far worse
+  than a timeout for anything editing a project. This also closes the abandonment case,
+  where a slot reclaimed after a timeout could still read the previous call's answer
+  because the stale response was newer than the new request.
+  *(Reported by @SNChicago in [issue #16](https://github.com/TwelveTake-Studios/reaper-mcp/issues/16).)*
+- **Every server process started on the same request slot.** The counter began at 0 in
+  each process, so the first unclaimed write of every server targeted `request_1.json`.
+  One stdio server is spawned per MCP client, and ten live processes against one mailbox
+  were observed minutes after a single client restart. The ring now starts at a
+  PID-derived offset.
+
+### Changed
+- **The tool-list payload is 17.5% smaller: 95,258 bytes down to 78,588** (roughly 4,500
+  fewer tokens on every turn of every session, before the user types anything). No tools
+  were added, removed or renamed and no parameter changed, so every 1.6.8 call site keeps
+  working. The conventions that were repeated across 176 docstrings now live once in the
+  server `instructions` block: 0-based indices, the `-1` master case, the `{ok, ...}`
+  envelope, the shared MIDI note filter and its onset-only semantics. That let 51 no-op
+  "Object with success status" Returns blocks, 201 tautological index lines and the twelve
+  oversized MIDI docstrings come out.
+- **MIDI note lists can be trimmed to what the caller needs.** Every note carries ten
+  keys, including its timing in BOTH seconds and beats, so a 256-note item (eight bars of
+  sixteenths) answers in about 43,000 bytes for a single call. Two opt-outs, both
+  defaulting to the existing full response so nothing changes for existing callers:
+  `fields=["pitch","start_beat"]` keeps only the named keys, and `return_notes=False` on a
+  write drops the echo entirely. Asking for beats and dropping selected/muted roughly
+  halves the response. An unrecognised field name is reported in `fields_ignored` and
+  changes nothing: these wrap write tools, and the edit has already happened by the time
+  the filter runs, so a typo in an output filter must not be reported as a failed edit.
+- **The bridge announces its version in the REAPER console at startup.** REAPER runs the
+  deployed copy of the script and no package upgrade updates it, so there was no way to
+  see which bridge was actually running short of opening the file. The banner now reads
+  `REAPER MCP Bridge <version> (File-based, Full API) started`.
+
 ## [1.6.8] - 2026-08-21
 
 **No bridge change.** The bridge stays at 1.6.7; if you redeployed for 1.6.7 you are done.
