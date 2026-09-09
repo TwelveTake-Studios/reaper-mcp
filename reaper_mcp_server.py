@@ -12,7 +12,7 @@ License: MIT
 Version: 1.6.5
 """
 
-__version__ = "1.7.2"
+__version__ = "1.7.3"
 
 import os
 import asyncio
@@ -169,6 +169,8 @@ CONVENTIONS (apply to every tool unless its own description says otherwise):
   with nothing changed.
 - REAPER refuses notes placed before the item start, so timing tools clamp to it rather
   than failing, and report the count in `clamped`.
+- MIDI transform tools answer with {ok, notes_changed, clamped, skipped,
+  out_of_bounds, notes:[...]}.
 - MIDI note lists are large: a 256-note item is roughly 44,000 bytes, because each note
   carries index, pitch, velocity, channel, selected, muted and its timing in BOTH seconds
   (start_time/end_time) and beats (start_beat/end_beat). Two opt-outs, both defaulting to
@@ -177,7 +179,7 @@ CONVENTIONS (apply to every tool unless its own description says otherwise):
   write you are not reading back. An unrecognised field name is reported in
   `fields_ignored` and changes nothing.
 
-IMPORTANT: This server uses FILE-BASED communication by default. The REAPER bridge script must be running in REAPER for tools to work. If a tool returns a timeout error, ensure:
+IMPORTANT: The REAPER bridge script must be running in REAPER for tools to work. If a tool returns a timeout error, ensure:
 1. REAPER is running
 2. The reaper_mcp_bridge.lua script is loaded and running in REAPER
 
@@ -870,7 +872,6 @@ async def take_fx_delete(
     Remove an FX plugin from a take.
 
     Args:
-        fx_index: FX index (0-based) in the take's FX chain.
     """
     err = _validate_indices(
         track_index=track_index, item_index=item_index, take_index=take_index, fx_index=fx_index
@@ -888,7 +889,6 @@ async def take_fx_get_name(
     Get the name of an FX plugin on a take.
 
     Args:
-        fx_index: FX index (0-based) in the take's FX chain.
     """
     err = _validate_indices(
         track_index=track_index, item_index=item_index, take_index=take_index, fx_index=fx_index
@@ -906,7 +906,6 @@ async def take_fx_get_enabled(
     Get the enabled (not bypassed) state of an FX plugin on a take.
 
     Args:
-        fx_index: FX index (0-based) in the take's FX chain.
 
     Returns:
         Object with 'ret' field (boolean).
@@ -927,7 +926,6 @@ async def take_fx_set_enabled(
     Enable or bypass an FX plugin on a take.
 
     Args:
-        fx_index: FX index (0-based) in the take's FX chain.
         enabled: True to enable, False to bypass.
     """
     err = _validate_indices(
@@ -948,7 +946,6 @@ async def take_fx_get_num_params(
     Get the number of parameters for an FX plugin on a take.
 
     Args:
-        fx_index: FX index (0-based) in the take's FX chain.
     """
     err = _validate_indices(
         track_index=track_index, item_index=item_index, take_index=take_index, fx_index=fx_index
@@ -966,7 +963,6 @@ async def take_fx_get_param_name(
     Get the name of a parameter on a take's FX plugin.
 
     Args:
-        fx_index: FX index (0-based) in the take's FX chain.
     """
     err = _validate_indices(
         track_index=track_index, item_index=item_index, take_index=take_index,
@@ -987,7 +983,6 @@ async def take_fx_get_param(
     Get a parameter value on a take's FX plugin.
 
     Args:
-        fx_index: FX index (0-based) in the take's FX chain.
 
     Returns:
         Object with 'value', 'min', and 'max' for the parameter.
@@ -1012,7 +1007,6 @@ async def take_fx_set_param(
     Set a parameter value on a take's FX plugin.
 
     Args:
-        fx_index: FX index (0-based) in the take's FX chain.
         value: New value (typically normalized 0-1; check min/max via take_fx_get_param).
     """
     err = _validate_indices(
@@ -1064,7 +1058,6 @@ async def set_active_take(track_index: int, item_index: int, take_index: int) ->
     Set the active take of a media item (which take plays).
 
     Args:
-        take_index: Take index to activate (0-based).
     """
     err = _validate_indices(track_index=track_index, item_index=item_index, take_index=take_index)
     if err:
@@ -1635,7 +1628,6 @@ async def add_midi_note(
         velocity: Note velocity (1-127).
         start_beat: Start position in beats from the item start (0 = first beat).
         length_beats: Note length in beats (0.25 = sixteenth, 0.5 = eighth, 1.0 = quarter).
-        channel: MIDI channel (0-15, default 0).
 
     Example:
         Four-on-the-floor kick: add_midi_note(0, 0, 36, 110, start_beat=0, length_beats=0.25)
@@ -1831,9 +1823,6 @@ async def transpose_midi_notes(
 
     Args:
         semitones: Signed shift; positive is up, negative is down. 0 = no-op.
-        pitch_low / pitch_high: inclusive pitch bounds for the filter, 0-127.
-        start_beat / end_beat: onset window in beats from the item start.
-        channel: MIDI channel 0-15; -1 = all channels.
 
     Returns:
         {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}, where `notes` is
@@ -1870,12 +1859,7 @@ async def nudge_midi_notes(
 
     Args:
         amount_beats: Signed beat shift (0.25 = a 16th later, -1.0 = a beat earlier). 0 = no-op.
-        pitch_low / pitch_high: inclusive pitch bounds for the filter, 0-127.
-        start_beat / end_beat: onset window in beats from the item start.
-        channel: MIDI channel 0-15; -1 = all channels.
 
-    Returns:
-        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
     """
     if track_index < 0 or item_index < 0:
         return {"ok": False, "error": "track_index and item_index must be >= 0"}
@@ -1981,16 +1965,12 @@ async def ramp_midi_note_velocities(
 
     Velocities interpolate by onset: the earliest note in the filtered set gets
     start_velocity, the latest gets end_velocity, everything between is linear. Notes
-    sharing an onset (a chord) get the same velocity. Results clamp to 1-127. Only notes
-    within pitch_low / pitch_high (inclusive, 0-127), within the onset window start_beat /
-    end_beat (beats from item start), and on channel (0-15, or -1 for all) are ramped.
+    sharing an onset (a chord) get the same velocity. Results clamp to 1-127.
 
     Args:
         start_velocity: Velocity at the earliest onset (1-127; out of range clamps, not an error).
         end_velocity: Velocity at the latest onset (1-127).
 
-    Returns:
-        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
     """
     if track_index < 0 or item_index < 0:
         return {"ok": False, "error": "track_index and item_index must be >= 0"}
@@ -2020,9 +2000,7 @@ async def scale_midi_note_velocities(
     fields: Optional[List[str]] = None
 ) -> dict:
     """    Scale MIDI note velocities: multiply, set to a fixed value, or compress toward a pivot.
-    Results clamp to 1-127. Only notes within pitch_low / pitch_high (inclusive, 0-127),
-    within the onset window start_beat / end_beat (beats from item start), and on channel
-    (0-15, or -1 for all) are touched.
+    Results clamp to 1-127.
 
     Args:
         mode: "multiply" (velocity * ratio), "set" (velocity becomes `value`), or "compress"
@@ -2083,12 +2061,7 @@ async def strum_midi_notes(
         direction: "up" strikes the lowest note of a chord first, "down" the highest.
         chord_window_beats: Onset tolerance for grouping notes into one chord (0 = exact
             same onset).
-        pitch_low / pitch_high: inclusive pitch bounds for the filter, 0-127.
-        start_beat / end_beat: onset window in beats from the item start.
-        channel: MIDI channel 0-15; None or -1 = all channels.
 
-    Returns:
-        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
     """
     if track_index < 0 or item_index < 0:
         return {"ok": False, "error": "track_index and item_index must be >= 0"}
@@ -2145,9 +2118,6 @@ async def snap_midi_notes_to_scale(
             list of semitone intervals from the root, each 0-11 (e.g. [0,2,4,7,9]).
         direction: "nearest" (closest scale tone), "up" or "down" (that way only, skipping
             a note rather than falling back to the other direction).
-        pitch_low / pitch_high: Pitch bounds, 0-127 inclusive.
-        start_beat / end_beat: Bound the note onset, in beats from the item start.
-        channel: 0-15, or -1 for every channel.
 
     Returns:
         {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}; `notes` is the
@@ -2206,12 +2176,7 @@ async def quantize_midi_notes(
             there, 0.0 is a no-op.
         swing: 0.0-1.0. 0.0 = straight, 1.0 = full triplet feel (off-beats at 66.7%),
             scaling linearly between. Only the off-beat (odd) grid cells are delayed.
-        pitch_low / pitch_high: Pitch bounds, 0-127 inclusive.
-        start_beat / end_beat: Bound the note onset, in beats from the item start.
-        channel: 0-15, or -1 for every channel.
 
-    Returns:
-        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
     """
     if track_index < 0 or item_index < 0:
         return {"ok": False, "error": "track_index and item_index must be >= 0"}
@@ -2257,12 +2222,7 @@ async def stretch_midi_notes(
             as long (double-time).
         pivot_beat: The fixed point, in beats from the item start; may be negative. None =
             the earliest targeted onset.
-        pitch_low / pitch_high: Pitch bounds, 0-127 inclusive.
-        start_beat / end_beat: Bound the note onset, in beats from the item start.
-        channel: 0-15, or -1 for every channel.
 
-    Returns:
-        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
     """
     if track_index < 0 or item_index < 0:
         return {"ok": False, "error": "track_index and item_index must be >= 0"}
@@ -2313,10 +2273,6 @@ async def legato_midi_notes(
             channel, keeping interleaved voices independent.
         max_gap_beats: connect only. Gaps wider than this are left as rests (>= 0).
         length_beats: fixed only. The length every targeted note is set to (> 0).
-        pitch_low, pitch_high: The shared pitch filter under this tool's names, 0-127
-            inclusive. start_beat/end_beat bound the note's ONSET, counted from the item
-            start; channel is 0-15,
-            -1 = all.
 
     Returns:
         {ok, notes_changed, clamped, skipped, out_of_bounds, gaps_preserved, notes:[...]}.
@@ -2386,14 +2342,8 @@ async def humanize_midi_notes(
         velocity: Velocity spread (standard deviation, in velocity units); 0.0 leaves
             velocity alone.
         seed: Any integer. The same seed, settings and take give the same result.
-        pitch_low, pitch_high: The shared pitch filter under this tool's names, 0-127
-            inclusive. start_beat/end_beat bound the note's ONSET, counted from the item
-            start; channel is 0-15,
-            -1 = all.
         max_sigma: Cap on how far one note may stray, in multiples of the spread.
 
-    Returns:
-        {ok, notes_changed, clamped, skipped, out_of_bounds, notes:[...]}.
     """
     if track_index < 0 or item_index < 0:
         return {"ok": False, "error": "track_index and item_index must be >= 0"}
@@ -2462,12 +2412,8 @@ async def remove_overlapping_midi_notes(
         mode: "trim" (shorten the earlier note) or "delete" (drop the quieter note).
         min_length_beats: A trimmed note left shorter than this is removed instead. Default
             1/128 of a beat; 0 disables it.
-        pitch_low, pitch_high: The shared pitch filter under this tool's names, 0-127
-            inclusive. Notes outside the filter are invisible: never touched, and never
-            counted as an overlap partner. start_beat/end_beat bound the note's ONSET, counted from the item
-            start, so a note beginning earlier and sustaining into the range is not
-            matched;
-            channel is 0-15, -1 = all.
+        pitch_low, pitch_high: Notes outside the filter are invisible: never touched,
+            and never counted as an overlap partner.
 
     Returns:
         {ok, mode, notes_changed, clamped, skipped, out_of_bounds, notes_removed, trimmed,

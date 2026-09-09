@@ -5,6 +5,28 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.3] - 2026-09-09
+
+The bridge did not change; `BRIDGE_VERSION` stays at 1.7.1 and no redeploy is needed.
+
+### Changed
+- **The tool list is another 2,955 bytes smaller: 79,720 down to 76,765**, roughly 5,000
+  fewer tokens than 1.6.8 on every turn of every session, before you type anything. No tool
+  was added, removed or renamed, and no parameter or behaviour changed, so every 1.7.2 call
+  site keeps working. 1.7.0 moved the shared conventions into the server `instructions`
+  block but left them restated in 27 docstrings: eight `take_fx_*` tools repeating the
+  `fx_index` convention, the shared MIDI note filter spelled out in eight transform tools
+  under four different wordings, the identical `Returns` shape in six of those (now stated
+  once in `instructions`), and the filter restated again in two velocity docstrings.
+  Anything that stated a real per-tool exception was kept, including `delete_track`'s
+  refusal to delete the master track, `set_midi_note`'s clamp landing in `out_of_bounds`
+  rather than `clamped`, and `remove_overlapping_midi_notes` on notes outside the filter
+  never counting as an overlap partner.
+
+### Fixed
+- The server `instructions` block said this server "uses FILE-BASED communication by
+  default", which implied an alternative transport after 1.7.2 removed the only other one.
+
 ## [1.7.2] - 2026-09-09
 
 The bridge did not change; `BRIDGE_VERSION` stays at 1.7.1 and no redeploy is needed.
