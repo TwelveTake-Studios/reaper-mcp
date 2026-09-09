@@ -12,7 +12,7 @@ License: MIT
 Version: 1.6.5
 """
 
-__version__ = "1.7.0"
+__version__ = "1.7.1"
 
 import os
 import asyncio
@@ -334,7 +334,8 @@ async def reaper_call_file(func: str, args: list, timeout: float = None) -> dict
     # process starts its counter over, so pid+counter repeats across restarts, which is
     # exactly when abandoned responses are lying around.
     request_id = uuid.uuid4().hex[:16]
-    payload = json.dumps({"func": func, "args": args, "id": request_id}).encode("utf-8")
+    payload = json.dumps({"func": func, "args": args, "id": request_id},
+                         ensure_ascii=False).encode("utf-8")
 
     # Claim a slot by EXCLUSIVE CREATE rather than trusting the counter.
     #
@@ -429,7 +430,7 @@ async def reaper_call_file(func: str, args: list, timeout: float = None) -> dict
         while time.time() - start_time < deadline:
             if response_file.exists():
                 try:
-                    response_text = response_file.read_text()
+                    response_text = response_file.read_text(encoding="utf-8")
                     if response_text.strip():
                         response_data = json.loads(response_text)
                         answered = response_data.get("id")
@@ -451,7 +452,7 @@ async def reaper_call_file(func: str, args: list, timeout: float = None) -> dict
                         except:
                             pass
                         return response_data
-                except json.JSONDecodeError:
+                except (json.JSONDecodeError, UnicodeDecodeError):
                     pass
                 except OSError:
                     pass

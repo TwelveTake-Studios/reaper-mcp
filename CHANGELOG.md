@@ -5,6 +5,52 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.1] - 2026-09-09
+
+**The bridge changed — redeploy `reaper_mcp_bridge.lua`** (`twelvetake-reaper-mcp
+--install-bridge`, then re-run the script in REAPER).
+
+### Fixed
+- **Every non-ASCII character was destroyed on its way into REAPER.** The server encoded
+  arguments with `json.dumps`, whose default turns any non-ASCII character into a `\uXXXX`
+  escape, and the bridge's decoder had no handler for `\u`, so the backslash was dropped
+  and the digits survived as text. A track named `Café` became `Cafu00e9`, a marker named
+  `Verse — reprise` became `Verse u2014 reprise`, and `可惜没如果` became
+  `u53efu60dcu6ca1u5982u679c`. Media paths were hit the same way, so `insert_audio_file`
+  and `open_project` wrote unopenable paths into the project. This was not locale-specific
+  and not limited to CJK: the mangling happened inside the bridge, so it affected every
+  user on every platform, and the call still reported success. The decoder now decodes
+  `\uXXXX` to UTF-8 in a single left-to-right pass, and the server no longer escapes
+  non-ASCII at all, which fixes the outbound direction even against a bridge that has not
+  been redeployed yet.
+  *(Reported by @incloon in [issue #17](https://github.com/TwelveTake-Studios/reaper-mcp/issues/17).)*
+- **Surrogate pairs are combined rather than dropped.** Characters outside the Basic
+  Multilingual Plane arrive as two `\uXXXX` escapes, and decoding each half separately
+  produces invalid UTF-8. A track named `Gtr 🎸` now round-trips intact. An unpaired half
+  decodes to U+FFFD instead of malformed bytes.
+- **A path segment that looks like an escape is no longer eaten.** `C:\udead\kick.wav` is
+  a legal Windows path. Unescaping in two passes (`\uXXXX` first, then the general case)
+  consumes `\udead` as a codepoint and destroys the path, which is the same failure as the
+  `Temp\reaper` corruption fixed in 1.3.2. The single-pass decoder consumes `\\` atomically
+  and cannot reopen it.
+- **Responses are read as UTF-8 rather than the machine's ANSI codepage.** The bridge
+  always writes UTF-8, but the server read the response with the platform default. On
+  Windows that silently produced mojibake for accented text (`Café` read back as `CafÃ©`)
+  and raised `UnicodeDecodeError` for CJK, surfacing as `File request failed: 'gbk' codec
+  can't decode byte 0xa5`. macOS and Linux were unaffected. A torn read of a partially
+  written response is still retried rather than failing the call.
+- **A control character in a track name no longer reports a phantom timeout.** The bridge
+  encoder escaped only `\`, `"`, `\n` and `\r`, so a name containing a tab produced invalid
+  JSON. The server treated it as an unfinished write and retried until the 5s timeout,
+  whose message blamed REAPER not running. All control characters below U+0020 are now
+  escaped, matching the HTTP transport, which already did this.
+
+### Added
+- Non-ASCII coverage in the test suite, which previously had none: eleven headless tests
+  driving the real bridge Lua, and nineteen live tests round-tripping track, marker and
+  region names through REAPER in Chinese, Japanese, accented Latin, typographic
+  punctuation and emoji.
+
 ## [1.7.0] - 2026-08-21
 
 **The bridge changed — redeploy `reaper_mcp_bridge.lua`** (`twelvetake-reaper-mcp

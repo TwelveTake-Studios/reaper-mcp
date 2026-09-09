@@ -40,6 +40,16 @@ The largest external contribution to this project, across three releases.
   `create_project`'s `name` parameter was never used, and that the call it gated saved an
   untitled project. Shipped in **v1.6.1**, along with a wider audit the report prompted.
 
+### [@incloon](https://github.com/incloon)
+
+- **[Issue #17](https://github.com/TwelveTake-Studios/reaper-mcp/issues/17)** - found that the
+  bridge's JSON decoder had no handler for `\uXXXX`, so the backslash was dropped and the
+  digits survived as literal text: every non-ASCII character the server sent was destroyed on
+  its way into REAPER, and the call still reported success. Identified the exact line, the
+  reason it fails, and the damage downstream, including the unopenable media paths written
+  into the project file. Also reported the second half, that responses were read with the
+  machine's ANSI codepage instead of UTF-8. Shipped in **v1.7.1**.
+
 ---
 
 ## Work in forks that this project has benefited from

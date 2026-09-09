@@ -120,6 +120,26 @@ def lua_decode(decoder_block):
     return _run
 
 
+@pytest.fixture
+def decode_payload(decoder_block):
+    """Decode a payload passed as a Lua global, so no Lua-level escaping distorts it."""
+    def _run(payload, expr="decode_json(PAYLOAD)"):
+        lua = lupa.LuaRuntime(unpack_returned_tuples=True)
+        lua.globals().PAYLOAD = payload
+        return lua.execute(decoder_block + "\nreturn " + expr)
+    return _run
+
+
+@pytest.fixture
+def encode_value(encoder_block):
+    """Encode one Python value through the real encoder; return the raw JSON text."""
+    def _run(value):
+        lua = lupa.LuaRuntime(unpack_returned_tuples=True)
+        lua.globals().VALUE = value
+        return lua.execute(encoder_block + "\nreturn encode_json({ret = VALUE})")
+    return _run
+
+
 def test_decodes_plain_numbers(lua_decode):
     assert lua_decode("return decode_json('42')") == 42
     assert lua_decode("return decode_json('-7')") == -7
@@ -479,3 +499,78 @@ def test_silent_track_reports_a_floor_not_negative_infinity(encoder_block, track
     # a bare "inf" also occurs inside the "info" key and would false-positive.
     assert "-inf" not in raw and "nan" not in raw, raw
     assert json.loads(raw)["info"]["volume_db"] == -150
+
+
+# --- non-ASCII text (issue #17) ---------------------------------------------
+
+TITLE = "可惜没如果"
+
+
+def test_unicode_escapes_decode_to_utf8(decode_payload):
+    r"""\uXXXX had no handler, so the backslash was dropped and 可 arrived as 'u53ef'."""
+    assert decode_payload(json.dumps(TITLE)) == TITLE
+
+
+def test_accented_latin_decodes(decode_payload):
+    """Not a CJK bug: json.dumps escapes é too, so Café arrived as 'Cafu00e9'."""
+    assert decode_payload(json.dumps("Café")) == "Café"
+
+
+def test_surrogate_pair_becomes_one_character(decode_payload):
+    """Astral codepoints arrive as a UTF-16 pair; decoding each half yields invalid UTF-8."""
+    assert decode_payload(json.dumps("Gtr 🎸")) == "Gtr 🎸"
+
+
+def test_lone_surrogate_becomes_the_replacement_character(decode_payload):
+    """An unpaired half is not encodable; emit U+FFFD rather than malformed UTF-8."""
+    assert decode_payload('"\\ud83c"') == "\ufffd"
+    assert decode_payload('"\\udfb8"') == "\ufffd"
+
+
+def test_a_path_segment_that_looks_like_an_escape_survives(decode_payload):
+    r"""C:\udead is a real directory. Unescaping in two passes eats it as \uDEAD."""
+    assert decode_payload(json.dumps("C:\\udead\\kick.wav")) == "C:\\udead\\kick.wav"
+    assert decode_payload(json.dumps("D:\\uface\\snare.wav")) == "D:\\uface\\snare.wav"
+
+
+def test_backslash_is_still_consumed_atomically(decode_payload):
+    r"""The v1.3.2 fix: in Temp\reaper the second backslash + r must not become CR."""
+    assert decode_payload(json.dumps("C:\\Temp\\reaper\\x.wav")) == "C:\\Temp\\reaper\\x.wav"
+
+
+def test_raw_utf8_passes_through_unchanged(decode_payload):
+    """Pins the ensure_ascii=False path, which is what lets an older bridge work."""
+    path = "C:\\Music\\" + TITLE + "\\a.wav"
+    assert decode_payload(json.dumps(TITLE, ensure_ascii=False)) == TITLE
+    assert decode_payload(json.dumps(path, ensure_ascii=False)) == path
+
+
+def test_unicode_survives_the_args_array(decode_payload):
+    """The real call path is an args array, whose scanner splits on quotes and commas."""
+    payload = json.dumps({"func": "insert_audio_file", "args": [0, TITLE], "id": "abc"})
+    assert decode_payload(payload, "decode_json(PAYLOAD).args[2]") == TITLE
+
+
+def test_control_characters_are_escaped(encode_value):
+    """A tab in a track name emitted a raw 0x09, which json.loads rejects outright."""
+    for raw in ["\t", "\n", "\r", "\x00", "\x0b", "\x07", "\x1f"]:
+        emitted = encode_value("a" + raw + "b")
+        assert json.loads(emitted)["ret"] == "a" + raw + "b", emitted
+
+
+def test_encoder_emits_non_ascii_as_utf8(encode_value):
+    """The response is read as UTF-8, so the encoder must not mangle what REAPER returns."""
+    assert json.loads(encode_value(TITLE))["ret"] == TITLE
+    assert json.loads(encode_value("Café 🎸"))["ret"] == "Café 🎸"
+
+
+def test_round_trip_through_both_halves(encoder_block, decoder_block):
+    """Server to bridge and back: what a user asks for is what a later read reports."""
+    for value in [TITLE, "Café", "Gtr 🎸", "Don’t Stop", "C:\\udead\\kick.wav", "Gtr\tDI"]:
+        lua = lupa.LuaRuntime(unpack_returned_tuples=True)
+        lua.globals().PAYLOAD = json.dumps({"args": [0, value]}, ensure_ascii=False)
+        emitted = lua.execute(
+            decoder_block + encoder_block
+            + "\nreturn encode_json({ret = decode_json(PAYLOAD).args[2]})"
+        )
+        assert json.loads(emitted)["ret"] == value

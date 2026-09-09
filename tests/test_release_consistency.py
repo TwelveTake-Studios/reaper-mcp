@@ -5,8 +5,13 @@ and again at 1.6.7, so `--version`, the USAGE header and the startup banner all
 under-reported by two releases (@SNChicago, issue #15). Nothing objected, twice, because
 nothing was checking.
 
-These are separate facts in four files and every one of them is hand-edited at release
+These are separate facts in five files and every one of them is hand-edited at release
 time. This file is the thing that refuses.
+
+README.md was added after its `**Version:**` line sat at 1.6.4 through three releases.
+It is the most-read file in the project -- GitHub renders it, and PyPI renders it as the
+package description -- so it was the most visible stale fact and the only one nothing
+checked.
 
 Read as raw text on purpose, like `test_packaging.py`: `tomllib` is 3.11+ and a release
 guard must not be the thing that breaks on the oldest supported Python.
@@ -21,6 +26,7 @@ REPO = Path(__file__).resolve().parent.parent
 PYPROJECT = REPO / "pyproject.toml"
 BRIDGE = REPO / "reaper_mcp_bridge.lua"
 CHANGELOG = REPO / "CHANGELOG.md"
+README = REPO / "README.md"
 
 SEMVER = r"\d+\.\d+\.\d+"
 
@@ -36,6 +42,12 @@ def package_version() -> str:
 def bridge_version() -> str:
     m = re.search(rf'BRIDGE_VERSION\s*=\s*"({SEMVER})"', BRIDGE.read_text(encoding="utf-8"))
     assert m, "no BRIDGE_VERSION in reaper_mcp_bridge.lua"
+    return m.group(1)
+
+
+def readme_version() -> str:
+    m = re.search(rf"^\*\*Version:\*\*\s*({SEMVER})\s*$", README.read_text(encoding="utf-8"), re.M)
+    assert m, "no '**Version:** x.y.z' line in README.md"
     return m.group(1)
 
 
@@ -125,4 +137,17 @@ def test_a_bridge_change_tells_users_to_redeploy():
         f"BRIDGE_VERSION was bumped to {bridge_version()} for this release, but the "
         f"CHANGELOG entry for {package_version()} never tells anyone to redeploy the "
         "bridge. REAPER keeps running the old deployed copy."
+    )
+
+
+def test_readme_version_matches_pyproject():
+    """The most-read file in the project, and the last one nothing was checking.
+
+    README.md is rendered by GitHub AND by PyPI as the package description, so a stale
+    version line here is the single most visible way to look unmaintained. It sat at
+    1.6.4 while pyproject reached 1.7.0.
+    """
+    assert readme_version() == package_version(), (
+        f"README declares {readme_version()} but pyproject declares {package_version()}. "
+        "Bump both in the same commit."
     )

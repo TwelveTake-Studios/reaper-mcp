@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "twelvetake-reaper-mcp"
-version = "1.7.0"
+version = "1.7.1"
 description = "MCP server for controlling REAPER DAW - mixing, mastering, MIDI composition, and full music production"
 readme = "README.md"
 license = "MIT"
@@ -60,9 +60,10 @@ dev = [
 ]
 
 [project.urls]
-Homepage = "https://twelvetake.com"
+Homepage = "https://twelvetake.com/tools/reaper-mcp/"
 Repository = "https://github.com/TwelveTake-Studios/reaper-mcp"
 Issues = "https://github.com/TwelveTake-Studios/reaper-mcp/issues"
+Changelog = "https://github.com/TwelveTake-Studios/reaper-mcp/blob/main/CHANGELOG.md"
 Funding = "https://buymeacoffee.com/twelvetake"
 
 [project.scripts]

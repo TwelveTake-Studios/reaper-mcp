@@ -4,7 +4,7 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.7.0"
+local BRIDGE_VERSION = "1.7.1"
 
 local bridge_dir = reaper.GetResourcePath() .. '/Scripts/mcp_bridge_data/'
 
@@ -32,6 +32,13 @@ local function as_array(t)
 end
 
 -- Simple JSON encoding (minimal implementation)
+local CONTROL_ESCAPES = { ['\n'] = '\\n', ['\r'] = '\\r', ['\t'] = '\\t',
+                          ['\b'] = '\\b', ['\f'] = '\\f' }
+
+local function escape_control(c)
+    return CONTROL_ESCAPES[c] or string.format('\\u%04X', string.byte(c))
+end
+
 local function encode_json(v)
     if type(v) == "nil" then
         return "null"
@@ -40,8 +47,8 @@ local function encode_json(v)
     elseif type(v) == "number" then
         return tostring(v)
     elseif type(v) == "string" then
-        -- Escape backslashes first, then other special chars
-        return string.format('"%s"', v:gsub('\\', '\\\\'):gsub('"', '\\"'):gsub('\n', '\\n'):gsub('\r', '\\r'))
+        local escaped = v:gsub('\\', '\\\\'):gsub('"', '\\"')
+        return '"' .. escaped:gsub("[\0-\31]", escape_control) .. '"'
     elseif type(v) == "table" then
         local parts = {}
         local is_array = getmetatable(v) == ARRAY_MARKER or #v > 0
@@ -65,6 +72,68 @@ local function encode_json(v)
 end
 
 -- Better JSON decoding that handles arrays properly
+local JSON_ESCAPES = { n = '\n', r = '\r', t = '\t', b = '\b', f = '\f',
+                       ['"'] = '"', ['\\'] = '\\', ['/'] = '/' }
+
+local function utf8_from_codepoint(cp)
+    if cp < 0x80 then
+        return string.char(cp)
+    elseif cp < 0x800 then
+        return string.char(0xC0 + math.floor(cp / 0x40),
+                           0x80 + cp % 0x40)
+    elseif cp < 0x10000 then
+        return string.char(0xE0 + math.floor(cp / 0x1000),
+                           0x80 + math.floor(cp / 0x40) % 0x40,
+                           0x80 + cp % 0x40)
+    else
+        return string.char(0xF0 + math.floor(cp / 0x40000),
+                           0x80 + math.floor(cp / 0x1000) % 0x40,
+                           0x80 + math.floor(cp / 0x40) % 0x40,
+                           0x80 + cp % 0x40)
+    end
+end
+
+local function unescape_string(s)
+    if not s:find('\\', 1, true) then return s end
+    if not s:find('\\u', 1, true) then
+        return (s:gsub('\\(.)', function(c) return JSON_ESCAPES[c] or c end))
+    end
+    local out, i, n = {}, 1, #s
+    while i <= n do
+        local c = s:sub(i, i)
+        if c ~= '\\' then
+            out[#out + 1] = c
+            i = i + 1
+        else
+            local hex = s:sub(i + 1, i + 1) == 'u'
+                        and s:sub(i + 2, i + 5):match('^%x%x%x%x$')
+            if hex then
+                local cp = tonumber(hex, 16)
+                i = i + 6
+                if cp >= 0xD800 and cp <= 0xDBFF then
+                    local tail = s:sub(i, i + 1) == '\\u'
+                                 and s:sub(i + 2, i + 5):match('^%x%x%x%x$')
+                    local low = tail and tonumber(tail, 16)
+                    if low and low >= 0xDC00 and low <= 0xDFFF then
+                        cp = 0x10000 + (cp - 0xD800) * 0x400 + (low - 0xDC00)
+                        i = i + 6
+                    else
+                        cp = 0xFFFD
+                    end
+                elseif cp >= 0xDC00 and cp <= 0xDFFF then
+                    cp = 0xFFFD
+                end
+                out[#out + 1] = utf8_from_codepoint(cp)
+            else
+                local esc = s:sub(i + 1, i + 1)
+                out[#out + 1] = JSON_ESCAPES[esc] or esc
+                i = i + 2
+            end
+        end
+    end
+    return table.concat(out)
+end
+
 local function decode_json(str)
     if not str or str == "" then return nil end
     
@@ -82,14 +151,7 @@ local function decode_json(str)
     elseif str:match("^%-?%d+%.?%d*$") or str:match("^%-?%d+%.?%d*[eE][-+]?%d+$") then
         return tonumber(str)
     elseif str:match('^"(.*)"$') then
-        -- Unescape string in a SINGLE pass so '\\' is consumed atomically.
-        -- (Sequential gsubs corrupted Windows paths: in "Temp\\reaper" the second
-        -- backslash + 'r' matched '\\r' and became a carriage return.)
-        local s = str:match('^"(.*)"$')
-        local escapes = { n = '\n', r = '\r', t = '\t', b = '\b', f = '\f',
-                          ['"'] = '"', ['\\'] = '\\', ['/'] = '/' }
-        s = s:gsub('\\(.)', function(c) return escapes[c] or c end)
-        return s
+        return unescape_string(str:match('^"(.*)"$'))
     elseif str:match("^%[.*%]$") then
         -- Array. The scanner is string-aware: a comma or a bracket inside a quoted
         -- string must not split the element. A track named 'Gtr, DI' used to break

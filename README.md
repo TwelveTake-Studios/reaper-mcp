@@ -6,9 +6,11 @@ A [TwelveTake Studios](https://twelvetake.com) project.
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow)](https://buymeacoffee.com/twelvetake)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-ff5e5b)](https://ko-fi.com/twelvetake)
 
+**[Setup guide, examples and FAQ -> twelvetake.com/tools/reaper-mcp](https://twelvetake.com/tools/reaper-mcp/)**
+
 A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control REAPER DAW for mixing, mastering, MIDI composition, and full music production workflows.
 
-**Version:** 1.6.4
+**Version:** 1.7.1
 
 ## Why This Server
 
@@ -44,7 +46,7 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
 
 ## Requirements
 
-- REAPER (any recent version; full live suite green through **REAPER 7.77**)
+- REAPER (any recent version; full live suite green through **REAPER 7.79**)
 - Python 3.10+ (for the MCP server)
 - An MCP-compatible AI assistant
 
