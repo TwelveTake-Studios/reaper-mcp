@@ -10,7 +10,7 @@ A [TwelveTake Studios](https://twelvetake.com) project.
 
 A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control REAPER DAW for mixing, mastering, MIDI composition, and full music production workflows.
 
-**Version:** 1.7.1
+**Version:** 1.7.2
 
 ## Why This Server
 
@@ -119,7 +119,7 @@ a number back means the server, bridge, and REAPER are all talking.
 To work on the server itself, run it from a clone instead of from PyPI. Install the dependencies:
 
 ```bash
-pip install -r requirements.txt   # or: pip install mcp httpx
+pip install -r requirements.txt   # or: pip install mcp
 ```
 
 Point your MCP client at the local script:
@@ -165,15 +165,10 @@ This pins the Python version and keeps dependencies isolated from your system.
 > **Note:** the `x86_64-linux` dev shell is tested and working. The macOS (Darwin) shells are
 > provided but have **not** been tested — confirmation from a macOS user is welcome.
 
-## Communication Modes
+## How It Communicates
 
-The **file-based bridge is the supported path** — it is reliable and needs no extra setup.
-HTTP mode is **deprecated** (see below).
-
-### File-Based (Default, Recommended)
-
-Uses JSON files for communication. More reliable, no network configuration needed.
-This is the only actively maintained path; all tools are guaranteed to work here.
+The server and the bridge exchange JSON files in a mailbox directory that the bridge script
+polls from inside REAPER. There is no network configuration and no port to open.
 
 ```
 MCP Server                    REAPER Bridge
@@ -194,22 +189,9 @@ MCP Server                    REAPER Bridge
 Override with `REAPER_BRIDGE_DIR` for portable installs. The server prints the directory it
 resolved to stderr on startup, and includes it in any timeout error.
 
-### HTTP Mode (Deprecated)
-
-> **Deprecated as of v1.2.1.** The HTTP bridges (`reaper_web_server.lua` / `reaper_web_server.py`)
-> are kept for existing users but are no longer maintained and will not receive new tools.
-> They may be removed in a future major release (v2.0). Use the file bridge instead.
-
-Uses HTTP requests on localhost. Requires additional setup:
-- **Lua HTTP bridge**: Requires LuaSocket (install via ReaPack → "sockmonkey")
-- **Python HTTP bridge**: Requires Python enabled in REAPER preferences
-
-```bash
-# Set environment variable to use HTTP mode
-REAPER_COMM_MODE=http python reaper_mcp_server.py
-```
-
-**Default port:** 9000
+The HTTP transport that shipped alongside this was removed in v1.7.2. It had been deprecated
+since v1.2.1, and its request parser could never read a POST body, so no call it was handed
+ever reached REAPER. `REAPER_COMM_MODE` no longer does anything.
 
 ## Quick Start Examples
 
@@ -570,8 +552,7 @@ Third-party plugins use their full name as shown in REAPER's FX browser.
 ### "Cannot connect to REAPER"
 1. Ensure REAPER is running
 2. Ensure the bridge script is running (check REAPER's console)
-3. For file mode: verify the bridge directory exists
-4. For HTTP mode: check port 9000 isn't blocked
+3. Verify the bridge directory exists
 
 ### "Track not found"
 - Track indices are 0-based
@@ -579,8 +560,8 @@ Third-party plugins use their full name as shown in REAPER's FX browser.
 - Check track count with `get_track_count()`
 
 ### Bridge script won't load
-- **Lua:** Ensure LuaSocket is installed (ReaPack → "sockmonkey")
-- **Python:** Enable Python in REAPER preferences
+- Deploy it with `twelvetake-reaper-mcp --install-bridge`, then load and run it from
+  REAPER's action list. REAPER runs the deployed copy, not the one in a clone.
 
 ### Slow response
 - File-based mode has ~50ms latency per call
@@ -590,12 +571,9 @@ Third-party plugins use their full name as shown in REAPER's FX browser.
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `REAPER_COMM_MODE` | `file` | Communication mode (`file` or `http`) |
 | `REAPER_BRIDGE_DIR` | REAPER's `Scripts/mcp_bridge_data`, resolved per platform | File bridge directory |
 | `REAPER_FILE_TIMEOUT` | `5.0` | Seconds to wait for the bridge to answer. The bridge answers only once the work finishes, and renders run at roughly realtime, so a render longer than this reports a timeout while REAPER completes it normally. Raise it when rendering; note that a genuinely unreachable bridge then also takes this long to report. |
 | `REAPER_MCP_DEBUG` | unset | Set to `1` before launching REAPER for per-call bridge console logging |
-| `REAPER_HOST` | `localhost` | HTTP bridge host |
-| `REAPER_PORT` | `9000` | HTTP bridge port |
 
 ## Contributing
 

@@ -3,7 +3,7 @@
 TwelveTake REAPER MCP Server
 
 Model Context Protocol server for controlling REAPER DAW.
-Supports both HTTP and file-based communication with REAPER.
+Communicates with REAPER through a file mailbox the bridge script polls.
 
 A TwelveTake Studios project - https://twelvetake.com
 
@@ -12,7 +12,7 @@ License: MIT
 Version: 1.6.5
 """
 
-__version__ = "1.7.1"
+__version__ = "1.7.2"
 
 import os
 import asyncio
@@ -30,11 +30,6 @@ from typing import List, Optional, Union
 from mcp.server.fastmcp import FastMCP
 from mcp.types import ToolAnnotations
 
-try:
-    import httpx
-    HTTPX_AVAILABLE = True
-except ImportError:
-    HTTPX_AVAILABLE = False
 
 
 def db_to_linear(db: float) -> float:
@@ -56,10 +51,6 @@ def _validate_indices(**named) -> Optional[dict]:
 
 
 # Configuration
-REAPER_HOST = os.getenv("REAPER_HOST", "localhost")
-REAPER_PORT = int(os.getenv("REAPER_PORT", "9000"))
-REAPER_URL = f"http://{REAPER_HOST}:{REAPER_PORT}"
-
 # File-based fallback configuration
 
 def reaper_resource_dir() -> Path:
@@ -153,7 +144,6 @@ except ValueError:
     RENDER_TIMEOUT = 600.0
 
 # Communication mode: "file" (default), "http", or "auto" (http with file fallback)
-COMM_MODE = os.getenv("REAPER_COMM_MODE", "file").lower()
 
 # Create MCP server
 mcp = FastMCP(
@@ -207,49 +197,8 @@ Use get_project_summary() first to get complete project context in one call."""
 # than random so a mailbox is reproducible while debugging.
 request_counter = os.getpid() % 999
 
-# HTTP client (reused for connection pooling)
-_http_client = None
-
-
-def get_http_client():
-    """Get or create HTTP client."""
-    global _http_client
-    if _http_client is None and HTTPX_AVAILABLE:
-        _http_client = httpx.Client(timeout=FILE_TIMEOUT)
-    return _http_client
-
-
 # --- Communication Layer ---
 
-async def reaper_call_http(func: str, args: list, timeout: float = None) -> dict:
-    """Call a REAPER function via HTTP bridge.
-
-    Takes the same per-call deadline as the file transport: a render is slow because
-    REAPER is slow, not because of how the request reached it.
-    """
-    if not HTTPX_AVAILABLE:
-        return {"ok": False, "error": "httpx not installed", "fallback": True}
-
-    client = get_http_client()
-    if client is None:
-        return {"ok": False, "error": "HTTP client not available", "fallback": True}
-
-    try:
-        response = client.post(
-            f"{REAPER_URL}/call",
-            json={"func": func, "args": args},
-            timeout=(FILE_TIMEOUT if timeout is None else timeout)
-        )
-        if response.status_code == 200:
-            return response.json()
-        else:
-            return {"ok": False, "error": f"HTTP {response.status_code}", "fallback": True}
-    except httpx.ConnectError:
-        return {"ok": False, "error": "Cannot connect to REAPER HTTP bridge", "fallback": True}
-    except httpx.TimeoutException:
-        return {"ok": False, "error": "HTTP request timed out", "fallback": True}
-    except Exception as e:
-        return {"ok": False, "error": f"HTTP error: {str(e)}", "fallback": True}
 
 
 # Response files this server may sweep. Covers today's response_<n>.json and the
@@ -492,17 +441,8 @@ async def reaper_call_file(func: str, args: list, timeout: float = None) -> dict
 
 
 async def dispatch(func: str, args_list: list, timeout: float = None) -> dict:
-    """Send one call over the configured transport, with no version gate."""
-    if COMM_MODE == "file":
-        return await reaper_call_file(func, args_list, timeout=timeout)
-    elif COMM_MODE == "http":
-        return await reaper_call_http(func, args_list, timeout=timeout)
-    else:  # auto mode
-        result = await reaper_call_http(func, args_list, timeout=timeout)
-        if result.get("fallback"):
-            # HTTP failed, try file-based
-            return await reaper_call_file(func, args_list, timeout=timeout)
-        return result
+    """Send one call over the file transport, with no version gate."""
+    return await reaper_call_file(func, args_list, timeout=timeout)
 
 
 def version_tuple(text: str) -> tuple:
@@ -579,13 +519,7 @@ async def ensure_bridge_current() -> Optional[dict]:
 
 async def reaper_call(func: str, *args, timeout: float = None) -> dict:
     """
-    Call a REAPER function via bridge.
-
-    Uses HTTP by default, falls back to file-based if HTTP unavailable.
-    Set REAPER_COMM_MODE environment variable to force a mode:
-    - "http": HTTP only
-    - "file": File-based only
-    - "auto": HTTP with file fallback (default)
+    Call a REAPER function via the bridge's file mailbox.
 
     `timeout` overrides the deadline for this call only (issue #11). Keyword-only, so
     every existing positional call site keeps passing REAPER arguments and cannot
@@ -3942,7 +3876,6 @@ select {BRIDGE_SCRIPT_NAME}, then run it.
 
 Environment:
   REAPER_BRIDGE_DIR   Override the bridge data directory.
-  REAPER_COMM_MODE    "file" (default), "http", or "auto".
 """
 
 
@@ -4006,22 +3939,21 @@ def main():
 
     # Refuse to start against a bridge directory that cannot work, rather than creating a
     # junk folder and timing out against it on every call for the rest of the session.
-    if BRIDGE_DIR_PROBLEM and COMM_MODE in ("file", "auto"):
+    if BRIDGE_DIR_PROBLEM:
         print(f"error: {BRIDGE_DIR_PROBLEM}", file=sys.stderr)
         raise SystemExit(1)
 
     # This process starts its slot counter at 1, so orphans a dead process left in
     # high slots would otherwise sit in the mailbox forever, and every stale file
     # taxes the bridge's per-tick directory enumeration.
-    if COMM_MODE in ("file", "auto"):
-        swept = sweep_orphaned_responses(BRIDGE_DIR)
-        if swept:
-            print(f"swept {swept} orphaned bridge response file(s) from {BRIDGE_DIR}",
-                  file=sys.stderr)
+    swept = sweep_orphaned_responses(BRIDGE_DIR)
+    if swept:
+        print(f"swept {swept} orphaned bridge response file(s) from {BRIDGE_DIR}",
+              file=sys.stderr)
 
     # stderr, never stdout: stdout carries the MCP JSON-RPC stream. Printing the resolved
     # directory here is what turns "it just times out" into a one-look diagnosis.
-    print(f"twelvetake-reaper-mcp {__version__} | comm mode: {COMM_MODE} | bridge dir: {BRIDGE_DIR}",
+    print(f"twelvetake-reaper-mcp {__version__} | bridge dir: {BRIDGE_DIR}",
           file=sys.stderr)
     mcp.run()
 

@@ -140,22 +140,8 @@ def test_main_sweeps_at_startup(mailbox, monkeypatch):
     age(orphan, 60)
     monkeypatch.setattr(srv, "BRIDGE_DIR", mailbox)
     monkeypatch.setattr(srv, "BRIDGE_DIR_PROBLEM", None)
-    monkeypatch.setattr(srv, "COMM_MODE", "file")
     monkeypatch.setattr(srv.mcp, "run", lambda: None)
     monkeypatch.setattr(srv.sys, "argv", ["twelvetake-reaper-mcp"])
     srv.main()
     assert not orphan.exists()
 
-
-def test_http_mode_does_not_sweep(mailbox, monkeypatch):
-    """HTTP mode never touches the file mailbox, so it must not delete from it either."""
-    orphan = mailbox / "response_15.json"
-    orphan.write_text('{"ok": true}')
-    age(orphan, 60)
-    monkeypatch.setattr(srv, "BRIDGE_DIR", mailbox)
-    monkeypatch.setattr(srv, "BRIDGE_DIR_PROBLEM", None)
-    monkeypatch.setattr(srv, "COMM_MODE", "http")
-    monkeypatch.setattr(srv.mcp, "run", lambda: None)
-    monkeypatch.setattr(srv.sys, "argv", ["twelvetake-reaper-mcp"])
-    srv.main()
-    assert orphan.exists()

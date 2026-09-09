@@ -5,6 +5,25 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.2] - 2026-09-09
+
+The bridge did not change; `BRIDGE_VERSION` stays at 1.7.1 and no redeploy is needed.
+
+### Removed
+- **The HTTP transport, which had not worked for a long time.** Deprecated since v1.2.1 and
+  kept on the assumption that someone might still be using it. They could not have been:
+  `parse_request` in `reaper_web_server.lua` split the request with a pattern that cannot
+  produce an empty string, so the blank line separating headers from body never matched, the
+  body offset was never set, and **every POST body was discarded**. The Python client sent
+  the function name and arguments in that body, so no call it was handed could ever reach
+  REAPER. `reaper_web_server.lua` and `reaper_web_server.py` are deleted, along with
+  `reaper_call_http`, the pooled HTTP client and the transport branch in `dispatch`.
+  Removing it also drops the `httpx` dependency and closes an unauthenticated
+  `load()`-based parser that ran with `Access-Control-Allow-Origin: *`.
+- `REAPER_COMM_MODE`, `REAPER_HOST` and `REAPER_PORT` no longer do anything. The file
+  transport was already the default, so a user who never set them sees no change, and one
+  who set `http` was getting errors rather than results.
+
 ## [1.7.1] - 2026-09-09
 
 **The bridge changed — redeploy `reaper_mcp_bridge.lua`** (`twelvetake-reaper-mcp
