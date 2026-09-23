@@ -61,9 +61,36 @@ class Recorder:
         return self.calls[-1]
 
 
+def _batch_through(call):
+    """Stand-in for reaper_batch that runs each call through `call`, as the bridge does."""
+    async def batch(*calls, timeout=None):
+        results = []
+        for func, *args in calls:
+            result = await call(func, *args)
+            results.append(result)
+            if not result.get("ok"):
+                return {"ok": False, "results": results, "failed_at": len(results) - 1,
+                        "error": result.get("error")}
+        return {"ok": True, "results": results}
+    return batch
+
+
+@pytest.fixture
+def batch_through():
+    return _batch_through
+
+
 @pytest.fixture
 def reaper(monkeypatch):
     """Patch reaper_call with a Recorder and hand it to the test."""
     rec = Recorder()
     monkeypatch.setattr(srv, "reaper_call", rec)
+    monkeypatch.setattr(srv, "reaper_batch", _batch_through(rec))
     return rec
+
+
+@pytest.fixture(autouse=True)
+def keep_mocked_tests_off_the_real_bridge(request, monkeypatch, tmp_path_factory):
+    if request.node.get_closest_marker("live"):
+        return
+    monkeypatch.setattr(srv, "BRIDGE_DIR", tmp_path_factory.mktemp("mailbox"))

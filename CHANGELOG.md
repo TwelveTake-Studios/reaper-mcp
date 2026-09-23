@@ -5,6 +5,43 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.4] - 2026-09-22
+
+**The bridge changed. Redeploy `reaper_mcp_bridge.lua`** (`twelvetake-reaper-mcp
+--install-bridge`, then re-run the script in REAPER). The server refuses an older bridge
+with a message saying so, because a 1.7.3 bridge cannot run the batched calls below.
+
+### Fixed
+- **`undo` could reverse the wrong thing.** Only the eleven MIDI transform tools created
+  an undo point. Everything else, including `delete_track`, `delete_item`,
+  `clear_midi_item` and every mixer and routing edit, left nothing in REAPER's undo
+  history. After an AI deleted a track, `undo` reversed whatever MIDI edit came before
+  it and the track stayed deleted. Now every tool call that edits the project is exactly
+  one step in the undo history, labelled with the tool that made it
+  (`MCP: delete track`), whether it is undone from the AI or with Ctrl+Z.
+- **Edits made of several REAPER calls are now one step.** `insert_track` with a name,
+  `create_bus`, `add_parallel_compression`, `setup_sidechain_send`,
+  `setup_sidechain_compression` and `add_midi_notes_batch` each made several calls and
+  so left several undo points: undoing a named `insert_track` once left the track in
+  place. A new batched request runs all of a tool's calls in one pass inside one undo
+  block, and stops at the first call that fails.
+- `add_midi_notes_batch` reported `ok: true` even when notes failed to insert. It now
+  stops at the first failed note and reports `ok: false` with `failed_at`; the notes
+  before it were inserted and one `undo` removes them all.
+
+### Changed
+- **Every tool now declares MCP annotations explicitly.** 54 read-only tools carry
+  `readOnlyHint`, 29 that delete or overwrite something carry `destructiveHint: true`,
+  and the other 93 carry `destructiveHint: false`. Before, 151 tools had none, which
+  the MCP spec reads as "may be destructive", so a client could not tell `get_tempo`
+  from `delete_track`. The server also uses these to decide which calls become undo
+  steps. Transport, view, selection, `run_action`, `undo`/`redo` themselves and project
+  open, save and render are deliberately not undo steps.
+- The tool list is 84,256 bytes, up from 78,098. That is the cost of the annotations,
+  and 78,098 was already the true figure for 1.7.3: the size check measured names,
+  descriptions and schemas but not annotations, and reported 76,765. It now measures
+  what a client receives.
+
 ## [1.7.3] - 2026-09-09
 
 The bridge did not change; `BRIDGE_VERSION` stays at 1.7.1 and no redeploy is needed.

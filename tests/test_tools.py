@@ -394,13 +394,14 @@ def test_add_parallel_compression_names_the_bus_with_correct_arity(reaper):
     assert renames[0] == ("GetSetMediaTrackInfo_String", [3, "P_NAME", "Parallel Comp Bus", True])
 
 
-def test_create_bus_reports_a_failed_rename_instead_of_claiming_success(monkeypatch):
+def test_create_bus_reports_a_failed_rename_instead_of_claiming_success(monkeypatch, batch_through):
     async def fake(func, *args):
         if func == "GetSetMediaTrackInfo_String":
             return {"ok": False, "error": "Track not found"}
         return {"ok": True, "ret": 3}
 
     monkeypatch.setattr(srv, "reaper_call", fake)
+    monkeypatch.setattr(srv, "reaper_batch", batch_through(fake))
     result = run(srv.create_bus("Drum Bus", [0]))
     assert result["ok"] is False
     assert "naming it failed" in result["error"]
@@ -408,13 +409,14 @@ def test_create_bus_reports_a_failed_rename_instead_of_claiming_success(monkeypa
     assert result["bus_track_index"] == 3
 
 
-def test_add_parallel_compression_reports_a_failed_rename(monkeypatch):
+def test_add_parallel_compression_reports_a_failed_rename(monkeypatch, batch_through):
     async def fake(func, *args):
         if func == "GetSetMediaTrackInfo_String":
             return {"ok": False, "error": "Track not found"}
         return {"ok": True, "ret": 3}
 
     monkeypatch.setattr(srv, "reaper_call", fake)
+    monkeypatch.setattr(srv, "reaper_batch", batch_through(fake))
     result = run(srv.add_parallel_compression(0))
     assert result["ok"] is False
     assert "naming it failed" in result["error"]

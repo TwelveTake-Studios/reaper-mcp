@@ -10,7 +10,7 @@ A [TwelveTake Studios](https://twelvetake.com) project.
 
 A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control REAPER DAW for mixing, mastering, MIDI composition, and full music production workflows.
 
-**Version:** 1.7.3
+**Version:** 1.7.4
 
 ## Why This Server
 
@@ -43,6 +43,8 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
   strum, velocity ramps — each targetable by pitch range, beat window, or channel
 - **Audio items** — import, split, duplicate, fade, position, mute
 - **Markers & regions** — create, edit, navigate, render by region
+- **Undoable edits**: every change the AI makes is one named step in REAPER's undo history
+  ("MCP: delete track"), so Ctrl+Z in REAPER reverses one tool call at a time
 
 ## Requirements
 

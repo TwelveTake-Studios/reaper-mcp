@@ -223,7 +223,7 @@ def test_timeout_is_not_a_version_verdict(monkeypatch):
     assert run(srv.ensure_bridge_current()) is None
     assert srv._bridge_check["done"] is False
 
-    monkeypatch.setattr(srv, "dispatch", _fake_dispatch({"ok": True, "version": "1.6.1"}))
+    monkeypatch.setattr(srv, "dispatch", _fake_dispatch({"ok": True, "version": srv.MIN_BRIDGE_VERSION}))
     assert run(srv.ensure_bridge_current()) is None
 
 

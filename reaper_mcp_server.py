@@ -12,10 +12,12 @@ License: MIT
 Version: 1.6.5
 """
 
-__version__ = "1.7.3"
+__version__ = "1.7.4"
 
 import os
 import asyncio
+import contextvars
+import functools
 import inspect
 import json
 import math
@@ -117,7 +119,7 @@ BRIDGE_DIR_PROBLEM = bridge_dir_problem(BRIDGE_DIR)
 # The bridge script version this server needs. REAPER runs whatever copy is deployed in
 # its Scripts folder, deployed by hand, so the halves drift. Anything older cannot answer
 # GetBridgeVersion and is reported as out of date instead of failing in obscure ways.
-MIN_BRIDGE_VERSION = "1.6.1"
+MIN_BRIDGE_VERSION = "1.7.4"
 
 # How long to wait for the bridge to answer. Configurable because the bridge answers
 # only after the work finishes and renders run at roughly realtime, so 5s reports a
@@ -178,6 +180,10 @@ CONVENTIONS (apply to every tool unless its own description says otherwise):
   for beats and dropping selected/muted roughly halves it), or return_notes=False on a
   write you are not reading back. An unrecognised field name is reported in
   `fields_ignored` and changes nothing.
+- Every tool call that edits the project is ONE step in REAPER's undo history, labelled
+  "MCP: <tool name>", so undo() reverses one tool call at a time; get_undo_state shows
+  whether the next step is yours or the user's. Transport, view,
+  selection, run_action and project open/save/render are not undo steps.
 
 IMPORTANT: The REAPER bridge script must be running in REAPER for tools to work. If a tool returns a timeout error, ensure:
 1. REAPER is running
@@ -256,7 +262,10 @@ def sweep_orphaned_responses(bridge_dir: Path, older_than: Optional[float] = Non
     return swept
 
 
-async def reaper_call_file(func: str, args: list, timeout: float = None) -> dict:
+undo_label = contextvars.ContextVar("undo_label", default=None)
+
+
+async def reaper_call_file(func: str, args: list, timeout: float = None, calls: list = None) -> dict:
     """Call a REAPER function via file-based bridge.
 
     `timeout` overrides the deadline for this one call. FILE_TIMEOUT is read here at call
@@ -285,8 +294,14 @@ async def reaper_call_file(func: str, args: list, timeout: float = None) -> dict
     # process starts its counter over, so pid+counter repeats across restarts, which is
     # exactly when abandoned responses are lying around.
     request_id = uuid.uuid4().hex[:16]
-    payload = json.dumps({"func": func, "args": args, "id": request_id},
-                         ensure_ascii=False).encode("utf-8")
+    if calls is None:
+        request = {"func": func, "args": args, "id": request_id}
+    else:
+        request = {"calls": calls, "id": request_id}
+    undo = undo_label.get()
+    if undo:
+        request["undo"] = undo
+    payload = json.dumps(request, ensure_ascii=False).encode("utf-8")
 
     # Claim a slot by EXCLUSIVE CREATE rather than trusting the counter.
     #
@@ -537,15 +552,30 @@ async def reaper_call(func: str, *args, timeout: float = None) -> dict:
     return await dispatch(func, args_list, timeout=timeout)
 
 
+async def reaper_batch(*calls, timeout: float = None) -> dict:
+    """
+    Run several bridge calls in one request, stopping at the first that fails.
+
+    Each call is a tuple of (func, *args). The bridge runs them in one pass, so an edit
+    made of several calls is a single step in REAPER's undo history. Answers
+    {ok, results: [one response per call run], failed_at, error}.
+    """
+    stale = await ensure_bridge_current()
+    if stale:
+        return stale
+    payload = [{"func": func, "args": list(args)} for func, *args in calls]
+    return await reaper_call_file("batch", [], timeout=timeout, calls=payload)
+
+
 # --- TRACK OPERATIONS ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_track_count() -> dict:
     """Get the total number of tracks in the current REAPER project (excluding master track)."""
     return await reaper_call("CountTracks", 0)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_track(track_index: int) -> dict:
     """
     Get information about a track.
@@ -557,19 +587,19 @@ async def get_track(track_index: int) -> dict:
     return await reaper_call("GetTrackInfo", track_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_all_tracks() -> dict:
     """Get information about all tracks in the project."""
     return await reaper_call("GetAllTracksInfo")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_master_track() -> dict:
     """Get information about the master track."""
     return await reaper_call("GetTrackInfo", -1)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def insert_track(index: int = None, name: str = None) -> dict:
     """
     Insert a new track at the specified index.
@@ -581,22 +611,20 @@ async def insert_track(index: int = None, name: str = None) -> dict:
     Returns:
         Info about the created track.
     """
-    # Get current count if no index specified
     if index is None:
         count_result = await reaper_call("CountTracks", 0)
         index = count_result.get("ret", 0)
 
-    result = await reaper_call("InsertTrackAtIndex", index, True)
+    calls = [("InsertTrackAtIndex", index, True)]
+    if name:
+        calls.append(("GetSetMediaTrackInfo_String", index, "P_NAME", name, True))
+    batch = await reaper_batch(*calls)
+    if not batch.get("ok"):
+        return {"ok": False, "error": batch.get("error", "unknown error")}
+    return batch["results"][0]
 
-    # Set name if provided. (Same leading-0 bug as delete_track had: the bridge
-    # reads args[1] as the track, so the extra 0 named track 0 with a bogus field.)
-    if name and result.get("ok"):
-        await reaper_call("GetSetMediaTrackInfo_String", index, "P_NAME", name, True)
 
-    return result
-
-
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def delete_track(track_index: int) -> dict:
     """
     Delete a track.
@@ -611,7 +639,7 @@ async def delete_track(track_index: int) -> dict:
     return await reaper_call("DeleteTrack", track_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_track_name(track_index: int, name: str) -> dict:
     """
     Set the name of a track.
@@ -622,7 +650,7 @@ async def set_track_name(track_index: int, name: str) -> dict:
     return await reaper_call("GetSetMediaTrackInfo_String", track_index, "P_NAME", name, True)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_track_volume(track_index: int, volume_db: float) -> dict:
     """
     Set the volume of a track in decibels.
@@ -633,7 +661,7 @@ async def set_track_volume(track_index: int, volume_db: float) -> dict:
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "D_VOL", db_to_linear(volume_db))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_track_pan(track_index: int, pan: float) -> dict:
     """
     Set the pan position of a track.
@@ -645,7 +673,7 @@ async def set_track_pan(track_index: int, pan: float) -> dict:
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "D_PAN", pan)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_track_mute(track_index: int, mute: bool) -> dict:
     """
     Set the mute state of a track.
@@ -656,7 +684,7 @@ async def set_track_mute(track_index: int, mute: bool) -> dict:
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "B_MUTE", 1 if mute else 0)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_track_solo(track_index: int, solo: bool) -> dict:
     """
     Set the solo state of a track.
@@ -669,7 +697,7 @@ async def set_track_solo(track_index: int, solo: bool) -> dict:
 
 # --- FX OPERATIONS ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def track_fx_get_count(track_index: int) -> dict:
     """
     Get the number of FX plugins on a track.
@@ -680,7 +708,7 @@ async def track_fx_get_count(track_index: int) -> dict:
     return await reaper_call("TrackFX_GetCount", track_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def track_fx_get_list(track_index: int) -> dict:
     """
     Get list of all FX plugins on a track.
@@ -693,7 +721,7 @@ async def track_fx_get_list(track_index: int) -> dict:
     return await reaper_call("GetTrackFXList", track_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def track_fx_add_by_name(track_index: int, fx_name: str, position: int = -1) -> dict:
     """
     Add an FX plugin to a track by name.
@@ -714,7 +742,7 @@ async def track_fx_add_by_name(track_index: int, fx_name: str, position: int = -
     return await reaper_call("TrackFX_AddByName", track_index, fx_name, False, instantiate)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True))
 async def track_fx_move(track_index: int, fx_index: int, new_position: int) -> dict:
     """
     Move an FX plugin to a new position within the same track's FX chain.
@@ -731,7 +759,7 @@ async def track_fx_move(track_index: int, fx_index: int, new_position: int) -> d
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def track_fx_delete(track_index: int, fx_index: int) -> dict:
     """
     Remove an FX plugin from a track.
@@ -740,7 +768,7 @@ async def track_fx_delete(track_index: int, fx_index: int) -> dict:
     return await reaper_call("TrackFX_Delete", track_index, fx_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def track_fx_get_name(track_index: int, fx_index: int) -> dict:
     """
     Get the name of an FX plugin.
@@ -749,7 +777,7 @@ async def track_fx_get_name(track_index: int, fx_index: int) -> dict:
     return await reaper_call("TrackFX_GetFXName", track_index, fx_index, "")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def track_fx_get_enabled(track_index: int, fx_index: int) -> dict:
     """
     Get the enabled state of an FX plugin.
@@ -760,7 +788,7 @@ async def track_fx_get_enabled(track_index: int, fx_index: int) -> dict:
     return await reaper_call("TrackFX_GetEnabled", track_index, fx_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def track_fx_set_enabled(track_index: int, fx_index: int, enabled: bool) -> dict:
     """
     Enable or disable an FX plugin.
@@ -771,7 +799,7 @@ async def track_fx_set_enabled(track_index: int, fx_index: int, enabled: bool) -
     return await reaper_call("TrackFX_SetEnabled", track_index, fx_index, enabled)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def track_fx_get_num_params(track_index: int, fx_index: int) -> dict:
     """
     Get the number of parameters for an FX plugin.
@@ -780,7 +808,7 @@ async def track_fx_get_num_params(track_index: int, fx_index: int) -> dict:
     return await reaper_call("TrackFX_GetNumParams", track_index, fx_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def track_fx_get_param_name(track_index: int, fx_index: int, param_index: int) -> dict:
     """
     Get the name of an FX parameter.
@@ -789,7 +817,7 @@ async def track_fx_get_param_name(track_index: int, fx_index: int, param_index: 
     return await reaper_call("TrackFX_GetParamName", track_index, fx_index, param_index, "")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def track_fx_get_param(track_index: int, fx_index: int, param_index: int) -> dict:
     """
     Get a specific parameter value of an FX plugin.
@@ -800,7 +828,7 @@ async def track_fx_get_param(track_index: int, fx_index: int, param_index: int) 
     return await reaper_call("TrackFX_GetParam", track_index, fx_index, param_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def track_fx_set_param(track_index: int, fx_index: int, param_index: int, value: float) -> dict:
     """
     Set a parameter value on an FX plugin.
@@ -844,7 +872,7 @@ async def take_fx_get_list(track_index: int, item_index: int, take_index: int) -
     return await reaper_call("TakeFX_GetList", track_index, item_index, take_index)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=False))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def take_fx_add_by_name(
     track_index: int, item_index: int, take_index: int, fx_name: str
 ) -> dict:
@@ -864,7 +892,7 @@ async def take_fx_add_by_name(
     return await reaper_call("TakeFX_AddByName", track_index, item_index, take_index, fx_name)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def take_fx_delete(
     track_index: int, item_index: int, take_index: int, fx_index: int
 ) -> dict:
@@ -918,7 +946,7 @@ async def take_fx_get_enabled(
     return await reaper_call("TakeFX_GetEnabled", track_index, item_index, take_index, fx_index)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True))
 async def take_fx_set_enabled(
     track_index: int, item_index: int, take_index: int, fx_index: int, enabled: bool
 ) -> dict:
@@ -998,7 +1026,7 @@ async def take_fx_get_param(
     )
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True))
 async def take_fx_set_param(
     track_index: int, item_index: int, take_index: int,
     fx_index: int, param_index: int, value: float,
@@ -1052,7 +1080,7 @@ async def get_active_take(track_index: int, item_index: int) -> dict:
     return await reaper_call("GetActiveTakeIndex", track_index, item_index)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True))
 async def set_active_take(track_index: int, item_index: int, take_index: int) -> dict:
     """
     Set the active take of a media item (which take plays).
@@ -1065,7 +1093,7 @@ async def set_active_take(track_index: int, item_index: int, take_index: int) ->
     return await reaper_call("SetActiveTakeByIndex", track_index, item_index, take_index)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def explode_takes(track_index: int, item_index: int) -> dict:
     """
     Explode all takes of a media item in place (each take becomes its own overlapping item).
@@ -1077,7 +1105,7 @@ async def explode_takes(track_index: int, item_index: int) -> dict:
     return await reaper_call("ExplodeTakes", track_index, item_index)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def crop_to_active_take(track_index: int, item_index: int) -> dict:
     """
     Crop a media item to its active take, discarding all other takes.
@@ -1089,7 +1117,7 @@ async def crop_to_active_take(track_index: int, item_index: int) -> dict:
     return await reaper_call("CropToActiveTake", track_index, item_index)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def delete_take(track_index: int, item_index: int, take_index: int) -> dict:
     """
     Delete a specific take from a media item.
@@ -1103,7 +1131,7 @@ async def delete_take(track_index: int, item_index: int, take_index: int) -> dic
     return await reaper_call("DeleteTakeByIndex", track_index, item_index, take_index)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True))
 async def select_comp_lane(track_index: int, lane_index: int) -> dict:
     """
     Make a fixed lane play exclusively on a track (REAPER 7 lane-based comping).
@@ -1122,7 +1150,7 @@ async def select_comp_lane(track_index: int, lane_index: int) -> dict:
 
 # --- ROUTING OPERATIONS ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def create_send(src_track: int, dest_track: int) -> dict:
     """
     Create a send from one track to another.
@@ -1137,7 +1165,7 @@ async def create_send(src_track: int, dest_track: int) -> dict:
     return await reaper_call("CreateTrackSend", src_track, dest_track)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def delete_send(track_index: int, send_index: int) -> dict:
     """
     Delete a send from a track.
@@ -1150,7 +1178,7 @@ async def delete_send(track_index: int, send_index: int) -> dict:
     return await reaper_call("RemoveTrackSend", track_index, 0, send_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_send_volume(track_index: int, send_index: int, volume_db: float) -> dict:
     """
     Set the volume of a track send.
@@ -1162,7 +1190,7 @@ async def set_send_volume(track_index: int, send_index: int, volume_db: float) -
     return await reaper_call("SetTrackSendUIVol", track_index, send_index, db_to_linear(volume_db), 0)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_track_num_sends(track_index: int) -> dict:
     """
     Get the number of sends from a track.
@@ -1172,7 +1200,7 @@ async def get_track_num_sends(track_index: int) -> dict:
     return await reaper_call("GetTrackNumSends", track_index, 0)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_send_dest_channels(track_index: int, send_index: int, dest_chan: int) -> dict:
     """
     Set the destination channels for a send (used for sidechain routing).
@@ -1188,7 +1216,7 @@ async def set_send_dest_channels(track_index: int, send_index: int, dest_chan: i
     return await reaper_call("SetTrackSendInfo_Value", track_index, 0, send_index, "I_DSTCHAN", dest_chan)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_send_source_channels(track_index: int, send_index: int, src_chan: int) -> dict:
     """
     Set the source channels for a send.
@@ -1201,7 +1229,48 @@ async def set_send_source_channels(track_index: int, send_index: int, src_chan: 
     return await reaper_call("SetTrackSendInfo_Value", track_index, 0, send_index, "I_SRCCHAN", src_chan)
 
 
-@mcp.tool()
+def _bus_batch_failure(batch: dict, bus_track_index: int) -> dict:
+    error = batch.get("error", "unknown error")
+    failed_at = batch.get("failed_at")
+    if failed_at is None or failed_at < 1:
+        return {"ok": False, "error": error, "failed_at": failed_at}
+    step = "naming it" if failed_at == 1 else "routing it"
+    return {
+        "ok": False,
+        "error": f"Bus track was created at index {bus_track_index} but {step} failed: {error}",
+        "bus_track_index": bus_track_index,
+        "failed_at": failed_at,
+    }
+
+
+async def _next_send_index(track_index: int) -> dict:
+    count = await reaper_call("GetTrackNumSends", track_index, 0)
+    if not count.get("ok"):
+        return {"ok": False, "error": count.get("error", "Track not found")}
+    return {"ok": True, "send_index": count.get("ret", 0)}
+
+
+async def _create_sidechain_send(src: int, dest: int, volume_db: float, *more_calls) -> dict:
+    nxt = await _next_send_index(src)
+    if not nxt.get("ok"):
+        return nxt
+    send_index = nxt["send_index"]
+    batch = await reaper_batch(
+        ("CreateTrackSend", src, dest),
+        ("SetTrackSendInfo_Value", src, 0, send_index, "I_DSTCHAN", 2),
+        ("SetTrackSendUIVol", src, send_index, db_to_linear(volume_db), 0),
+        *more_calls,
+    )
+    if not batch.get("ok"):
+        return {"ok": False, "error": batch.get("error", "unknown error"),
+                "failed_at": batch.get("failed_at")}
+    created = batch["results"][0].get("ret")
+    if created != send_index:
+        return {"ok": False, "error": f"Send was created at index {created}, expected {send_index}"}
+    return {"ok": True, "send_index": send_index}
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def setup_sidechain_send(src_track: int, dest_track: int, volume_db: float = 0.0) -> dict:
     """
     Create a sidechain send from one track to another track's FX sidechain input.
@@ -1217,18 +1286,10 @@ async def setup_sidechain_send(src_track: int, dest_track: int, volume_db: float
     Returns:
         Object with send_index and routing info.
     """
-    # Create the send
-    send_result = await reaper_call("CreateTrackSend", src_track, dest_track)
-    send_index = send_result.get("ret", 0)
-
-    if not send_result.get("ok", False):
-        return send_result
-
-    # Route to channels 3-4 (sidechain input)
-    # I_DSTCHAN: 0=1-2, 2=3-4 (sidechain), 4=5-6, etc.
-    await reaper_call("SetTrackSendInfo_Value", src_track, 0, send_index, "I_DSTCHAN", 2)
-
-    await reaper_call("SetTrackSendUIVol", src_track, send_index, db_to_linear(volume_db), 0)
+    batch = await _create_sidechain_send(src_track, dest_track, volume_db)
+    if not batch.get("ok"):
+        return batch
+    send_index = batch["send_index"]
 
     return {
         "ok": True,
@@ -1241,7 +1302,7 @@ async def setup_sidechain_send(src_track: int, dest_track: int, volume_db: float
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def configure_reacomp_sidechain(track_index: int, fx_index: int, use_sidechain: bool = True) -> dict:
     """
     Configure ReaComp to use sidechain input for detection.
@@ -1268,7 +1329,7 @@ async def configure_reacomp_sidechain(track_index: int, fx_index: int, use_sidec
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def setup_sidechain_compression(
     trigger_track: int,
     target_track: int,
@@ -1297,20 +1358,13 @@ async def setup_sidechain_compression(
         - Bass is on track 1 with ReaComp at FX index 2
         Call: setup_sidechain_compression(0, 1, 2)
     """
-    # Step 1: Create sidechain send
-    send_result = await reaper_call("CreateTrackSend", trigger_track, target_track)
-    if not send_result.get("ok", False):
-        return {"ok": False, "error": "Failed to create send", "details": send_result}
-
-    send_index = send_result.get("ret", 0)
-
-    # Step 2: Route send to channels 3-4 (sidechain input)
-    await reaper_call("SetTrackSendInfo_Value", trigger_track, 0, send_index, "I_DSTCHAN", 2)
-
-    await reaper_call("SetTrackSendUIVol", trigger_track, send_index, db_to_linear(send_volume_db), 0)
-
-    # Step 4: Configure ReaComp to use sidechain input
-    await reaper_call("TrackFX_SetParam", target_track, compressor_fx_index, 8, 1.0)
+    batch = await _create_sidechain_send(
+        trigger_track, target_track, send_volume_db,
+        ("TrackFX_SetParam", target_track, compressor_fx_index, 8, 1.0),
+    )
+    if not batch.get("ok"):
+        return {"ok": False, "error": "Failed to set up sidechain compression", "details": batch}
+    send_index = batch["send_index"]
 
     return {
         "ok": True,
@@ -1327,19 +1381,19 @@ async def setup_sidechain_compression(
 
 # --- TRANSPORT OPERATIONS ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def play() -> dict:
     """Start playback in REAPER."""
     return await reaper_call("OnPlayButton")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def stop() -> dict:
     """Stop playback in REAPER."""
     return await reaper_call("OnStopButton")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_play_state() -> dict:
     """
     Get the current playback state.
@@ -1350,7 +1404,7 @@ async def get_play_state() -> dict:
     return await reaper_call("GetPlayState")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_cursor_position() -> dict:
     """
     Get the edit cursor position.
@@ -1361,7 +1415,7 @@ async def get_cursor_position() -> dict:
     return await reaper_call("GetCursorPosition")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_cursor_position(position: float) -> dict:
     """
     Set the edit cursor position.
@@ -1375,31 +1429,31 @@ async def set_cursor_position(position: float) -> dict:
 
 # --- PROJECT OPERATIONS ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def save_project() -> dict:
     """Save the current REAPER project."""
     return await reaper_call("Main_SaveProject", 0, False)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_project_path() -> dict:
     """Get the project path."""
     return await reaper_call("GetProjectPath", "")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_project_name() -> dict:
     """Get the project name."""
     return await reaper_call("GetProjectName", 0, "")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_tempo() -> dict:
     """Get the project tempo."""
     return await reaper_call("Master_GetTempo")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_time_signature() -> dict:
     """Get the project time signature."""
     return await reaper_call("GetTimeSignature")
@@ -1407,7 +1461,7 @@ async def get_time_signature() -> dict:
 
 # --- MIXING/MASTERING HELPERS ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def add_mastering_chain() -> dict:
     """
     Add a standard mastering chain to the master track.
@@ -1437,7 +1491,7 @@ async def add_mastering_chain() -> dict:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def add_parallel_compression(track_index: int, blend_db: float = -6.0) -> dict:
     """
     Set up New York style parallel compression for a track.
@@ -1451,47 +1505,36 @@ async def add_parallel_compression(track_index: int, blend_db: float = -6.0) -> 
     Returns:
         Object with bus_track_index, send_index, and compressor_fx_index.
     """
-    # Get current track count
     count_result = await reaper_call("CountTracks", 0)
     new_track_index = count_result.get("ret", 0)
+    nxt = await _next_send_index(track_index)
+    if not nxt.get("ok"):
+        return nxt
+    send_index = nxt["send_index"]
 
-    # Create parallel compression bus
-    await reaper_call("InsertTrackAtIndex", new_track_index, True)
-    # Same leading-0 bug insert_track already fixed (see the note at its call site): the
-    # bridge reads args[1] as the track, so an extra 0 shifted every argument along and
-    # setnewvalue received the NAME, which coerces to false. The call was therefore a
-    # read, the bus was never named, and the tool still reported success.
-    rename = await reaper_call("GetSetMediaTrackInfo_String", new_track_index, "P_NAME", "Parallel Comp Bus", True)
-    if not rename.get("ok"):
-        return {
-            "ok": False,
-            "error": (
-                f"Bus track was created at index {new_track_index} but naming it failed: "
-                f"{rename.get('error', 'unknown error')}"
-            ),
-            "bus_track_index": new_track_index,
-        }
-
-    # Create send from source to bus
-    send_result = await reaper_call("CreateTrackSend", track_index, new_track_index)
-
-    await reaper_call("SetTrackSendUIVol", track_index, send_result.get("ret", 0), db_to_linear(blend_db), 0)
-
-    # Add compressor
-    comp_result = await reaper_call("TrackFX_AddByName", new_track_index, "ReaComp", False, -1)
+    batch = await reaper_batch(
+        ("InsertTrackAtIndex", new_track_index, True),
+        ("GetSetMediaTrackInfo_String", new_track_index, "P_NAME", "Parallel Comp Bus", True),
+        ("CreateTrackSend", track_index, new_track_index),
+        ("SetTrackSendUIVol", track_index, send_index, db_to_linear(blend_db), 0),
+        ("TrackFX_AddByName", new_track_index, "ReaComp", False, -1),
+    )
+    if not batch.get("ok"):
+        return _bus_batch_failure(batch, new_track_index)
+    results = batch["results"]
 
     return {
         "ok": True,
         "source_track": track_index,
         "bus_track_index": new_track_index,
-        "send_index": send_result.get("ret"),
-        "compressor_fx_index": comp_result.get("ret"),
+        "send_index": results[2].get("ret"),
+        "compressor_fx_index": results[4].get("ret"),
         "blend_db": blend_db,
         "note": "Configure compressor for heavy compression. Adjust send level to taste."
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def create_bus(name: str, source_track_indices: list[int]) -> dict:
     """
     Create a submix/stem bus and route specified tracks to it.
@@ -1503,33 +1546,21 @@ async def create_bus(name: str, source_track_indices: list[int]) -> dict:
     Returns:
         Object with bus_track_index and routing info.
     """
-    # Get track count
     count_result = await reaper_call("CountTracks", 0)
     new_track_index = count_result.get("ret", 0)
 
-    # Create bus track
-    await reaper_call("InsertTrackAtIndex", new_track_index, True)
-    # See the note in add_parallel_compression: the leading 0 shifted every argument and
-    # made this a read, so the bus silently kept its default name.
-    rename = await reaper_call("GetSetMediaTrackInfo_String", new_track_index, "P_NAME", name, True)
-    if not rename.get("ok"):
-        return {
-            "ok": False,
-            "error": (
-                f"Bus track was created at index {new_track_index} but naming it failed: "
-                f"{rename.get('error', 'unknown error')}"
-            ),
-            "bus_track_index": new_track_index,
-        }
+    batch = await reaper_batch(
+        ("InsertTrackAtIndex", new_track_index, True),
+        ("GetSetMediaTrackInfo_String", new_track_index, "P_NAME", name, True),
+        *[("CreateTrackSend", src_idx, new_track_index) for src_idx in source_track_indices],
+    )
+    if not batch.get("ok"):
+        return _bus_batch_failure(batch, new_track_index)
 
-    # Create sends from each source track
-    sends_created = []
-    for src_idx in source_track_indices:
-        send_result = await reaper_call("CreateTrackSend", src_idx, new_track_index)
-        sends_created.append({
-            "source_track": src_idx,
-            "send_index": send_result.get("ret")
-        })
+    sends_created = [
+        {"source_track": src_idx, "send_index": result.get("ret")}
+        for src_idx, result in zip(source_track_indices, batch["results"][2:])
+    ]
 
     return {
         "ok": True,
@@ -1540,7 +1571,7 @@ async def create_bus(name: str, source_track_indices: list[int]) -> dict:
     }
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def add_eq(track_index: int) -> dict:
     """
     Add ReaEQ to a track.
@@ -1551,7 +1582,7 @@ async def add_eq(track_index: int) -> dict:
     return await reaper_call("TrackFX_AddByName", track_index, "ReaEQ", False, -1)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def add_compressor(track_index: int) -> dict:
     """
     Add ReaComp to a track.
@@ -1562,7 +1593,7 @@ async def add_compressor(track_index: int) -> dict:
     return await reaper_call("TrackFX_AddByName", track_index, "ReaComp", False, -1)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def add_limiter(track_index: int) -> dict:
     """
     Add ReaLimit (brickwall limiter) to a track.
@@ -1575,7 +1606,7 @@ async def add_limiter(track_index: int) -> dict:
 
 # --- MIDI OPERATIONS ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def create_midi_item(track_index: int, position: float, length: float) -> dict:
     """
     Create an empty MIDI item on a track.
@@ -1592,7 +1623,7 @@ async def create_midi_item(track_index: int, position: float, length: float) -> 
     return await reaper_call("CreateMIDIItem", track_index, position, position + length)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_midi_item(track_index: int, item_index: int) -> dict:
     """
     Get information about a MIDI item.
@@ -1610,7 +1641,7 @@ async def _beats_to_seconds(beats: float) -> float:
     return (beats / tempo) * 60.0
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def add_midi_note(
     track_index: int,
     item_index: int,
@@ -1642,7 +1673,7 @@ async def add_midi_note(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def add_midi_notes_batch(
     track_index: int,
     item_index: int,
@@ -1661,11 +1692,11 @@ async def add_midi_notes_batch(
     tempo_result = await reaper_call("Master_GetTempo")
     tempo = tempo_result.get("ret") or 120.0
 
-    results = []
+    calls = []
     for note in notes:
         start_time = (note.get("start_beat", 0) / tempo) * 60.0
         length = (note.get("length_beats", 1.0) / tempo) * 60.0
-        result = await reaper_call(
+        calls.append((
             "InsertMIDINote",
             track_index,
             item_index,
@@ -1674,12 +1705,19 @@ async def add_midi_notes_batch(
             length,
             note.get("velocity", 100),
             note.get("channel", 0)
-        )
-        results.append(result)
+        ))
+    if not calls:
+        return {"ok": True, "notes_added": 0, "results": []}
+    batch = await reaper_batch(*calls)
+    results = batch.get("results", [])
+    if not batch.get("ok"):
+        return {"ok": False, "error": batch.get("error", "unknown error"),
+                "failed_at": batch.get("failed_at"),
+                "notes_added": max(len(results) - 1, 0), "results": results}
     return {"ok": True, "notes_added": len(results), "results": results}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_midi_notes(track_index: int, item_index: int, fields: Optional[List[str]] = None) -> dict:
     """
     Get all MIDI notes from an item.
@@ -1691,7 +1729,7 @@ async def get_midi_notes(track_index: int, item_index: int, fields: Optional[Lis
                         fields=fields)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def delete_midi_note(track_index: int, item_index: int, note_index: int) -> dict:
     """
     Delete a MIDI note from an item.
@@ -1700,7 +1738,7 @@ async def delete_midi_note(track_index: int, item_index: int, note_index: int) -
     return await reaper_call("MIDI_DeleteNote", track_index, item_index, note_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def clear_midi_item(track_index: int, item_index: int) -> dict:
     """
     Delete all MIDI notes from an item.
@@ -1711,7 +1749,7 @@ async def clear_midi_item(track_index: int, item_index: int) -> dict:
     return await reaper_call("ClearMIDIItem", track_index, item_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_midi_note_velocity(
     track_index: int,
     item_index: int,
@@ -1803,7 +1841,7 @@ def _midi_note_filter(
     return filt
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def transpose_midi_notes(
     track_index: int,
     item_index: int,
@@ -1838,7 +1876,7 @@ async def transpose_midi_notes(
     return _shape_notes(await reaper_call("TransposeMIDINotes", track_index, item_index, int(round(semitones)), filt), return_notes, fields)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def nudge_midi_notes(
     track_index: int,
     item_index: int,
@@ -1871,7 +1909,7 @@ async def nudge_midi_notes(
     return _shape_notes(await reaper_call("NudgeMIDINotes", track_index, item_index, float(amount_beats), filt), return_notes, fields)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_selected_midi_notes(track_index: int, item_index: int, fields: Optional[List[str]] = None) -> dict:
     """
     Read the MIDI notes currently SELECTED in REAPER's editor for the active take.
@@ -1891,7 +1929,7 @@ async def get_selected_midi_notes(track_index: int, item_index: int, fields: Opt
                         fields=fields)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_midi_note(
     track_index: int,
     item_index: int,
@@ -1947,7 +1985,7 @@ async def set_midi_note(
     return _shape_notes(await reaper_call("SetMIDINote", track_index, item_index, note_index, edits), return_notes, fields)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def ramp_midi_note_velocities(
     track_index: int,
     item_index: int,
@@ -1983,7 +2021,7 @@ async def ramp_midi_note_velocities(
                              int(start_velocity), int(end_velocity), filt), return_notes, fields)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def scale_midi_note_velocities(
     track_index: int,
     item_index: int,
@@ -2037,7 +2075,7 @@ async def scale_midi_note_velocities(
                              mode, float(ratio), int(value), int(pivot), filt), return_notes, fields)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def strum_midi_notes(
     track_index: int,
     item_index: int,
@@ -2089,7 +2127,7 @@ _SCALE_MODES = ("major", "minor", "harmonic_minor", "melodic_minor", "dorian", "
                 "blues", "whole_tone", "chromatic", "ionian", "aeolian", "natural_minor")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def snap_midi_notes_to_scale(
     track_index: int,
     item_index: int,
@@ -2148,7 +2186,7 @@ async def snap_midi_notes_to_scale(
                              int(root), mode, direction, filt), return_notes, fields)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def quantize_midi_notes(
     track_index: int,
     item_index: int,
@@ -2195,7 +2233,7 @@ async def quantize_midi_notes(
                              float(grid), float(strength), float(swing), filt), return_notes, fields)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def stretch_midi_notes(
     track_index: int,
     item_index: int,
@@ -2242,7 +2280,7 @@ async def stretch_midi_notes(
     return _shape_notes(await reaper_call("StretchMIDINotes", track_index, item_index, float(factor), opts), return_notes, fields)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def legato_midi_notes(
     track_index: int,
     item_index: int,
@@ -2308,7 +2346,7 @@ async def legato_midi_notes(
 _WIRE_DECIMALS = 4
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def humanize_midi_notes(
     track_index: int,
     item_index: int,
@@ -2383,7 +2421,7 @@ async def humanize_midi_notes(
 
 # The only v1.6.0 tool that removes notes rather than moving them, so it is the only one
 # carrying destructiveHint -- an MCP client can warn before calling it.
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def remove_overlapping_midi_notes(
     track_index: int,
     item_index: int,
@@ -2436,7 +2474,7 @@ async def remove_overlapping_midi_notes(
 
 # --- AUDIO ITEM OPERATIONS ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def insert_audio_file(track_index: int, file_path: str, position: float) -> dict:
     """
     Insert an audio file onto a track.
@@ -2459,7 +2497,7 @@ async def insert_audio_file(track_index: int, file_path: str, position: float) -
     return await reaper_call("InsertAudioFile", track_index, file_path, position)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_track_items(track_index: int) -> dict:
     """
     Get all media items on a track.
@@ -2470,7 +2508,7 @@ async def get_track_items(track_index: int) -> dict:
     return await reaper_call("GetTrackItems", track_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_item_info(track_index: int, item_index: int) -> dict:
     """
     Get information about a media item.
@@ -2481,7 +2519,7 @@ async def get_item_info(track_index: int, item_index: int) -> dict:
     return await reaper_call("GetItemInfo", track_index, item_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_item_position(track_index: int, item_index: int, position: float) -> dict:
     """
     Set the position of a media item.
@@ -2493,7 +2531,7 @@ async def set_item_position(track_index: int, item_index: int, position: float) 
     return await reaper_call("SetMediaItemInfo_Value", track_index, item_index, "D_POSITION", position)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_item_length(track_index: int, item_index: int, length: float) -> dict:
     """
     Set the length of a media item.
@@ -2505,7 +2543,7 @@ async def set_item_length(track_index: int, item_index: int, length: float) -> d
     return await reaper_call("SetMediaItemInfo_Value", track_index, item_index, "D_LENGTH", length)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def delete_item(track_index: int, item_index: int) -> dict:
     """
     Delete a media item.
@@ -2514,7 +2552,7 @@ async def delete_item(track_index: int, item_index: int) -> dict:
     return await reaper_call("DeleteTrackMediaItem", track_index, item_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def duplicate_item(track_index: int, item_index: int) -> dict:
     """
     Duplicate a media item.
@@ -2525,7 +2563,7 @@ async def duplicate_item(track_index: int, item_index: int) -> dict:
     return await reaper_call("DuplicateItem", track_index, item_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def split_item(track_index: int, item_index: int, position: float) -> dict:
     """
     Split a media item at a position.
@@ -2539,7 +2577,7 @@ async def split_item(track_index: int, item_index: int, position: float) -> dict
     return await reaper_call("SplitMediaItem", track_index, item_index, position)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_item_mute(track_index: int, item_index: int, mute: bool) -> dict:
     """
     Mute or unmute a media item.
@@ -2551,7 +2589,7 @@ async def set_item_mute(track_index: int, item_index: int, mute: bool) -> dict:
     return await reaper_call("SetMediaItemInfo_Value", track_index, item_index, "B_MUTE", 1 if mute else 0)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_item_volume(track_index: int, item_index: int, volume_db: float) -> dict:
     """
     Set the volume of a media item.
@@ -2563,7 +2601,7 @@ async def set_item_volume(track_index: int, item_index: int, volume_db: float) -
     return await reaper_call("SetMediaItemInfo_Value", track_index, item_index, "D_VOL", db_to_linear(volume_db))
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_item_fade_in(track_index: int, item_index: int, length: float) -> dict:
     """
     Set the fade-in length of a media item.
@@ -2575,7 +2613,7 @@ async def set_item_fade_in(track_index: int, item_index: int, length: float) -> 
     return await reaper_call("SetMediaItemInfo_Value", track_index, item_index, "D_FADEINLEN", length)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_item_fade_out(track_index: int, item_index: int, length: float) -> dict:
     """
     Set the fade-out length of a media item.
@@ -2589,7 +2627,7 @@ async def set_item_fade_out(track_index: int, item_index: int, length: float) ->
 
 # --- PROJECT OPERATIONS (Extended) ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_tempo(bpm: float) -> dict:
     """
     Set the project tempo.
@@ -2601,7 +2639,7 @@ async def set_tempo(bpm: float) -> dict:
     return await reaper_call("SetCurrentBPM", 0, bpm, True)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_time_signature(numerator: int, denominator: int) -> dict:
     """
     Set the project time signature.
@@ -2614,7 +2652,7 @@ async def set_time_signature(numerator: int, denominator: int) -> dict:
     return await reaper_call("SetTimeSignature", numerator, denominator)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def create_project() -> dict:
     """
     Create a new REAPER project.
@@ -2631,7 +2669,7 @@ async def create_project() -> dict:
     return await reaper_call("Main_OnCommand", 40023, 0)  # File: New project
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def open_project(path: str) -> dict:
     """
     Open a REAPER project file.
@@ -2643,7 +2681,7 @@ async def open_project(path: str) -> dict:
     return await reaper_call("Main_openProject", path)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, destructiveHint=True))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def render_project(
     output_path: str,
     start_time: float = None,
@@ -2687,7 +2725,7 @@ async def render_project(
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def render_region(region_index: int, output_path: str) -> dict:
     """
     NOT IMPLEMENTED. Use render_project with the region's start/end from get_regions.
@@ -2708,7 +2746,7 @@ async def render_region(region_index: int, output_path: str) -> dict:
 
 # --- MARKERS AND REGIONS ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def add_marker(position: float, name: str = "", color: int = 0) -> dict:
     """
     Add a marker at a position.
@@ -2724,7 +2762,7 @@ async def add_marker(position: float, name: str = "", color: int = 0) -> dict:
     return await reaper_call("AddProjectMarker2", 0, False, position, 0, name, -1, color)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def add_region(start: float, end: float, name: str = "", color: int = 0) -> dict:
     """
     Add a region.
@@ -2741,7 +2779,7 @@ async def add_region(start: float, end: float, name: str = "", color: int = 0) -
     return await reaper_call("AddProjectMarker2", 0, True, start, end, name, -1, color)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_markers() -> dict:
     """
     Get all markers in the project.
@@ -2752,7 +2790,7 @@ async def get_markers() -> dict:
     return await reaper_call("GetProjectMarkers")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_regions() -> dict:
     """
     Get all regions in the project.
@@ -2763,7 +2801,7 @@ async def get_regions() -> dict:
     return await reaper_call("GetProjectRegions")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def delete_marker(marker_index: int) -> dict:
     """
     Delete a marker by index.
@@ -2772,7 +2810,7 @@ async def delete_marker(marker_index: int) -> dict:
     return await reaper_call("DeleteProjectMarker", 0, marker_index, False)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def delete_region(region_index: int) -> dict:
     """
     Delete a region by index.
@@ -2781,7 +2819,7 @@ async def delete_region(region_index: int) -> dict:
     return await reaper_call("DeleteProjectMarker", 0, region_index, True)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def go_to_marker(marker_index: int) -> dict:
     """
     Move the edit cursor to a marker.
@@ -2790,7 +2828,7 @@ async def go_to_marker(marker_index: int) -> dict:
     return await reaper_call("GoToMarker", 0, marker_index, False)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def go_to_region(region_index: int) -> dict:
     """
     Move the edit cursor to a region start.
@@ -2801,7 +2839,7 @@ async def go_to_region(region_index: int) -> dict:
 
 # --- AUTOMATION ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_track_envelope(track_index: int, envelope_name: str) -> dict:
     """
     Get a track envelope by name.
@@ -2815,7 +2853,7 @@ async def get_track_envelope(track_index: int, envelope_name: str) -> dict:
     return await reaper_call("GetTrackEnvelopeByName", track_index, envelope_name)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_envelope_point_count(track_index: int, envelope_name: str) -> dict:
     """
     Get the number of points in an envelope.
@@ -2829,7 +2867,7 @@ async def get_envelope_point_count(track_index: int, envelope_name: str) -> dict
     return await reaper_call("CountEnvelopePoints", track_index, envelope_name)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def add_envelope_point(
     track_index: int,
     envelope_name: str,
@@ -2852,7 +2890,7 @@ async def add_envelope_point(
     return await reaper_call("InsertEnvelopePoint", track_index, envelope_name, time, value, shape, 0, False, False)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_envelope_points(track_index: int, envelope_name: str) -> dict:
     """
     Get all points from an envelope.
@@ -2866,7 +2904,7 @@ async def get_envelope_points(track_index: int, envelope_name: str) -> dict:
     return await reaper_call("GetEnvelopePoints", track_index, envelope_name)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def delete_envelope_point(track_index: int, envelope_name: str, point_index: int) -> dict:
     """
     Delete an envelope point.
@@ -2878,7 +2916,7 @@ async def delete_envelope_point(track_index: int, envelope_name: str, point_inde
     return await reaper_call("DeleteEnvelopePoint", track_index, envelope_name, point_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def clear_envelope(track_index: int, envelope_name: str) -> dict:
     """
     Delete all points from an envelope.
@@ -2890,7 +2928,7 @@ async def clear_envelope(track_index: int, envelope_name: str) -> dict:
     return await reaper_call("ClearEnvelope", track_index, envelope_name)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_track_automation_mode(track_index: int, mode: int) -> dict:
     """
     Set the automation mode for a track.
@@ -2902,7 +2940,7 @@ async def set_track_automation_mode(track_index: int, mode: int) -> dict:
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "I_AUTOMODE", mode)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def arm_track_envelope(track_index: int, envelope_name: str, arm: bool = True) -> dict:
     """
     Arm or disarm an envelope for recording.
@@ -2917,7 +2955,7 @@ async def arm_track_envelope(track_index: int, envelope_name: str, arm: bool = T
 
 # --- FX PARAMETER AUTOMATION ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def get_fx_envelope(track_index: int, fx_index: int, param_index: int) -> dict:
     """
     Get or create an automation envelope for an FX parameter.
@@ -2934,7 +2972,7 @@ async def get_fx_envelope(track_index: int, fx_index: int, param_index: int) -> 
     return await reaper_call("GetFXEnvelope", track_index, fx_index, param_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def add_fx_envelope_point(
     track_index: int,
     fx_index: int,
@@ -2957,7 +2995,7 @@ async def add_fx_envelope_point(
     return await reaper_call("AddFXEnvelopePoint", track_index, fx_index, param_index, time, value, shape)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_fx_envelope_points(track_index: int, fx_index: int, param_index: int) -> dict:
     """
     Get all automation points from an FX parameter envelope.
@@ -2968,7 +3006,7 @@ async def get_fx_envelope_points(track_index: int, fx_index: int, param_index: i
     return await reaper_call("GetFXEnvelopePoints", track_index, fx_index, param_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def delete_fx_envelope_point(
     track_index: int,
     fx_index: int,
@@ -2985,7 +3023,7 @@ async def delete_fx_envelope_point(
     return await reaper_call("DeleteFXEnvelopePoint", track_index, fx_index, param_index, point_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def clear_fx_envelope(track_index: int, fx_index: int, param_index: int) -> dict:
     """
     Clear all automation points from an FX parameter envelope.
@@ -2998,7 +3036,7 @@ async def clear_fx_envelope(track_index: int, fx_index: int, param_index: int) -
 
 # --- SELECTION AND EDITING ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def undo() -> dict:
     """
     Undo the last action in REAPER.
@@ -3009,7 +3047,7 @@ async def undo() -> dict:
     return await reaper_call("Undo_DoUndo2", 0)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def redo() -> dict:
     """
     Redo the last undone action in REAPER.
@@ -3020,7 +3058,7 @@ async def redo() -> dict:
     return await reaper_call("Undo_DoRedo2", 0)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_undo_state() -> dict:
     """
     Get the current undo/redo state.
@@ -3031,7 +3069,7 @@ async def get_undo_state() -> dict:
     return await reaper_call("GetUndoState")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def select_track(track_index: int, exclusive: bool = True) -> dict:
     """
     Select a track.
@@ -3045,7 +3083,7 @@ async def select_track(track_index: int, exclusive: bool = True) -> dict:
     return await reaper_call("SetTrackSelected", track_index, True)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def select_all_tracks() -> dict:
     """
     Select all tracks.
@@ -3054,7 +3092,7 @@ async def select_all_tracks() -> dict:
     return await reaper_call("Main_OnCommand", 40296, 0)  # Select all tracks
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def unselect_all_tracks() -> dict:
     """
     Unselect all tracks.
@@ -3063,7 +3101,7 @@ async def unselect_all_tracks() -> dict:
     return await reaper_call("Main_OnCommand", 40297, 0)  # Unselect all tracks
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_selected_tracks() -> dict:
     """
     Get indices of all selected tracks.
@@ -3074,7 +3112,7 @@ async def get_selected_tracks() -> dict:
     return await reaper_call("GetSelectedTracks")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def select_all_items() -> dict:
     """
     Select all media items.
@@ -3083,7 +3121,7 @@ async def select_all_items() -> dict:
     return await reaper_call("Main_OnCommand", 40182, 0)  # Select all items
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def unselect_all_items() -> dict:
     """
     Unselect all media items.
@@ -3092,7 +3130,7 @@ async def unselect_all_items() -> dict:
     return await reaper_call("Main_OnCommand", 40289, 0)  # Unselect all items
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_selected_items() -> dict:
     """
     Get all selected media items.
@@ -3103,7 +3141,7 @@ async def get_selected_items() -> dict:
     return await reaper_call("GetSelectedItems")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def copy_selected_items() -> dict:
     """
     Copy selected items to clipboard.
@@ -3112,7 +3150,7 @@ async def copy_selected_items() -> dict:
     return await reaper_call("Main_OnCommand", 40057, 0)  # Copy items
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def cut_selected_items() -> dict:
     """
     Cut selected items to clipboard.
@@ -3121,7 +3159,7 @@ async def cut_selected_items() -> dict:
     return await reaper_call("Main_OnCommand", 40059, 0)  # Cut items
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def paste_items() -> dict:
     """
     Paste items from clipboard at edit cursor.
@@ -3130,7 +3168,7 @@ async def paste_items() -> dict:
     return await reaper_call("Main_OnCommand", 40058, 0)  # Paste items
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def delete_selected_items() -> dict:
     """
     Delete all selected items.
@@ -3139,7 +3177,7 @@ async def delete_selected_items() -> dict:
     return await reaper_call("Main_OnCommand", 40006, 0)  # Remove items
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_time_selection(start: float, end: float) -> dict:
     """
     Set the time selection.
@@ -3152,7 +3190,7 @@ async def set_time_selection(start: float, end: float) -> dict:
     return await reaper_call("SetTimeSelection", start, end)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_time_selection() -> dict:
     """
     Get the current time selection.
@@ -3163,7 +3201,7 @@ async def get_time_selection() -> dict:
     return await reaper_call("GetSet_LoopTimeRange", False, False, 0, 0, False)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def clear_time_selection() -> dict:
     """
     Clear the time selection.
@@ -3174,7 +3212,7 @@ async def clear_time_selection() -> dict:
 
 # --- MIXER ENHANCEMENTS ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_track_phase(track_index: int, invert: bool) -> dict:
     """
     Set the phase inversion of a track.
@@ -3186,7 +3224,7 @@ async def set_track_phase(track_index: int, invert: bool) -> dict:
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "B_PHASE", 1 if invert else 0)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_track_width(track_index: int, width: float) -> dict:
     """
     Set the stereo width of a track.
@@ -3199,7 +3237,7 @@ async def set_track_width(track_index: int, width: float) -> dict:
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "D_WIDTH", width)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_track_as_folder(track_index: int, folder_depth: int) -> dict:
     """
     Set a track as a folder parent or child.
@@ -3211,7 +3249,7 @@ async def set_track_as_folder(track_index: int, folder_depth: int) -> dict:
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "I_FOLDERDEPTH", folder_depth)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def arm_track(track_index: int, arm: bool = True) -> dict:
     """
     Arm or disarm a track for recording.
@@ -3223,7 +3261,7 @@ async def arm_track(track_index: int, arm: bool = True) -> dict:
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "I_RECARM", 1 if arm else 0)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_track_input(track_index: int, input_index: int) -> dict:
     """
     Set the record input for a track.
@@ -3235,7 +3273,7 @@ async def set_track_input(track_index: int, input_index: int) -> dict:
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "I_RECINPUT", input_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_track_monitor(track_index: int, monitor: int) -> dict:
     """
     Set the monitor mode for a track.
@@ -3247,7 +3285,7 @@ async def set_track_monitor(track_index: int, monitor: int) -> dict:
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "I_RECMON", monitor)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_track_color(track_index: int, r: int, g: int, b: int) -> dict:
     """
     Set the color of a track.
@@ -3263,7 +3301,7 @@ async def set_track_color(track_index: int, r: int, g: int, b: int) -> dict:
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "I_CUSTOMCOLOR", color)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_track_peak(track_index: int, channel: int = 0) -> dict:
     """
     Get the current peak level of a track.
@@ -3294,7 +3332,7 @@ async def get_track_peak_hold(track_index: int, channel: int = 0) -> dict:
     return await reaper_call("Track_GetPeakHoldDB", track_index, channel)
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True))
 async def clear_all_peak_indicators() -> dict:
     """
     Clear the peak hold indicators on all tracks (including master).
@@ -3316,7 +3354,7 @@ async def get_track_master_send(track_index: int) -> dict:
     return await reaper_call("GetMediaTrackInfo_Value", track_index, "B_MAINSEND")
 
 
-@mcp.tool(annotations=ToolAnnotations(readOnlyHint=False, idempotentHint=True))
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True))
 async def set_track_master_send(track_index: int, enabled: bool) -> dict:
     """
     Enable or disable the master/parent send on a track.
@@ -3335,7 +3373,7 @@ async def set_track_master_send(track_index: int, enabled: bool) -> dict:
 
 # --- ADVANCED FEATURES ---
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def run_action(action_id: int) -> dict:
     """
     Run a REAPER action by command ID.
@@ -3347,7 +3385,7 @@ async def run_action(action_id: int) -> dict:
     return await reaper_call("Main_OnCommand", action_id, 0)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def run_action_by_name(action_name: str) -> dict:
     """
     Run a REAPER action by its named command id.
@@ -3383,7 +3421,7 @@ async def run_action_by_name(action_name: str) -> dict:
     return await reaper_call("Main_OnCommand", cmd_id, 0)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_fx_presets(track_index: int, fx_index: int) -> dict:
     """
     Get list of presets available for an FX.
@@ -3394,7 +3432,7 @@ async def get_fx_presets(track_index: int, fx_index: int) -> dict:
     return await reaper_call("TrackFX_GetPresetList", track_index, fx_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_fx_preset(track_index: int, fx_index: int) -> dict:
     """
     Get the current preset name of an FX.
@@ -3405,7 +3443,7 @@ async def get_fx_preset(track_index: int, fx_index: int) -> dict:
     return await reaper_call("TrackFX_GetPreset", track_index, fx_index, "")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_fx_preset(track_index: int, fx_index: int, preset_name: str) -> dict:
     """
     Set the preset of an FX.
@@ -3417,7 +3455,7 @@ async def set_fx_preset(track_index: int, fx_index: int, preset_name: str) -> di
     return await reaper_call("TrackFX_SetPreset", track_index, fx_index, preset_name)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def save_fx_preset(track_index: int, fx_index: int, preset_name: str) -> dict:
     """
     Save the current FX settings as a preset.
@@ -3463,7 +3501,7 @@ _EQ_BANDTYPE_NAMES = {
 _EQ_PARAMTYPE_NAMES = {0: "freq", 1: "gain", 2: "Q"}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_eq_bands(track_index: int, fx_index: int) -> dict:
     """
     Get all ReaEQ band settings in one structured call.
@@ -3507,7 +3545,7 @@ async def get_eq_bands(track_index: int, fx_index: int) -> dict:
     return {"ok": True, "bands": bands, "param_count": num_params}
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_eq_band(track_index: int, fx_index: int, bandtype: int, bandidx: int,
                       paramtype: int, value: float, is_normalized: bool = False) -> dict:
     """
@@ -3540,7 +3578,7 @@ async def set_eq_band(track_index: int, fx_index: int, bandtype: int, bandidx: i
                              bandtype, bandidx, paramtype, value, False)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_eq_band_enabled(track_index: int, fx_index: int, bandtype: int,
                               bandidx: int = 0) -> dict:
     """
@@ -3557,7 +3595,7 @@ async def get_eq_band_enabled(track_index: int, fx_index: int, bandtype: int,
     return await reaper_call("TrackFX_GetEQBandEnabled", track_index, fx_index, bandtype, bandidx)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def set_eq_band_enabled(track_index: int, fx_index: int, bandtype: int,
                               bandidx: int = 0, enabled: bool = True) -> dict:
     """
@@ -3573,7 +3611,7 @@ async def set_eq_band_enabled(track_index: int, fx_index: int, bandtype: int,
     return await reaper_call("TrackFX_SetEQBandEnabled", track_index, fx_index, bandtype, bandidx, enabled)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def find_eq(track_index: int, instantiate: bool = False) -> dict:
     """
     Find ReaEQ on a track, optionally adding it if absent.
@@ -3587,7 +3625,7 @@ async def find_eq(track_index: int, instantiate: bool = False) -> dict:
     return await reaper_call("TrackFX_GetEQ", track_index, instantiate)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_track_fx_chunk(track_index: int, fx_index: int) -> dict:
     """
     Get the raw state chunk from an FX plugin (includes preset/state data).
@@ -3601,7 +3639,7 @@ async def get_track_fx_chunk(track_index: int, fx_index: int) -> dict:
     return await reaper_call("GetFXChunk", track_index, fx_index)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_project_length() -> dict:
     """
     Get the length of the project (end of last item).
@@ -3612,7 +3650,7 @@ async def get_project_length() -> dict:
     return await reaper_call("GetProjectLength", 0)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_project_summary() -> dict:
     """
     Get a comprehensive summary of the current REAPER project.
@@ -3644,7 +3682,7 @@ async def get_project_summary() -> dict:
     return await reaper_call("GetProjectSummary")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_play_position() -> dict:
     """
     Get the current playback position.
@@ -3655,7 +3693,7 @@ async def get_play_position() -> dict:
     return await reaper_call("GetPlayPosition")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def record() -> dict:
     """
     Start recording in REAPER.
@@ -3664,7 +3702,7 @@ async def record() -> dict:
     return await reaper_call("OnRecordButton")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def pause() -> dict:
     """
     Pause playback in REAPER.
@@ -3673,7 +3711,7 @@ async def pause() -> dict:
     return await reaper_call("OnPauseButton")
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def toggle_repeat() -> dict:
     """
     Toggle repeat/loop mode.
@@ -3684,7 +3722,7 @@ async def toggle_repeat() -> dict:
     return await reaper_call("Main_OnCommand", 1068, 0)  # Toggle repeat
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_repeat_state() -> dict:
     """
     Get the current repeat state.
@@ -3695,7 +3733,7 @@ async def get_repeat_state() -> dict:
     return await reaper_call("GetSetRepeat", -1)
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def zoom_to_selection() -> dict:
     """
     Zoom the arrange view to the time selection.
@@ -3704,7 +3742,7 @@ async def zoom_to_selection() -> dict:
     return await reaper_call("Main_OnCommand", 40031, 0)  # Zoom to time selection
 
 
-@mcp.tool()
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def zoom_to_project() -> dict:
     """
     Zoom the arrange view to show the entire project.
@@ -3802,6 +3840,55 @@ def normalize_tool_descriptions() -> int:
 # Run at import so the savings apply however the server is started.
 _SCHEMA_BYTES_SAVED = slim_tool_schemas()
 _DESCRIPTION_BYTES_SAVED = normalize_tool_descriptions()
+
+
+UNDO_EXEMPT_TOOLS = frozenset({
+    "undo", "redo",
+    "play", "stop", "pause", "record", "toggle_repeat",
+    "set_cursor_position", "go_to_marker", "go_to_region",
+    "zoom_to_selection", "zoom_to_project",
+    "select_track", "select_all_tracks", "unselect_all_tracks",
+    "select_all_items", "unselect_all_items", "copy_selected_items",
+    "set_time_selection", "clear_time_selection", "clear_all_peak_indicators",
+    "create_project", "open_project", "save_project",
+    "render_project", "render_region", "save_fx_preset",
+    "run_action", "run_action_by_name",
+})
+
+
+def undo_step_label(tool_name: str) -> str:
+    return "MCP: " + tool_name.replace("_", " ")
+
+
+def _in_undo_step(fn, label):
+    @functools.wraps(fn)
+    async def step(*args, **kwargs):
+        token = undo_label.set(undo_label.get() or label)
+        try:
+            return await fn(*args, **kwargs)
+        finally:
+            undo_label.reset(token)
+    return step
+
+
+def wrap_tools_in_undo_steps() -> list:
+    manager = getattr(mcp, "_tool_manager", None)
+    if manager is None or not callable(getattr(manager, "list_tools", None)):
+        return []
+    wrapped = []
+    for tool in manager.list_tools():
+        annotations = tool.annotations
+        if annotations is not None and annotations.readOnlyHint:
+            continue
+        if tool.name in UNDO_EXEMPT_TOOLS or getattr(tool.fn, "__wrapped__", None):
+            continue
+        tool.fn = _in_undo_step(tool.fn, undo_step_label(tool.name))
+        globals()[tool.name] = tool.fn
+        wrapped.append(tool.name)
+    return wrapped
+
+
+UNDO_STEP_TOOLS = wrap_tools_in_undo_steps()
 
 
 # --- MAIN ---

@@ -4,7 +4,7 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.7.1"
+local BRIDGE_VERSION = "1.7.4"
 
 local bridge_dir = reaper.GetResourcePath() .. '/Scripts/mcp_bridge_data/'
 
@@ -2271,48 +2271,8 @@ local function reap_abandoned_responses(responses)
 end
 
 -- Main processing function
-local function process_request()
-    local pending, responses = scan_mailbox()
-    reap_abandoned_responses(responses)
-    for _, req in ipairs(pending) do
-        -- `i` is the slot TEXT exactly as it appeared on disk, so the request is opened
-        -- under the name that was actually enumerated and the response mirrors its
-        -- padding -- the caller finds the answer where it is waiting for it.
-        local i = req.label
-        local numbered_request_file = bridge_dir .. req.name
-        local numbered_response_file = bridge_dir .. 'response_' .. i .. '.json'
-        
-        if file_exists(numbered_request_file) then
-            -- Echoed back on every exit path so the server can prove the answer in a
-            -- slot is the answer to ITS question. Declared out here because the error
-            -- handler below lives outside the pcall closure and needs it too.
-            local request_id = nil
-            -- Wrap in pcall to catch any errors
-            local ok, err = pcall(function()
-                -- Read and process request
-                local request_data = read_file(numbered_request_file)
-                -- An empty request is the server mid-claim, not a bad request. It
-                -- claims its slot with O_CREAT|O_EXCL, which makes request_N.json
-                -- visible here at zero bytes, then clears any stale response_N, and
-                -- only then writes the payload. That order is forced: unlinking the
-                -- stale response after writing the payload would race the answer we
-                -- are about to produce and delete it. So the empty window is real and
-                -- must be waited out. Answering it would hand the caller a false
-                -- "Malformed request JSON" for a request it was still writing.
-                if request_data and request_data:match("^%s*$") then request_data = nil end
-                if request_data then
-                    log("Processing request " .. i .. ": " .. request_data .. "\n")
-                    
-                    -- Parse the request
-                    local request = decode_json(request_data)
-                    if request then request_id = request.id end
-                    if request and request.func then
-                        local fname = request.func
-                        local args = request.args or {}
-                    
-                    -- Call the REAPER function
-                    local response = {ok = false}
-                    
+local function dispatch_call(fname, args)
+    local response = {ok = false}
                     -- Handle all API functions
                                         if DSL_FUNCTIONS[fname] then
                         local result = DSL_FUNCTIONS[fname](table.unpack(args))
@@ -7315,7 +7275,73 @@ local function process_request()
                             response.error = "Unknown function: " .. fname
                         end
                     end
+    return response
+end
+
+local function process_request()
+    local pending, responses = scan_mailbox()
+    reap_abandoned_responses(responses)
+    for _, req in ipairs(pending) do
+        -- `i` is the slot TEXT exactly as it appeared on disk, so the request is opened
+        -- under the name that was actually enumerated and the response mirrors its
+        -- padding -- the caller finds the answer where it is waiting for it.
+        local i = req.label
+        local numbered_request_file = bridge_dir .. req.name
+        local numbered_response_file = bridge_dir .. 'response_' .. i .. '.json'
+        
+        if file_exists(numbered_request_file) then
+            -- Echoed back on every exit path so the server can prove the answer in a
+            -- slot is the answer to ITS question. Declared out here because the error
+            -- handler below lives outside the pcall closure and needs it too.
+            local request_id = nil
+            local undo_label = nil
+            -- Wrap in pcall to catch any errors
+            local ok, err = pcall(function()
+                -- Read and process request
+                local request_data = read_file(numbered_request_file)
+                -- An empty request is the server mid-claim, not a bad request. It
+                -- claims its slot with O_CREAT|O_EXCL, which makes request_N.json
+                -- visible here at zero bytes, then clears any stale response_N, and
+                -- only then writes the payload. That order is forced: unlinking the
+                -- stale response after writing the payload would race the answer we
+                -- are about to produce and delete it. So the empty window is real and
+                -- must be waited out. Answering it would hand the caller a false
+                -- "Malformed request JSON" for a request it was still writing.
+                if request_data and request_data:match("^%s*$") then request_data = nil end
+                if request_data then
+                    log("Processing request " .. i .. ": " .. request_data .. "\n")
                     
+                    -- Parse the request
+                    local request = decode_json(request_data)
+                    if request then request_id = request.id end
+                    if request and (request.func or request.calls) then
+                    local response
+                    if type(request.undo) == "string" and request.undo ~= "" then
+                        undo_label = request.undo
+                        reaper.Undo_BeginBlock()
+                    end
+                    
+                    if type(request.calls) == "table" then
+                        response = {ok = true, results = as_array({})}
+                        for n, call in ipairs(request.calls) do
+                            local result = dispatch_call(call.func, call.args or {})
+                            response.results[n] = result
+                            if not result.ok then
+                                response.ok = false
+                                response.failed_at = n - 1
+                                response.error = result.error
+                                break
+                            end
+                        end
+                    else
+                        response = dispatch_call(request.func, request.args or {})
+                    end
+
+                    if undo_label then
+                        reaper.Undo_EndBlock(undo_label, -1)
+                        undo_label = nil
+                    end
+
                     -- Write response
                     response.id = request_id
                     local response_json = encode_json(response)
@@ -7339,6 +7365,9 @@ local function process_request()
             if not ok then
                 -- Error occurred, write error response
                 reaper.ShowConsoleMsg("ERROR processing request " .. i .. ": " .. tostring(err) .. "\n")
+                if undo_label then
+                    reaper.Undo_EndBlock(undo_label, -1)
+                end
                 local error_response = {ok = false, error = "Bridge error: " .. tostring(err),
                                        id = request_id}
                 write_file(numbered_response_file, encode_json(error_response))

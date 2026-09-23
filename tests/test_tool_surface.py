@@ -26,7 +26,7 @@ import reaper_mcp_server as srv
 #
 # The headroom is deliberately modest. It absorbs ordinary docstring edits and a handful
 # of new tools; it does not absorb another 28,000-byte release going unnoticed.
-CEILING_BYTES = 78_000
+CEILING_BYTES = 85_500
 
 # Descriptions are ours; schema bytes belong to Pydantic and move when it does. Measured
 # 52,319. This is the ceiling that actually guards against docstring bloat.
@@ -35,10 +35,13 @@ DESCRIPTION_CEILING_BYTES = 34_000
 
 def tools_list_payload():
     """The tool list as a client receives it, in the shape tools/list serialises."""
-    return [
-        {"name": t.name, "description": t.description or "", "inputSchema": t.parameters}
-        for t in srv.mcp._tool_manager.list_tools()
-    ]
+    payload = []
+    for t in srv.mcp._tool_manager.list_tools():
+        entry = {"name": t.name, "description": t.description or "", "inputSchema": t.parameters}
+        if t.annotations is not None:
+            entry["annotations"] = t.annotations.model_dump(exclude_none=True)
+        payload.append(entry)
+    return payload
 
 
 def test_payload_stays_under_ceiling():
