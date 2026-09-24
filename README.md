@@ -2,7 +2,7 @@
 
 A [TwelveTake Studios](https://twelvetake.com) project.
 
-[![Tools](https://img.shields.io/badge/tools-176-blue)](https://github.com/TwelveTake-Studios/reaper-mcp)
+[![Tools](https://img.shields.io/badge/tools-177-blue)](https://github.com/TwelveTake-Studios/reaper-mcp)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow)](https://buymeacoffee.com/twelvetake)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-ff5e5b)](https://ko-fi.com/twelvetake)
 
@@ -10,7 +10,7 @@ A [TwelveTake Studios](https://twelvetake.com) project.
 
 A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control REAPER DAW for mixing, mastering, MIDI composition, and full music production workflows.
 
-**Version:** 1.7.4
+**Version:** 1.7.5
 
 ## Why This Server
 
@@ -32,7 +32,7 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
 - **Stock REAPER Lua only** — the bridge script has no dependencies, nothing extra to install in REAPER
 - Copy the script, run it, connect your AI assistant
 
-### 176 Tools Covering Real Production Needs
+### 177 Tools Covering Real Production Needs
 
 - **Full FX control** — add/remove plugins, get/set any parameter by index, manage presets, bypass
 - **FX parameter automation** — automate any plugin knob (flanger depth, filter cutoff, etc.)
@@ -383,7 +383,7 @@ Multi-take workflows: list/switch/delete takes, explode/crop, REAPER 7 fixed-lan
 | `get_project_path()` | Get project directory |
 | `get_project_name()` | Get project filename |
 | `get_project_length()` | Get project length (seconds) |
-| `get_tempo()` | Get project tempo (BPM) |
+| `get_tempo()` | Tempo at project start (BPM), plus every tempo marker |
 | `set_tempo(bpm)` | Set project tempo |
 | `get_time_signature()` | Get time signature |
 | `set_time_signature(num, denom)` | Set time signature |
@@ -405,7 +405,7 @@ Multi-take workflows: list/switch/delete takes, explode/crop, REAPER 7 fixed-lan
 | `clear_midi_item(track, item)` | Delete all notes |
 | `set_midi_note_velocity(track, item, note, vel)` | Change note velocity |
 
-### MIDI Utilities (13 tools)
+### MIDI Utilities (14 tools)
 
 Editing tools for notes that already exist. Every one takes the same optional filter — a pitch
 range, an onset window in beats from the item start, and a channel — so you can target a phrase
@@ -425,6 +425,7 @@ without selecting anything by hand. Timing is in beats, pitch in semitones. Each
 | `scale_midi_note_velocities(track, item, mode, ratio, ...)` | Multiply / set / compress velocities |
 | `set_midi_note(track, item, note, ...)` | Edit one note's pitch, velocity, timing, channel |
 | `get_selected_midi_notes(track, item)` | Read the notes selected in REAPER's editor |
+| `select_midi_notes(track, item, ...)` | Select the notes matching a pitch/beat/channel filter |
 | `remove_overlapping_midi_notes(track, item, mode, ...)` | Trim or delete overlapping same-pitch notes |
 
 `remove_overlapping_midi_notes` is the only one here that can remove notes; the rest only move

@@ -227,13 +227,35 @@ def test_timeout_is_not_a_version_verdict(monkeypatch):
     assert run(srv.ensure_bridge_current()) is None
 
 
-def test_probe_runs_once_then_caches(monkeypatch):
-    fake = _fake_dispatch({"ok": True, "version": "1.6.1"})
+def test_a_pass_is_probed_once_then_cached(monkeypatch):
+    fake = _fake_dispatch({"ok": True, "version": srv.MIN_BRIDGE_VERSION})
     monkeypatch.setattr(srv, "dispatch", fake)
     run(srv.ensure_bridge_current())
     run(srv.ensure_bridge_current())
     run(srv.ensure_bridge_current())
     assert len(fake.calls) == 1
+
+
+@pytest.mark.parametrize("stale", [
+    {"ok": True, "version": "1.6.0"},
+    {"ok": False, "error": "Unknown function: GetBridgeVersion"},
+])
+def test_a_redeployed_bridge_clears_the_refusal_without_a_reconnect(monkeypatch, stale):
+    monkeypatch.setattr(srv, "dispatch", _fake_dispatch(stale))
+    assert run(srv.reaper_call("CountTracks", 0))["ok"] is False
+    assert run(srv.reaper_call("CountTracks", 0))["ok"] is False
+
+    current = {"ok": True, "version": srv.MIN_BRIDGE_VERSION}
+
+    async def redeployed(func, args, timeout=None):
+        redeployed.calls.append(func)
+        return current if func == "GetBridgeVersion" else {"ok": True, "ret": 3}
+    redeployed.calls = []
+    monkeypatch.setattr(srv, "dispatch", redeployed)
+
+    assert run(srv.reaper_call("CountTracks", 0)) == {"ok": True, "ret": 3}
+    assert run(srv.reaper_call("CountTracks", 0)) == {"ok": True, "ret": 3}
+    assert redeployed.calls == ["GetBridgeVersion", "CountTracks", "CountTracks"]
 
 
 def test_stale_bridge_short_circuits_a_real_tool_call(monkeypatch):

@@ -12,7 +12,7 @@ License: MIT
 Version: 1.6.5
 """
 
-__version__ = "1.7.4"
+__version__ = "1.7.5"
 
 import os
 import asyncio
@@ -119,7 +119,7 @@ BRIDGE_DIR_PROBLEM = bridge_dir_problem(BRIDGE_DIR)
 # The bridge script version this server needs. REAPER runs whatever copy is deployed in
 # its Scripts folder, deployed by hand, so the halves drift. Anything older cannot answer
 # GetBridgeVersion and is reported as out of date instead of failing in obscure ways.
-MIN_BRIDGE_VERSION = "1.7.4"
+MIN_BRIDGE_VERSION = "1.7.5"
 
 # How long to wait for the bridge to answer. Configurable because the bridge answers
 # only after the work finishes and renders run at roughly realtime, so 5s reports a
@@ -497,11 +497,12 @@ async def ensure_bridge_current() -> Optional[dict]:
     the argument list rather than failing. A shortened argument list is a wrong edit to
     the user's project, so a stale bridge is refused rather than used.
 
-    A probe that merely times out (REAPER closed) is NOT cached, so the real call still
-    gets to report the real problem.
+    Only a pass is cached. A refusal is re-probed on the next call, so redeploying the
+    bridge and re-running it in REAPER clears the refusal without reconnecting the server.
+    A probe that merely times out (REAPER closed) is not a verdict at all.
     """
     if _bridge_check["done"]:
-        return _bridge_check["error"]
+        return None
 
     result = await dispatch("GetBridgeVersion", [])
 
@@ -516,12 +517,13 @@ async def ensure_bridge_current() -> Optional[dict]:
                 "error": f"Bridge script is out of date (deployed {deployed}, need {MIN_BRIDGE_VERSION})",
                 "hint": _STALE_BRIDGE_HINT,
             }
+            return _bridge_check["error"]
+        _bridge_check["error"] = None
         _bridge_check["done"] = True
-        return _bridge_check["error"]
+        return None
 
     # A bridge older than 1.6.1 has no GetBridgeVersion handler and says so.
     if "Unknown function" in str(result.get("error", "")):
-        _bridge_check["done"] = True
         _bridge_check["error"] = {
             "ok": False,
             "error": f"Bridge script is out of date (pre-{MIN_BRIDGE_VERSION}, cannot report its version)",
@@ -1250,12 +1252,24 @@ async def _next_send_index(track_index: int) -> dict:
     return {"ok": True, "send_index": count.get("ret", 0)}
 
 
+REACOMP_DETECTOR_PARAM = 8
+REACOMP_DETECTOR_MAIN = 0.0
+REACOMP_DETECTOR_AUX = 2 / 1084
+
+
 async def _create_sidechain_send(src: int, dest: int, volume_db: float, *more_calls) -> dict:
     nxt = await _next_send_index(src)
     if not nxt.get("ok"):
         return nxt
     send_index = nxt["send_index"]
+    nchan = await reaper_call("GetMediaTrackInfo_Value", dest, "I_NCHAN")
+    if not nchan.get("ok"):
+        return {"ok": False, "error": nchan.get("error", "Destination track not found")}
+    widen = []
+    if (nchan.get("ret") or 2) < 4:
+        widen = [("SetMediaTrackInfo_Value", dest, "I_NCHAN", 4)]
     batch = await reaper_batch(
+        *widen,
         ("CreateTrackSend", src, dest),
         ("SetTrackSendInfo_Value", src, 0, send_index, "I_DSTCHAN", 2),
         ("SetTrackSendUIVol", src, send_index, db_to_linear(volume_db), 0),
@@ -1264,7 +1278,7 @@ async def _create_sidechain_send(src: int, dest: int, volume_db: float, *more_ca
     if not batch.get("ok"):
         return {"ok": False, "error": batch.get("error", "unknown error"),
                 "failed_at": batch.get("failed_at")}
-    created = batch["results"][0].get("ret")
+    created = batch["results"][len(widen)].get("ret")
     if created != send_index:
         return {"ok": False, "error": f"Send was created at index {created}, expected {send_index}"}
     return {"ok": True, "send_index": send_index}
@@ -1315,10 +1329,8 @@ async def configure_reacomp_sidechain(track_index: int, fx_index: int, use_sidec
     Returns:
         Object with configuration status.
     """
-    # ReaComp parameter 8 (SignIn) controls detector input
-    # 0 = main input, 1 = auxiliary/sidechain input
-    value = 1.0 if use_sidechain else 0.0
-    result = await reaper_call("TrackFX_SetParam", track_index, fx_index, 8, value)
+    value = REACOMP_DETECTOR_AUX if use_sidechain else REACOMP_DETECTOR_MAIN
+    result = await reaper_call("TrackFX_SetParam", track_index, fx_index, REACOMP_DETECTOR_PARAM, value)
 
     return {
         "ok": result.get("ok", False),
@@ -1360,7 +1372,8 @@ async def setup_sidechain_compression(
     """
     batch = await _create_sidechain_send(
         trigger_track, target_track, send_volume_db,
-        ("TrackFX_SetParam", target_track, compressor_fx_index, 8, 1.0),
+        ("TrackFX_SetParam", target_track, compressor_fx_index, REACOMP_DETECTOR_PARAM,
+         REACOMP_DETECTOR_AUX),
     )
     if not batch.get("ok"):
         return {"ok": False, "error": "Failed to set up sidechain compression", "details": batch}
@@ -1449,8 +1462,8 @@ async def get_project_name() -> dict:
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_tempo() -> dict:
-    """Get the project tempo."""
-    return await reaper_call("Master_GetTempo")
+    """Get the tempo at project start as `ret`, and every tempo marker as `tempo_markers`."""
+    return await reaper_call("GetTempoMap")
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -1634,13 +1647,6 @@ async def get_midi_item(track_index: int, item_index: int) -> dict:
     return await reaper_call("GetMIDIItemInfo", track_index, item_index)
 
 
-async def _beats_to_seconds(beats: float) -> float:
-    """Convert beats to seconds at the project's current tempo."""
-    tempo_result = await reaper_call("Master_GetTempo")
-    tempo = tempo_result.get("ret") or 120.0
-    return (beats / tempo) * 60.0
-
-
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def add_midi_note(
     track_index: int,
@@ -1664,12 +1670,9 @@ async def add_midi_note(
         Four-on-the-floor kick: add_midi_note(0, 0, 36, 110, start_beat=0, length_beats=0.25)
         then start_beat=1, 2, 3.
     """
-    # Beats -> seconds at project tempo; the bridge DSL handler takes time offsets
-    # relative to the item start. (Fix + beats ergonomics from PR #1, @nuxero)
-    start_time = await _beats_to_seconds(start_beat)
-    length = await _beats_to_seconds(length_beats)
     return await reaper_call(
-        "InsertMIDINote", track_index, item_index, pitch, start_time, length, velocity, channel
+        "InsertMIDINoteBeats", track_index, item_index, pitch, start_beat, length_beats,
+        velocity, channel
     )
 
 
@@ -1689,20 +1692,15 @@ async def add_midi_notes_batch(
     Returns:
         Object with count of notes added.
     """
-    tempo_result = await reaper_call("Master_GetTempo")
-    tempo = tempo_result.get("ret") or 120.0
-
     calls = []
     for note in notes:
-        start_time = (note.get("start_beat", 0) / tempo) * 60.0
-        length = (note.get("length_beats", 1.0) / tempo) * 60.0
         calls.append((
-            "InsertMIDINote",
+            "InsertMIDINoteBeats",
             track_index,
             item_index,
             note.get("pitch", 60),
-            start_time,
-            length,
+            note.get("start_beat", 0),
+            note.get("length_beats", 1.0),
             note.get("velocity", 100),
             note.get("channel", 0)
         ))
@@ -1927,6 +1925,40 @@ async def get_selected_midi_notes(track_index: int, item_index: int, fields: Opt
         return {"ok": False, "error": "track_index and item_index must be >= 0"}
     return _shape_notes(await reaper_call("GetSelectedMIDINotes", track_index, item_index),
                         fields=fields)
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
+async def select_midi_notes(
+    track_index: int,
+    item_index: int,
+    pitch_low: int = 0,
+    pitch_high: int = 127,
+    start_beat: Optional[float] = None,
+    end_beat: Optional[float] = None,
+    channel: int = -1,
+    selected: bool = True,
+    exclusive: bool = True,
+    return_notes: bool = True,
+    fields: Optional[List[str]] = None
+) -> dict:
+    """
+    Select the MIDI notes matching the filter, as if clicked in REAPER's MIDI editor.
+
+    Args:
+        selected: False deselects the matching notes instead; with no filter, clears the selection.
+        exclusive: When selecting, deselect every note that does not match.
+
+    `notes_changed` counts notes whose selection flipped.
+    """
+    if track_index < 0 or item_index < 0:
+        return {"ok": False, "error": "track_index and item_index must be >= 0"}
+    if channel != -1 and not (0 <= channel <= 15):
+        return {"ok": False, "error": "channel must be -1 (all) or 0-15"}
+    if not (0 <= pitch_low <= 127) or not (0 <= pitch_high <= 127):
+        return {"ok": False, "error": "pitch_low and pitch_high must be 0-127"}
+    filt = _midi_note_filter(pitch_low, pitch_high, start_beat, end_beat, channel)
+    return _shape_notes(await reaper_call("SelectMIDINotes", track_index, item_index, filt,
+                                          bool(selected), bool(exclusive)), return_notes, fields)
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
@@ -3848,7 +3880,7 @@ UNDO_EXEMPT_TOOLS = frozenset({
     "set_cursor_position", "go_to_marker", "go_to_region",
     "zoom_to_selection", "zoom_to_project",
     "select_track", "select_all_tracks", "unselect_all_tracks",
-    "select_all_items", "unselect_all_items", "copy_selected_items",
+    "select_all_items", "unselect_all_items", "copy_selected_items", "select_midi_notes",
     "set_time_selection", "clear_time_selection", "clear_all_peak_indicators",
     "create_project", "open_project", "save_project",
     "render_project", "render_region", "save_fx_preset",

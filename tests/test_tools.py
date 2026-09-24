@@ -38,9 +38,9 @@ def test_transport(reaper):
     assert reaper.last == ("OnStopButton", [])
 
 
-def test_get_tempo(reaper):
+def test_get_tempo_reads_the_tempo_map(reaper):
     run(srv.get_tempo())
-    assert reaper.last == ("Master_GetTempo", [])
+    assert reaper.calls == [("GetTempoMap", [])]
 
 
 def test_set_tempo(reaper):
@@ -187,25 +187,20 @@ def test_create_midi_item_uses_dsl_handler(reaper):
     assert reaper.last == ("CreateMIDIItem", [0, 1.0, 5.0])  # start, end = pos + length
 
 
-def test_add_midi_note_beats_to_seconds(reaper):
-    # Recorder returns ret=0 for Master_GetTempo -> falls back to 120 BPM (1 beat = 0.5s)
+def test_add_midi_note_sends_beats_for_the_bridge_to_convert(reaper):
     run(srv.add_midi_note(0, 1, 60, 100, start_beat=2.0, length_beats=1.0))
-    func, args = reaper.last
-    assert func == "InsertMIDINote"
-    assert args[:3] == [0, 1, 60]
-    assert args[3] == pytest.approx(1.0)   # 2 beats @ 120 BPM
-    assert args[4] == pytest.approx(0.5)   # 1 beat @ 120 BPM
-    assert args[5:] == [100, 0]
+    assert reaper.calls == [("InsertMIDINoteBeats", [0, 1, 60, 2.0, 1.0, 100, 0])]
 
 
-def test_add_midi_notes_batch_beats(reaper):
-    notes = [{"pitch": 36, "velocity": 110, "start_beat": 1.0, "length_beats": 0.5}]
+def test_add_midi_notes_batch_sends_beats_for_the_bridge_to_convert(reaper):
+    notes = [{"pitch": 36, "velocity": 110, "start_beat": 1.0, "length_beats": 0.5},
+             {"pitch": 38, "start_beat": 1.5}]
     result = run(srv.add_midi_notes_batch(0, 0, notes))
-    assert result["notes_added"] == 1
-    func, args = reaper.last
-    assert func == "InsertMIDINote"
-    assert args[3] == pytest.approx(0.5)    # 1 beat @ 120 BPM
-    assert args[4] == pytest.approx(0.25)   # 0.5 beat @ 120 BPM
+    assert result["notes_added"] == 2
+    assert reaper.calls == [
+        ("InsertMIDINoteBeats", [0, 0, 36, 1.0, 0.5, 110, 0]),
+        ("InsertMIDINoteBeats", [0, 0, 38, 1.5, 1.0, 100, 0]),
+    ]
 
 
 def test_get_midi_notes_handler(reaper):

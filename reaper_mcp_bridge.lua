@@ -4,7 +4,7 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.7.4"
+local BRIDGE_VERSION = "1.7.5"
 
 local bridge_dir = reaper.GetResourcePath() .. '/Scripts/mcp_bridge_data/'
 
@@ -1963,6 +1963,24 @@ local function remove_overlaps_pure(notes, opts)
     return {edits = edits, removals = removals,
             trimmed = trimmed, deduped = deduped, deleted = deleted}
 end
+local function select_notes_pure(notes, filt, ctx, selected, exclusive)
+    local changes = {}
+    for _, n in ipairs(notes) do
+        local want
+        if note_in_filter(n, filt, ctx) then
+            want = selected
+        elseif selected and exclusive then
+            want = false
+        else
+            want = n.selected
+        end
+        if want ~= n.selected then
+            changes[#changes + 1] = {index = n.index, selected = want}
+        end
+    end
+    return {changes = changes, notes_changed = #changes}
+end
+
 -- === MIDI_PURE_END ===
 
 -- Impure helpers (need reaper.*): read notes, derive ctx, build the response note list.
@@ -5290,6 +5308,82 @@ local function dispatch_call(fname, args)
                             response.ok = false
                         end
 
+                    elseif fname == "InsertMIDINoteBeats" then
+                        if #args >= 5 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if not take then
+                                response.error = err
+                                response.ok = false
+                            else
+                                local item = reaper.GetMediaItemTake_Item(take)
+                                local item_pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+                                local start_qn = reaper.MIDI_GetProjQNFromPPQPos(take,
+                                    reaper.MIDI_GetPPQPosFromProjTime(take, item_pos)) + args[4]
+                                local ppq_start = reaper.MIDI_GetPPQPosFromProjQN(take, start_qn)
+                                local ppq_end = reaper.MIDI_GetPPQPosFromProjQN(take, start_qn + args[5])
+                                reaper.MIDI_InsertNote(take, false, false, ppq_start, ppq_end,
+                                    args[7] or 0, args[3], args[6] or 100, false)
+                                reaper.MIDI_Sort(take)
+                                response.ok = true
+                            end
+                        else
+                            response.error = "InsertMIDINoteBeats requires track_index, item_index, pitch, start_beat, length_beats"
+                            response.ok = false
+                        end
+
+                    elseif fname == "GetTempoMap" then
+                        local _, _, start_bpm = reaper.TimeMap_GetTimeSigAtTime(0, 0)
+                        local markers = as_array({})
+                        for i = 0, reaper.CountTempoTimeSigMarkers(0) - 1 do
+                            local ok, timepos, _, _, bpm, _, _, linear = reaper.GetTempoTimeSigMarker(0, i)
+                            if ok then
+                                markers[#markers + 1] = {time = timepos, bpm = bpm, linear = linear}
+                            end
+                        end
+                        response.ret = start_bpm
+                        response.tempo_markers = markers
+                        response.ok = true
+
+                    elseif fname == "SelectMIDINotes" then
+                        if #args >= 2 then
+                            local take, err = resolve_midi_take(args[1], args[2])
+                            if not take then
+                                response.error = err
+                                response.ok = false
+                            else
+                                local item = reaper.GetMediaItemTake_Item(take)
+                                local ctx = midi_ctx(take, item)
+                                if not (ctx.ppq_per_qn and ctx.ppq_per_qn > 0) then
+                                    response.error = "Could not determine PPQ-per-quarter-note for take"
+                                    response.ok = false
+                                else
+                                    local filt = args[3] or {}
+                                    local res = select_notes_pure(midi_read_notes(take), filt, ctx,
+                                        args[4] ~= false, args[5] ~= false)
+                                    local wok, werr = pcall(function()
+                                        for _, ch in ipairs(res.changes) do
+                                            reaper.MIDI_SetNote(take, ch.index, ch.selected, nil, nil, nil, nil, nil, nil, true)
+                                        end
+                                        if res.notes_changed > 0 then reaper.MIDI_Sort(take) end
+                                    end)
+                                    if wok then
+                                        response.notes = midi_note_list(take, item)
+                                        response.notes_changed = res.notes_changed
+                                        response.clamped = 0
+                                        response.skipped = 0
+                                        response.out_of_bounds = 0
+                                        response.ok = true
+                                    else
+                                        response.error = "Select failed: " .. tostring(werr)
+                                        response.ok = false
+                                    end
+                                end
+                            end
+                        else
+                            response.error = "SelectMIDINotes requires track_index, item_index"
+                            response.ok = false
+                        end
+
                     elseif fname == "SetMIDINote" then
                         -- args: track_index, item_index, note_index, edits{pitch?, start_beat?, length_beats?, channel?}
                         if #args >= 3 then
@@ -6192,7 +6286,7 @@ local function dispatch_call(fname, args)
                     elseif fname == "SetTimeSignature" then
                         -- args: numerator, denominator -> tempo/time-sig marker at project start
                         if #args >= 2 then
-                            local bpm = reaper.Master_GetTempo()
+                            local _, _, bpm = reaper.TimeMap_GetTimeSigAtTime(0, 0)
                             local ok2 = reaper.SetTempoTimeSigMarker(0, -1, 0, -1, -1, bpm, args[1], args[2], false)
                             reaper.UpdateTimeline()
                             response.ret = ok2

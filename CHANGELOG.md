@@ -5,6 +5,45 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.5] - 2026-09-24
+
+**The bridge changed. Redeploy `reaper_mcp_bridge.lua`** (`twelvetake-reaper-mcp
+--install-bridge`, then re-run the script in REAPER). The server refuses an older bridge,
+which has no handler for the new tool or for the tempo fixes.
+
+### Added
+- **`select_midi_notes`**: selects the notes in a MIDI item that match the shared pitch,
+  beat-window and channel filter, the same selection you would make by clicking in REAPER's
+  MIDI editor. By default it replaces the current selection; `exclusive=False` adds to it,
+  and `selected=False` deselects the matching notes instead, so calling it with no filter
+  and `selected=False` clears the selection. It is the writer that pairs with
+  `get_selected_midi_notes`. Pitch, timing and velocity are never touched, and like the
+  other selection tools it is not an undo step.
+
+### Fixed
+- **The sidechain tools built a sidechain the compressor could not hear.**
+  `setup_sidechain_send` and `setup_sidechain_compression` routed the send to channels 3/4
+  of a target track that only had 2 channels, so the send carried nothing. They now give
+  the target 4 channels first; a track that already has more keeps them.
+  `setup_sidechain_compression` and `configure_reacomp_sidechain` also set ReaComp's
+  detector input to the wrong entry. `SignIn` moves in steps of 1/1084, so the old value
+  of 1.0 selected the top of the range instead of Aux L+R. It is now 2/1084, which REAPER
+  displays as `2`.
+- **Notes landed early or late after a tempo change.** `add_midi_note` and
+  `add_midi_notes_batch` turned beats into seconds at one tempo, the tempo under the edit
+  cursor. With the cursor past a change from 120 to 180 BPM, a note asked for at beat 6
+  landed on beat 4. The bridge now converts through REAPER's tempo map, so `start_beat`
+  means the same thing here as it does in `get_midi_notes` and the other MIDI tools.
+- **`get_tempo` reported the tempo under the edit cursor.** `ret` is now the tempo the
+  project starts at, and a new `tempo_markers` list gives every tempo marker's time, BPM
+  and whether it ramps.
+- **`set_time_signature` could change the tempo the song starts at.** It wrote its marker
+  at the project start using the tempo under the edit cursor, so with the cursor past a
+  tempo change the start of the song took the later tempo. It now keeps the start tempo.
+- **A stale-bridge refusal outlived the fix.** After seeing an out-of-date bridge, the
+  server refused every call until the MCP connection was restarted, even once the new
+  bridge was deployed and running. It now checks again on the next call.
+
 ## [1.7.4] - 2026-09-22
 
 **The bridge changed. Redeploy `reaper_mcp_bridge.lua`** (`twelvetake-reaper-mcp

@@ -26,7 +26,7 @@ import reaper_mcp_server as srv
 #
 # The headroom is deliberately modest. It absorbs ordinary docstring edits and a handful
 # of new tools; it does not absorb another 28,000-byte release going unnoticed.
-CEILING_BYTES = 85_500
+CEILING_BYTES = 86_700
 
 # Descriptions are ours; schema bytes belong to Pydantic and move when it does. Measured
 # 52,319. This is the ceiling that actually guards against docstring bloat.
