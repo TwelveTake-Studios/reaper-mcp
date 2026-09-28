@@ -334,53 +334,56 @@ def test_index_below_minus_one_is_not_found(fx_list):
     assert out["ok"] is False
 
 
-# --- InsertAudioFile (v1.6.1) -----------------------------------------------
-#
-# insert_audio_file called InsertMedia(file, mode), which takes two arguments, with four.
-# track_index and position fell off the end and were never sent: the file landed on
-# whichever track was selected at the edit cursor, and the tool reported success. The
-# handler now aims both deliberately, which means it must also put the user's selection
-# and cursor back.
+# --- InsertAudioFile ---------------------------------------------------------
 
 
 @pytest.fixture(scope="module")
 def insert_audio_block(bridge_src):
-    m = re.search(r"-- Insert an audio file onto a specific track.*?\nend\n", bridge_src, re.S)
+    m = re.search(r"local function InsertAudioFile\(.*?\nend\n", bridge_src, re.S)
     assert m, "could not locate InsertAudioFile — did it move or get renamed?"
     return m.group(0)
 
 
 INSERT_STUB = """
--- Four tracks. Track 2 is the target; tracks 0 and 3 start SELECTED so we can prove
--- the original selection is restored rather than clobbered.
 local tracks = {}
 for i = 0, 3 do tracks[i] = {id = i, items = {}, selected = (i == 0 or i == 3)} end
+local master = {id = -1, items = {}, selected = true}
+local touched = tracks[1]
 
 log = {cursor_sets = {}, inserted = nil, ui_refresh = 0}
 local cursor = 12.5
 
 reaper = {
     GetTrack = function(_, i) return tracks[i] end,
+    GetMasterTrack = function(_) return master end,
+    GetLastTouchedTrack = function() return touched end,
     CountTracks = function(_) return 4 end,
     IsTrackSelected = function(t) return t.selected end,
     SetTrackSelected = function(t, v) t.selected = v end,
+    Main_OnCommand = function(cmd, _)
+        if cmd ~= 40914 then return end
+        if master.selected then touched = master; return end
+        for i = 0, 3 do
+            if tracks[i].selected then touched = tracks[i]; return end
+        end
+    end,
     GetCursorPosition = function() return cursor end,
     SetEditCurPos = function(p) cursor = p; log.cursor_sets[#log.cursor_sets + 1] = p end,
     PreventUIRefresh = function(n) log.ui_refresh = log.ui_refresh + n end,
     UpdateArrange = function() end,
     CountTrackMediaItems = function(t) return #t.items end,
+    CountMediaItems = function(_)
+        local n = #master.items
+        for i = 0, 3 do n = n + #tracks[i].items end
+        return n
+    end,
     GetTrackMediaItem = function(t, i) return t.items[i + 1] end,
     GetMediaItemInfo_Value = function(item, _) return item.pos end,
     InsertMedia = function(file, mode)
-        -- Mimic REAPER: the file lands on the SELECTED track at the CURRENT cursor.
-        for i = 0, 3 do
-            if tracks[i].selected then
-                table.insert(tracks[i].items, {pos = cursor})
-                log.inserted = {track = i, pos = cursor, file = file, mode = mode}
-                return 1
-            end
-        end
-        return 0
+        if file == "unreadable.wav" then return 0 end
+        table.insert(touched.items, {pos = cursor})
+        log.inserted = {track = touched.id, pos = cursor, file = file, mode = mode}
+        return 1
     end,
 }
 """
@@ -396,7 +399,8 @@ def insert_audio(encoder_block, insert_audio_block):
             f"return encode_json(response), encode_json({{track = log.inserted and log.inserted.track,"
             f" pos = log.inserted and log.inserted.pos, cursor = reaper.GetCursorPosition(),"
             f" sel0 = reaper.GetTrack(0,0).selected, sel2 = reaper.GetTrack(0,2).selected,"
-            f" sel3 = reaper.GetTrack(0,3).selected, ui = log.ui_refresh}})"
+            f" sel3 = reaper.GetTrack(0,3).selected, master = reaper.GetMasterTrack(0).selected,"
+            f" touched = reaper.GetLastTouchedTrack().id, ui = log.ui_refresh}})"
         )
         response, state = lua.execute(source)
         return json.loads(response), json.loads(state)
@@ -426,6 +430,33 @@ def test_the_edit_cursor_is_restored(insert_audio):
     assert state["cursor"] == 12.5
 
 
+def test_the_last_touched_track_is_restored(insert_audio):
+    _, state = insert_audio('InsertAudioFile(2, "kick.wav", 4.25)')
+    assert state["touched"] == 1
+
+
+def test_the_master_selection_is_restored(insert_audio):
+    _, state = insert_audio('InsertAudioFile(2, "kick.wav", 4.25)')
+    assert state["master"] is True
+
+
+def test_an_unreadable_file_reports_nothing_created(insert_audio):
+    response, state = insert_audio('InsertAudioFile(2, "unreadable.wav", 4.25)')
+    assert response["ok"] is False
+    assert "No item was created" in response["error"]
+    assert state["touched"] == 1
+
+
+def test_an_item_on_another_track_is_not_reported_as_missing(insert_audio):
+    response, state = insert_audio(
+        '(function() reaper.Main_OnCommand = function() end;'
+        ' return InsertAudioFile(2, "kick.wav", 4.25) end)()'
+    )
+    assert state["track"] == 1
+    assert response["ok"] is False
+    assert response["error"] == "REAPER placed the item on a different track than requested"
+
+
 def test_ui_refresh_is_balanced(insert_audio):
     """An unbalanced PreventUIRefresh leaves REAPER's UI frozen."""
     _, state = insert_audio('InsertAudioFile(2, "kick.wav", 4.25)')
@@ -445,6 +476,52 @@ def test_empty_file_path_is_rejected(insert_audio):
     response, _ = insert_audio('InsertAudioFile(2, "", 1.0)')
     assert response["ok"] is False
     assert "file_path" in response["error"]
+
+
+# --- run_item_action ---------------------------------------------------------
+
+
+ITEM_ACTION_STUB = """
+local item = {selected = false}
+local other = {selected = true}
+local cursor = 7.25
+
+reaper = {
+    GetTrack = function(_, i) if i == 0 then return {} end end,
+    GetTrackMediaItem = function(_, i) if i == 0 then return item end end,
+    CountSelectedMediaItems = function(_) return other.selected and 1 or 0 end,
+    GetSelectedMediaItem = function(_, _) return other end,
+    SelectAllMediaItems = function(_, v) item.selected = v; other.selected = v end,
+    SetMediaItemSelected = function(it, v) it.selected = v end,
+    ValidatePtr2 = function() return true end,
+    GetCursorPosition = function() return cursor end,
+    SetEditCurPos = function(p) cursor = p end,
+    Main_OnCommand = function(cmd, _)
+        if item.selected then cursor = 42.0 end
+    end,
+    UpdateArrange = function() end,
+}
+"""
+
+
+@pytest.fixture(scope="module")
+def item_action_block(bridge_src):
+    m = re.search(r"local function run_item_action\(.*?\nend\n", bridge_src, re.S)
+    assert m, "could not locate run_item_action"
+    return m.group(0)
+
+
+@pytest.mark.parametrize("cmd", [41295, 40642, 40131, 40129])
+def test_an_item_action_leaves_the_edit_cursor_where_it_was(item_action_block, cmd):
+    lua = lupa.LuaRuntime(unpack_returned_tuples=True)
+    ok, cursor, other_selected = lua.execute(
+        f"{item_action_block}\n{ITEM_ACTION_STUB}\n"
+        f"local ok = run_item_action(0, 0, {cmd})\n"
+        f"return ok, reaper.GetCursorPosition(), reaper.GetSelectedMediaItem(0, 0).selected"
+    )
+    assert ok is True
+    assert cursor == 7.25
+    assert other_selected is True
 
 
 # --- GetTrackInfo volume/pan (v1.6.1) ---------------------------------------

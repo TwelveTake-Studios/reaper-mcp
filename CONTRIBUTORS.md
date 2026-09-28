@@ -50,6 +50,14 @@ The largest external contribution to this project, across three releases.
   into the project file. Also reported the second half, that responses were read with the
   machine's ANSI codepage instead of UTF-8. Shipped in **v1.7.1**.
 
+### [@adavius-oss](https://github.com/adavius-oss)
+
+- **[Issue #18](https://github.com/TwelveTake-Studios/reaper-mcp/issues/18)** - found that
+  `insert_audio_file` could put the file on a different track from the one asked for and
+  then report that no item had been created, so a retry left a duplicate. Supplied the
+  one-line fix, running action 40914 once the target track is selected, already tested on a
+  six-line dialogue alternating between two tracks. Shipped in **v1.7.6**.
+
 ---
 
 ## Work in forks that this project has benefited from

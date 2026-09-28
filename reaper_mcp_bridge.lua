@@ -4,7 +4,7 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.7.5"
+local BRIDGE_VERSION = "1.7.6"
 
 local bridge_dir = reaper.GetResourcePath() .. '/Scripts/mcp_bridge_data/'
 
@@ -406,16 +406,6 @@ local function GetTrackInfo(track_index)
     }
 end
 
--- Insert an audio file onto a specific track at a specific position.
---
--- ReaScript's InsertMedia(file, mode) takes only two arguments and always drops the
--- file on the SELECTED track at the EDIT CURSOR. The server used to call it with two
--- extra arguments, which simply fell off the end: the tool's track_index and position
--- were never sent anywhere, so audio landed wherever the user happened to be pointing
--- and the tool still reported success.
---
--- So aim both deliberately, then put the user's selection and cursor back exactly as
--- they were. Their selection is not ours to change as a side effect.
 local function InsertAudioFile(track_index, file_path, position)
     if type(file_path) ~= "string" or file_path == "" then
         return {ok = false, error = "file_path is required"}
@@ -427,6 +417,9 @@ local function InsertAudioFile(track_index, file_path, position)
     position = position or 0
 
     local saved_cursor = reaper.GetCursorPosition()
+    local saved_touched = reaper.GetLastTouchedTrack()
+    local master = reaper.GetMasterTrack(0)
+    local saved_master = reaper.IsTrackSelected(master)
     local total = reaper.CountTracks(0)
     local saved_selection = {}
     for i = 0, total - 1 do
@@ -434,23 +427,41 @@ local function InsertAudioFile(track_index, file_path, position)
     end
 
     reaper.PreventUIRefresh(1)
+    reaper.SetTrackSelected(master, false)
     for i = 0, total - 1 do
         reaper.SetTrackSelected(reaper.GetTrack(0, i), false)
     end
     reaper.SetTrackSelected(track, true)
+    reaper.Main_OnCommand(40914, 0)
     reaper.SetEditCurPos(position, false, false)
 
     local before = reaper.CountTrackMediaItems(track)
+    local project_before = reaper.CountMediaItems(0)
     reaper.InsertMedia(file_path, 0)
     local after = reaper.CountTrackMediaItems(track)
+    local project_after = reaper.CountMediaItems(0)
 
+    reaper.SetTrackSelected(track, false)
+    if saved_touched then
+        reaper.SetTrackSelected(saved_touched, true)
+        reaper.Main_OnCommand(40914, 0)
+        reaper.SetTrackSelected(saved_touched, false)
+    end
     for i = 0, total - 1 do
         reaper.SetTrackSelected(reaper.GetTrack(0, i), saved_selection[i] and true or false)
     end
+    reaper.SetTrackSelected(master, saved_master and true or false)
     reaper.SetEditCurPos(saved_cursor, false, false)
     reaper.PreventUIRefresh(-1)
     reaper.UpdateArrange()
 
+    if after <= before and project_after > project_before then
+        return {
+            ok = false,
+            error = "REAPER placed the item on a different track than requested",
+            file_path = file_path
+        }
+    end
     if after <= before then
         return {
             ok = false,
@@ -1318,6 +1329,7 @@ local function run_item_action(track_index, item_index, cmd_id)
         return false, "Media item not found at index " .. tostring(item_index)
             .. " on track " .. tostring(track_index)
     end
+    local saved_cursor = reaper.GetCursorPosition()
     local saved = {}
     for i = 0, reaper.CountSelectedMediaItems(0) - 1 do
         saved[#saved + 1] = reaper.GetSelectedMediaItem(0, i)
@@ -1325,6 +1337,7 @@ local function run_item_action(track_index, item_index, cmd_id)
     reaper.SelectAllMediaItems(0, false)
     reaper.SetMediaItemSelected(item, true)
     reaper.Main_OnCommand(cmd_id, 0)
+    reaper.SetEditCurPos(saved_cursor, false, false)
     reaper.SelectAllMediaItems(0, false)
     for _, it in ipairs(saved) do
         if reaper.ValidatePtr2(0, it, "MediaItem*") then

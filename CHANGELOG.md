@@ -5,6 +5,28 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.6] - 2026-09-28
+
+**The bridge changed. Redeploy `reaper_mcp_bridge.lua`** (`twelvetake-reaper-mcp
+--install-bridge`, then re-run the script in REAPER). The server refuses an older bridge,
+which still has both bugs below.
+
+### Fixed
+- **`insert_audio_file` could put the file on the wrong track and then report that nothing
+  was created.** REAPER inserts media on the last-touched track, not the selected one. When
+  another track had been touched last, the file landed on that track at the requested time,
+  and the tool answered `ok: false` with a missing-file error, so retrying made a duplicate.
+  The requested track is now made the last-touched one before the insert, and afterwards
+  the last-touched track, the track selection and the edit cursor are put back as they
+  were. If an item ever lands on a different track anyway, the error now says so instead of
+  blaming the file.
+  *(Reported with a tested fix by [@adavius-oss](https://github.com/adavius-oss) in
+  [issue #18](https://github.com/TwelveTake-Studios/reaper-mcp/issues/18).)*
+- **`duplicate_item` moved the edit cursor** to the end of the copy, which is what the
+  REAPER action behind it does. The cursor now stays where it was. `explode_takes`,
+  `crop_to_active_take` and `delete_take` run through the same code and keep it in place
+  too.
+
 ## [1.7.5] - 2026-09-24
 
 **The bridge changed. Redeploy `reaper_mcp_bridge.lua`** (`twelvetake-reaper-mcp

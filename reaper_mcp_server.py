@@ -12,7 +12,7 @@ License: MIT
 Version: 1.6.5
 """
 
-__version__ = "1.7.5"
+__version__ = "1.7.6"
 
 import os
 import asyncio
@@ -119,7 +119,7 @@ BRIDGE_DIR_PROBLEM = bridge_dir_problem(BRIDGE_DIR)
 # The bridge script version this server needs. REAPER runs whatever copy is deployed in
 # its Scripts folder, deployed by hand, so the halves drift. Anything older cannot answer
 # GetBridgeVersion and is reported as out of date instead of failing in obscure ways.
-MIN_BRIDGE_VERSION = "1.7.5"
+MIN_BRIDGE_VERSION = "1.7.6"
 
 # How long to wait for the bridge to answer. Configurable because the bridge answers
 # only after the work finishes and renders run at roughly realtime, so 5s reports a
