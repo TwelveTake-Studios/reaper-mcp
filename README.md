@@ -8,9 +8,11 @@ A [TwelveTake Studios](https://twelvetake.com) project.
 
 **[Setup guide, examples and FAQ -> twelvetake.com/tools/reaper-mcp](https://twelvetake.com/tools/reaper-mcp/)**
 
+Listed in the [MCP Registry](https://registry.modelcontextprotocol.io/) as `mcp-name: com.twelvetake/reaper-mcp`.
+
 A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control REAPER DAW for mixing, mastering, MIDI composition, and full music production workflows.
 
-**Version:** 1.7.6
+**Version:** 1.7.7
 
 ## Why This Server
 

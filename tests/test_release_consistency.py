@@ -17,6 +17,7 @@ Read as raw text on purpose, like `test_packaging.py`: `tomllib` is 3.11+ and a 
 guard must not be the thing that breaks on the oldest supported Python.
 """
 
+import json
 import re
 from pathlib import Path
 
@@ -27,6 +28,7 @@ PYPROJECT = REPO / "pyproject.toml"
 BRIDGE = REPO / "reaper_mcp_bridge.lua"
 CHANGELOG = REPO / "CHANGELOG.md"
 README = REPO / "README.md"
+SERVER_JSON = REPO / "server.json"
 
 SEMVER = r"\d+\.\d+\.\d+"
 
@@ -150,4 +152,24 @@ def test_readme_version_matches_pyproject():
     assert readme_version() == package_version(), (
         f"README declares {readme_version()} but pyproject declares {package_version()}. "
         "Bump both in the same commit."
+    )
+
+
+def test_registry_manifest_matches_the_release():
+    manifest = json.loads(SERVER_JSON.read_text(encoding="utf-8"))
+    assert manifest["version"] == package_version(), (
+        f"server.json declares {manifest['version']} but pyproject declares {package_version()}"
+    )
+    for package in manifest["packages"]:
+        assert package["version"] == package_version(), (
+            f"server.json package {package['identifier']} pins {package['version']}, "
+            f"not {package_version()}"
+        )
+    assert len(manifest["description"]) <= 100
+
+
+def test_readme_carries_the_registry_ownership_marker():
+    name = json.loads(SERVER_JSON.read_text(encoding="utf-8"))["name"]
+    assert f"mcp-name: {name}" in README.read_text(encoding="utf-8"), (
+        f"README.md must contain 'mcp-name: {name}' or the MCP registry refuses the publish"
     )
