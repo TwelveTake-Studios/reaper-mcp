@@ -71,7 +71,7 @@ def test_unknown_field_is_reported_not_fatal():
     out = srv._shape_notes(res, True, ["pitch", "looudness"])
     assert out["ok"] is True
     assert out["fields_ignored"] == ["looudness"]
-    assert out["notes"] == [{"pitch": 60}], "the recognised field still applied"
+    assert out["notes"] == [{"pitch": 60}], "the recognized field still applied"
 
 
 def test_all_field_names_unknown_leaves_the_notes_alone():

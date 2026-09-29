@@ -1,0 +1,153 @@
+desc:TwelveTake MCP Analyzer
+options:gmem=TwelveTake_MCP_Analyzer
+slider1:1<0,1000,1>-Protocol
+
+in_pin:left
+in_pin:right
+out_pin:left
+out_pin:right
+
+@init
+PROTOCOL = 1;
+N = 4096;
+HOP = 2048;
+T = 16;
+PH = 4;
+BINS = N / 2 + 1;
+FFTBUF = 0;
+WIN = 2 * N;
+FIFOL = WIN + N;
+FIFOR = FIFOL + N;
+COEF = FIFOR + N;
+HISTL = COEF + PH * T;
+HISTR = HISTL + 2 * T;
+G_BINS = 1024;
+
+function bessel_i0(x) local(sum term k) (
+  sum = 1; term = 1; k = 1;
+  loop(40, term *= (x / (2 * k)) * (x / (2 * k)); sum += term; k += 1;);
+  sum;
+);
+
+function reset_state() (
+  nsamp = 0; pkl = 0; pkr = 0; tpl = 0; tpr = 0;
+  sll = 0; srr = 0; slr = 0; sl = 0; sr = 0; overs = 0; frames = 0;
+  fpos = 0; filled = 0; since_hop = 0; hpos = 0; hotl = 0; hotr = 0;
+  memset(FIFOL, 0, N); memset(FIFOR, 0, N);
+  memset(HISTL, 0, 2 * T); memset(HISTR, 0, 2 * T);
+);
+
+function flush() (
+  gmem[2] = nsamp; gmem[3] = pkl; gmem[4] = pkr; gmem[5] = tpl; gmem[6] = tpr;
+  gmem[7] = sll; gmem[8] = srr; gmem[9] = slr; gmem[10] = sl; gmem[11] = sr;
+  gmem[12] = overs; gmem[13] = frames; gmem[14] = srate; gmem[15] = N; gmem[16] = wsum2;
+);
+
+function do_frame() local(i k nk idx a b c d lr li rr ri) (
+  i = 0; idx = fpos;
+  loop(N,
+    FFTBUF[2 * i] = FIFOL[idx] * WIN[i];
+    FFTBUF[2 * i + 1] = FIFOR[idx] * WIN[i];
+    idx += 1; idx >= N ? idx = 0;
+    i += 1;
+  );
+  fft(FFTBUF, N);
+  fft_permute(FFTBUF, N);
+  k = 0;
+  loop(BINS,
+    nk = k == 0 ? 0 : N - k;
+    a = FFTBUF[2 * k]; b = FFTBUF[2 * k + 1];
+    c = FFTBUF[2 * nk]; d = FFTBUF[2 * nk + 1];
+    lr = (a + c) * 0.5; li = (b - d) * 0.5;
+    rr = (b + d) * 0.5; ri = (c - a) * 0.5;
+    gmem[G_BINS + k] += lr * lr + li * li;
+    gmem[G_BINS + BINS + k] += rr * rr + ri * ri;
+    gmem[G_BINS + 2 * BINS + k] += lr * rr + li * ri;
+    k += 1;
+  );
+  frames += 1;
+);
+
+i = 0;
+wsum2 = 0;
+loop(N, WIN[i] = 0.5 - 0.5 * cos(2 * $pi * i / N); wsum2 += WIN[i] * WIN[i]; i += 1;);
+
+taps = PH * T;
+center = (taps - 1) / 2;
+beta = 7;
+norm = bessel_i0(beta);
+i = 0;
+loop(taps,
+  tk = (i - center) / PH;
+  sinc = abs(tk) < 0.000000001 ? 1 : sin($pi * tk) / ($pi * tk);
+  r = (i - center) / center;
+  p = i % PH;
+  COEF[p * T + (i - p) / PH] = sinc * bessel_i0(beta * sqrt(max(0, 1 - r * r))) / norm;
+  i += 1;
+);
+p = 0;
+hmax = 0;
+loop(PH,
+  s = 0; j = 0; loop(T, s += COEF[p * T + j]; j += 1;);
+  a = 0; j = 0; loop(T, COEF[p * T + j] /= s; a += abs(COEF[p * T + j]); j += 1;);
+  hmax = max(hmax, a);
+  p += 1;
+);
+
+run_id = -1;
+reset_state();
+
+@block
+gmem[17] != run_id ? (run_id = gmem[17]; reset_state(););
+armed = gmem[0] && play_state != 0;
+armed ? gmem[1] = PROTOCOL;
+remaining = samplesblock;
+
+@sample
+armed ? (
+  l = spl0; r = spl1;
+  al = abs(l); ar = abs(r);
+  nsamp += 1;
+  al > pkl ? pkl = al;
+  ar > pkr ? pkr = ar;
+  sll += l * l; srr += r * r; slr += l * r; sl += l; sr += r;
+  (al >= 1 || ar >= 1) ? overs += 1;
+
+  HISTL[hpos] = l; HISTL[hpos + T] = l;
+  HISTR[hpos] = r; HISTR[hpos + T] = r;
+  hpos += 1; hpos >= T ? hpos = 0;
+  al > tpl ? tpl = al;
+  ar > tpr ? tpr = ar;
+  al * hmax > tpl ? hotl = T;
+  ar * hmax > tpr ? hotr = T;
+  newest = hpos + T - 1;
+  hotl > 0 ? (
+    hotl -= 1;
+    p = 0;
+    loop(PH,
+      yl = 0; j = 0; cp = COEF + p * T;
+      loop(T, yl += cp[j] * HISTL[newest - j]; j += 1;);
+      abs(yl) > tpl ? tpl = abs(yl);
+      p += 1;
+    );
+  );
+  hotr > 0 ? (
+    hotr -= 1;
+    p = 0;
+    loop(PH,
+      yr = 0; j = 0; cp = COEF + p * T;
+      loop(T, yr += cp[j] * HISTR[newest - j]; j += 1;);
+      abs(yr) > tpr ? tpr = abs(yr);
+      p += 1;
+    );
+  );
+
+  FIFOL[fpos] = l; FIFOR[fpos] = r;
+  fpos += 1; fpos >= N ? fpos = 0;
+  filled < N ? filled += 1;
+  since_hop += 1;
+  since_hop >= HOP && filled >= N ? (since_hop = 0; do_frame(););
+
+  remaining -= 1;
+  remaining <= 0 ? flush();
+);

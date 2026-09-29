@@ -90,6 +90,15 @@ def test_length_operator_intact_on_marked_empty(lua_run):
     assert lua_run("return #as_array({})") == 0
 
 
+def test_non_finite_numbers_encode_as_null(lua_run):
+    out = lua_run("return encode_json({ok = true, a = math.huge, b = -math.huge, c = 0/0, d = 1.5})")
+    assert json.loads(out) == {"ok": True, "a": None, "b": None, "c": None, "d": 1.5}
+
+
+def test_non_finite_numbers_inside_arrays_encode_as_null(lua_run):
+    assert json.loads(lua_run("return encode_json({1, math.huge, -math.huge, 0/0})")) == [1, None, None, None]
+
+
 def test_array_of_empty_arrays(lua_run):
     # Marker recursion: encoder recurses into nested marked tables.
     assert lua_run("return encode_json(as_array({ as_array({}) }))") == "[[]]"
@@ -285,7 +294,7 @@ def test_empty_chain_reports_zero_fx(fx_list):
     assert out["fx_count"] == 0
 
 
-def test_empty_chain_serialises_as_brackets_not_braces(encoder_block, fx_list_block):
+def test_empty_chain_serializes_as_brackets_not_braces(encoder_block, fx_list_block):
     """The whole v1.5.0 release exists because an empty list once regressed to {}.
 
     Asserted on the raw JSON text: json.loads maps both [] and {} to falsy

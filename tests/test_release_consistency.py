@@ -135,7 +135,7 @@ def test_a_bridge_change_tells_users_to_redeploy():
     if bridge_version() != package_version():
         return
     section = changelog_section(package_version()).lower()
-    assert "redeploy" in section, (
+    assert "redeploy" in section or "--install-bridge" in section, (
         f"BRIDGE_VERSION was bumped to {bridge_version()} for this release, but the "
         f"CHANGELOG entry for {package_version()} never tells anyone to redeploy the "
         "bridge. REAPER keeps running the old deployed copy."

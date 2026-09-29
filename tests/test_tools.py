@@ -302,7 +302,7 @@ def test_render_region_documented_error(reaper):
 
     It used to promise the render suite "for v1.9". The roadmap said v1.9 in two places,
     the renumbering moved the render suite to a different minor, and this test pinned the
-    promise rather than the behaviour, so the stale version shipped to users on every
+    promise rather than the behavior, so the stale version shipped to users on every
     call with a green suite. A roadmap slot is not a contract; the workaround is.
     """
     result = run(srv.render_region(0, "C:/tmp/r.wav"))

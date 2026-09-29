@@ -26,7 +26,7 @@ import reaper_mcp_server as srv
 #
 # The headroom is deliberately modest. It absorbs ordinary docstring edits and a handful
 # of new tools; it does not absorb another 28,000-byte release going unnoticed.
-CEILING_BYTES = 86_700
+CEILING_BYTES = 88_400
 
 # Descriptions are ours; schema bytes belong to Pydantic and move when it does. Measured
 # 52,319. This is the ceiling that actually guards against docstring bloat.
@@ -34,7 +34,7 @@ DESCRIPTION_CEILING_BYTES = 34_000
 
 
 def tools_list_payload():
-    """The tool list as a client receives it, in the shape tools/list serialises."""
+    """The tool list as a client receives it, in the shape tools/list serializes."""
     payload = []
     for t in srv.mcp._tool_manager.list_tools():
         entry = {"name": t.name, "description": t.description or "", "inputSchema": t.parameters}
@@ -82,7 +82,7 @@ def test_descriptions_carry_no_leading_indentation():
     assert not offenders, f"descriptions still indented (run on <3.13 to see it): {offenders}"
 
 
-def test_description_normalisation_is_idempotent():
+def test_description_normalization_is_idempotent():
     assert srv.normalize_tool_descriptions() == 0
 
 

@@ -5,6 +5,37 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.8.0] - 2026-09-29
+
+**After you update, run `twelvetake-reaper-mcp --install-bridge`.** It installs the new bridge and
+the analyzer plugin that the measurement tools need. If REAPER is running the 1.7.8 bridge, you
+don't have to do anything in REAPER. If you installed with ReaPack, synchronize your packages
+instead.
+
+### Added
+- **`measure_loudness`** gives you integrated loudness, short-term and momentary maximum, loudness
+  range, sample peak and true peak for the master, a track or a single item, over the whole
+  project or a time range you choose. The loudness figures are REAPER's own. It passes the EBU's
+  synthetic compliance signals within the EBU's tolerances: Tech 3341 loudness cases 1 to 5 and
+  true-peak cases 15 to 19, and Tech 3342 loudness range cases 1 to 4.
+- **`measure_spectrum`** gives you octave-band levels from 31.5 Hz to 16 kHz, the spectral
+  centroid, the tilt in dB per octave, the stereo correlation overall and below 150 Hz, the
+  side-to-mid level and the left/right balance.
+- **The TwelveTake MCP Analyzer** is a small JSFX plugin that measures true peak, the spectrum and
+  the stereo figures. `--install-bridge` installs it in REAPER's `Effects/TwelveTake` folder, and
+  the ReaPack package includes it. Without it, `measure_loudness` still gives you REAPER's figures
+  and tells you what it couldn't measure.
+- Measuring doesn't write any files or add steps to your undo history. When it finishes, your
+  selections, time selection and edit cursor are where you left them. It measures a track or item
+  after its fader and pan. Measuring the master does mark the project as modified, even though
+  nothing in it changed: REAPER can't add a plugin to the master without setting that flag.
+
+### Fixed
+- When a bridge reply contained an infinite or undefined number, such as the level of silence,
+  the server couldn't read it. It waited out its whole timeout and then told you the call had
+  timed out. The bridge now sends those numbers as null, and when a reply can't be read, the
+  server tells you so within half a second.
+
 ## [1.7.8] - 2026-09-29
 
 **The bridge changed. Redeploy it by hand one last time** (`twelvetake-reaper-mcp --install-bridge`,
@@ -122,7 +153,7 @@ with a message saying so, because a 1.7.3 bridge cannot run the batched calls be
   `clear_midi_item` and every mixer and routing edit, left nothing in REAPER's undo
   history. After an AI deleted a track, `undo` reversed whatever MIDI edit came before
   it and the track stayed deleted. Now every tool call that edits the project is exactly
-  one step in the undo history, labelled with the tool that made it
+  one step in the undo history, labeled with the tool that made it
   (`MCP: delete track`), whether it is undone from the AI or with Ctrl+Z.
 - **Edits made of several REAPER calls are now one step.** `insert_track` with a name,
   `create_bus`, `add_parallel_compression`, `setup_sidechain_send`,
@@ -154,7 +185,7 @@ The bridge did not change; `BRIDGE_VERSION` stays at 1.7.1 and no redeploy is ne
 ### Changed
 - **The tool list is another 2,955 bytes smaller: 79,720 down to 76,765**, roughly 5,000
   fewer tokens than 1.6.8 on every turn of every session, before you type anything. No tool
-  was added, removed or renamed, and no parameter or behaviour changed, so every 1.7.2 call
+  was added, removed or renamed, and no parameter or behavior changed, so every 1.7.2 call
   site keeps working. 1.7.0 moved the shared conventions into the server `instructions`
   block but left them restated in 27 docstrings: eight `take_fx_*` tools repeating the
   `fx_index` convention, the shared MIDI note filter spelled out in eight transform tools
@@ -272,7 +303,7 @@ The bridge did not change; `BRIDGE_VERSION` stays at 1.7.1 and no redeploy is ne
   defaulting to the existing full response so nothing changes for existing callers:
   `fields=["pitch","start_beat"]` keeps only the named keys, and `return_notes=False` on a
   write drops the echo entirely. Asking for beats and dropping selected/muted roughly
-  halves the response. An unrecognised field name is reported in `fields_ignored` and
+  halves the response. An unrecognized field name is reported in `fields_ignored` and
   changes nothing: these wrap write tools, and the edit has already happened by the time
   the filter runs, so a typo in an output filter must not be reported as a failed edit.
 - **The bridge announces its version in the REAPER console at startup.** REAPER runs the
@@ -637,7 +668,7 @@ is in beats, pitch in semitones, and each tool is a single undo step.
 ### Removed
 - Five dead MIDI handlers that no tool could reach (`QuantizeItem`, `TransposeMIDINotes`,
   `QuantizeMIDINotes`, `HumanizeMIDITiming`, `AnalyzeMIDIPattern`). They were unreachable from
-  every public entry point, so no shipped behaviour changes. Among them: a "quantize" that
+  every public entry point, so no shipped behavior changes. Among them: a "quantize" that
   returned `ok` without touching a note, and a humanize with a hardcoded PPQ that silently
   restretched notes.
 

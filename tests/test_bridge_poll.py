@@ -145,7 +145,7 @@ def test_zero_padded_slot_keeps_its_name(scan):
     """
     slots, _, _ = scan("request_007.json")
     assert slots == "007", (
-        "the padded slot was normalised to a number; the bridge will look for "
+        "the padded slot was normalized to a number; the bridge will look for "
         "request_7.json, never find it, and strand the entry forever"
     )
 

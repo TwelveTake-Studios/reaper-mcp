@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "twelvetake-reaper-mcp"
-version = "1.7.8"
+version = "1.8.0"
 description = "MCP server for controlling REAPER DAW - mixing, mastering, MIDI composition, and full music production"
 readme = "README.md"
 license = "MIT"
@@ -78,11 +78,13 @@ only-include = [
 # no site-packages path to dig it out of. `--install-bridge` deploys this copy.
 [tool.hatch.build.targets.wheel.force-include]
 "reaper_mcp_bridge.lua" = "reaper_mcp_bridge.lua"
+"twelvetake_mcp_analyzer.jsfx" = "twelvetake_mcp_analyzer.jsfx"
 
 [tool.hatch.build.targets.sdist]
 include = [
     "reaper_mcp_server.py",
     "reaper_mcp_bridge.lua",
+    "twelvetake_mcp_analyzer.jsfx",
     "README.md",
     "LICENSE",
     "requirements.txt",

@@ -161,7 +161,7 @@ def test_the_label_is_written_into_the_request(request_dir):
     assert sent["func"] == "DeleteTrack"
 
 
-def test_an_unlabelled_request_has_no_undo_key(request_dir):
+def test_an_unlabeled_request_has_no_undo_key(request_dir):
     async def go():
         task = asyncio.ensure_future(srv.reaper_call_file("CountTracks", [0]))
         sent = await _capture(request_dir, {"ok": True, "ret": 1})

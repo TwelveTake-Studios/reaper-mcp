@@ -79,7 +79,7 @@ def lua_tmp(tmp_path):
 def stub_render_reaper(targets_lua=None, action_lua=""):
     """A REAPER stand-in for the render surface.
 
-    The settings hold recognisably non-default user values so a restore-to-defaults
+    The settings hold recognizably non-default user values so a restore-to-defaults
     bug would be caught. ``during_render`` snapshots what the settings were at the
     moment Main_OnCommand fired — the only moment they may legitimately differ from
     the user's own. ``action_lua`` simulates what the render command does: create

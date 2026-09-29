@@ -4,7 +4,7 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.7.8"
+local BRIDGE_VERSION = "1.8.0"
 local BRIDGE_SOURCE = debug and debug.getinfo and debug.getinfo(1, "S").source or ""
 local BRIDGE_PATH = BRIDGE_SOURCE:sub(1, 1) == "@" and BRIDGE_SOURCE:sub(2) or ""
 local INSTANCE_SECTION = "TwelveTake_REAPER_MCP"
@@ -54,6 +54,9 @@ local function encode_json(v)
     elseif type(v) == "boolean" then
         return tostring(v)
     elseif type(v) == "number" then
+        if v ~= v or v == math.huge or v == -math.huge then
+            return "null"
+        end
         return tostring(v)
     elseif type(v) == "string" then
         local escaped = v:gsub('\\', '\\\\'):gsub('"', '\\"')
@@ -1901,7 +1904,7 @@ end
 -- `notes` here is ALREADY scoped by the caller's filter: an out-of-scope note is invisible —
 -- never edited, never deleted, and never a partner that could cause someone else's deletion.
 --   dedupe (both modes): notes sharing an onset collapse to one — highest velocity, tie to the
---     longest, tie to the lowest index. Runs first because trimming to a same-onset neighbour
+--     longest, tie to the lowest index. Runs first because trimming to a same-onset neighbor
 --     would otherwise produce a zero-length note.
 --   trim: each note's end pulls back to the next onset (one pass, off ORIGINAL onsets). If that
 --     would leave it shorter than min_length_ppq it is removed instead — counted as deduped,
@@ -2241,6 +2244,438 @@ local function RenderProject(path, start_t, end_t, tail, overwrite)
 
     return {ok = true, ret = true, output = path, targets = targets}
 end
+
+-- Audio measurement
+
+local ANALYZER_PROTOCOL = 1
+local ANALYZER_GMEM = "TwelveTake_MCP_Analyzer"
+local ANALYZER_BIN_BASE = 1024
+local ANALYZER_BINS = 2049
+local ANALYZER_FILES = {
+    "TwelveTake/twelvetake_mcp_analyzer.jsfx",
+    "TwelveTake REAPER MCP/TwelveTake/twelvetake_mcp_analyzer.jsfx",
+}
+local ANALYZER_HINT = "Install it with: twelvetake-reaper-mcp --install-bridge (ReaPack users: Extensions > ReaPack > Synchronize packages)"
+local MEASURE_HELPER_NAME = "__twelvetake_measure__"
+local OCTAVE_CENTERS = {31.5, 63, 125, 250, 500, 1000, 2000, 4000, 8000, 16000}
+
+local function finite(x)
+    return type(x) == "number" and x == x and x ~= math.huge and x ~= -math.huge
+end
+
+local function round_to(x, places)
+    if not finite(x) then return nil end
+    local m = 10 ^ places
+    if x < 0 then return -math.floor(-x * m + 0.5) / m end
+    return math.floor(x * m + 0.5) / m
+end
+
+local function db_power(x)
+    if not finite(x) or x <= 0 then return nil end
+    return 10 * math.log(x, 10)
+end
+
+local function db_amp(x)
+    if not finite(x) or x <= 0 then return nil end
+    return 20 * math.log(x, 10)
+end
+
+local function parse_duration(text)
+    local total = 0
+    for part in tostring(text):gmatch("[^:]+") do
+        local v = tonumber(part)
+        if not v then return nil end
+        total = total * 60 + v
+    end
+    return total
+end
+
+local function parse_render_stats(text)
+    local entries = {}
+    local current
+    for token in (tostring(text or "") .. ";"):gmatch("([^;]*);") do
+        local key, value = token:match("^([A-Z]+):(.*)$")
+        if key == "FILE" then
+            current = {name = value}
+            entries[#entries + 1] = current
+        elseif current and key then
+            value = value:match("^%s*(.-)%s*$")
+            if key == "LENGTH" then
+                current.length = parse_duration(value)
+            else
+                current[key] = tonumber(value)
+            end
+        elseif current and token ~= "" then
+            current.name = current.name .. ";" .. token
+        end
+    end
+    return entries
+end
+
+local SILENT_RATIO = 1e-12
+
+local function both_audible(a, b)
+    return finite(a) and finite(b) and a > 0 and b > 0
+        and math.min(a, b) >= SILENT_RATIO * math.max(a, b)
+end
+
+local function stereo_from_sums(sll, srr, slr)
+    local out = {}
+    if both_audible(sll, srr) then
+        out.correlation = slr / math.sqrt(sll * srr)
+        out.balance_db = db_power(sll / srr)
+    end
+    local mid, side = sll + srr + 2 * slr, sll + srr - 2 * slr
+    if finite(mid) and finite(side) and mid > 0 and side > 0 then
+        out.side_to_mid_db = db_power(side / mid)
+    end
+    return out
+end
+
+local function spectrum_from_bins(pl, pr, cross, bins, frames, srate, n_fft, wsum2)
+    if not (frames and frames >= 1 and srate and srate > 0 and n_fft and n_fft > 0 and wsum2 and wsum2 > 0) then
+        return nil
+    end
+    local norm = 2 / (n_fft * wsum2 * frames)
+    local bin_hz = srate / n_fft
+    local bands = as_array({})
+    local xs, ys = {}, {}
+    for _, c in ipairs(OCTAVE_CENTERS) do
+        local lo, hi = c / math.sqrt(2), c * math.sqrt(2)
+        if lo < srate / 2 then
+            local sum = 0
+            for k = math.max(1, math.ceil(lo / bin_hz)), bins - 2 do
+                local f = k * bin_hz
+                if f >= hi then break end
+                if f >= lo then sum = sum + (pl[k] + pr[k]) / 2 end
+            end
+            local level = db_power(2 * norm * sum)
+            bands[#bands + 1] = {hz = c, dbfs = level and round_to(level, 1) or -math.huge}
+            if level and c >= 63 and c <= 8000 then
+                xs[#xs + 1] = math.log(c, 2)
+                ys[#ys + 1] = level
+            end
+        end
+    end
+    local weighted, total, low_x, low_l, low_r = 0, 0, 0, 0, 0
+    for k = 1, bins - 2 do
+        local f = k * bin_hz
+        local p = pl[k] + pr[k]
+        if f >= 20 and f <= 20000 then
+            weighted = weighted + f * p
+            total = total + p
+        end
+        if f >= 20 and f < 150 then
+            low_x = low_x + cross[k]
+            low_l = low_l + pl[k]
+            low_r = low_r + pr[k]
+        end
+    end
+    local tilt
+    if #xs >= 3 then
+        local mx, my = 0, 0
+        for i = 1, #xs do mx = mx + xs[i]; my = my + ys[i] end
+        mx, my = mx / #xs, my / #xs
+        local num, den = 0, 0
+        for i = 1, #xs do
+            num = num + (xs[i] - mx) * (ys[i] - my)
+            den = den + (xs[i] - mx) ^ 2
+        end
+        if den > 0 then tilt = num / den end
+    end
+    return {
+        bands = bands,
+        centroid_hz = total > 0 and round_to(weighted / total, 0) or nil,
+        tilt_db_per_octave = round_to(tilt, 2),
+        low_correlation = both_audible(low_l, low_r) and round_to(low_x / math.sqrt(low_l * low_r), 3) or nil,
+    }
+end
+
+local function analyzer_path()
+    local base = reaper.GetResourcePath() .. "/Effects/"
+    for _, rel in ipairs(ANALYZER_FILES) do
+        if file_exists(base .. rel) then return rel end
+    end
+    return nil
+end
+
+local MASTER_POST_FX_ENVELOPES = {"Volume", "Pan", "Width", "Trim Volume", "Mute"}
+
+local function master_output_altered(master)
+    local v = function(key) return reaper.GetMediaTrackInfo_Value(master, key) end
+    if v("D_PAN") ~= 0 or v("D_WIDTH") ~= 1 then return true end
+    if v("I_PANMODE") == 6 and (v("D_DUALPANL") ~= -1 or v("D_DUALPANR") ~= 1) then return true end
+    for _, name in ipairs(MASTER_POST_FX_ENVELOPES) do
+        local env = reaper.GetTrackEnvelopeByName(master, name)
+        if env and reaper.CountEnvelopePoints(env) > 0 then return true end
+    end
+    return false
+end
+
+local function add_analyzer_quietly(helper, rel)
+    local ok, chunk = reaper.GetTrackStateChunk(helper, "", false)
+    if not ok or chunk:find("<FXCHAIN", 1, true) then return -1 end
+    local fxchain = "<FXCHAIN\nSHOW 0\nLASTSEL 0\nDOCKED 0\nBYPASS 0 0 0\n<JS \"" .. rel .. "\" \"\"\n"
+        .. string.rep("- ", 64) .. "\n>\nFLOATPOS 0 0 0 0\nWAK 0 0\n>\n"
+    local replaced, count = chunk:gsub(">%s*$", fxchain .. ">")
+    if count ~= 1 or not reaper.SetTrackStateChunk(helper, replaced, false) then return -1 end
+    return reaper.TrackFX_GetCount(helper) == 1 and 0 or -1
+end
+
+local function read_analyzer()
+    local g = reaper.gmem_read
+    local n_fft = g(15)
+    local bins = math.floor(n_fft / 2 + 0.5) + 1
+    local pl, pr, cross = {}, {}, {}
+    for k = 0, bins - 1 do
+        pl[k] = g(ANALYZER_BIN_BASE + k)
+        pr[k] = g(ANALYZER_BIN_BASE + bins + k)
+        cross[k] = g(ANALYZER_BIN_BASE + 2 * bins + k)
+    end
+    return {
+        ran = g(1) == ANALYZER_PROTOCOL, samples = g(2),
+        peak = math.max(g(3), g(4)), true_peak = math.max(g(5), g(6)),
+        sll = g(7), srr = g(8), slr = g(9), overs = g(12),
+        frames = g(13), srate = g(14), n_fft = n_fft, wsum2 = g(16),
+        bins = bins, pl = pl, pr = pr, cross = cross,
+    }
+end
+
+local function measure_target(track_index, item_index, start_t, end_t, want_analyzer)
+    local master = reaper.GetMasterTrack(0)
+    local track = track_index == -1 and master or reaper.GetTrack(0, track_index)
+    if not track then return nil, {ok = false, error = "Track not found"} end
+    local item
+    if item_index >= 0 then
+        if track == master then
+            return nil, {ok = false, error = "Items are on tracks: pass the item's track_index with item_index"}
+        end
+        item = reaper.GetTrackMediaItem(track, item_index)
+        if not item then return nil, {ok = false, error = "Item not found"} end
+        if start_t >= 0 or end_t >= 0 then
+            return nil, {ok = false, error = "An item is measured over its own span: leave start_time and end_time out"}
+        end
+        start_t = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+        end_t = start_t + reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+    end
+    local ranged = start_t >= 0 or end_t >= 0
+    if ranged and (start_t < 0 or end_t < 0) then
+        return nil, {ok = false, error = "Pass both start_time and end_time, or neither"}
+    end
+    if ranged and end_t <= start_t then
+        return nil, {ok = false, error = "end_time must be after start_time"}
+    end
+    if not ranged and reaper.GetProjectLength(0) <= 0 then
+        return nil, {ok = false, error = "Nothing to measure: the project is empty"}
+    end
+    local play = reaper.GetPlayState()
+    if play & 1 == 1 or play & 4 == 4 then
+        return nil, {ok = false, error = "Stop playback first: measuring runs a render dry run of the project"}
+    end
+
+    local saved = {tracks = {}, muted = {}}
+    for i = 0, reaper.CountTracks(0) - 1 do
+        local t = reaper.GetTrack(0, i)
+        saved.tracks[#saved.tracks + 1] = {t, reaper.IsTrackSelected(t)}
+    end
+    saved.master_selected = reaper.IsTrackSelected(master)
+    saved.ts_start, saved.ts_end = reaper.GetSet_LoopTimeRange2(0, false, false, 0, 0, false)
+    saved.loop_start, saved.loop_end = reaper.GetSet_LoopTimeRange2(0, false, true, 0, 0, false)
+    saved.cursor = reaper.GetCursorPosition()
+
+    local helper, analyzer_track, analyzer_fx
+    local function restore()
+        if analyzer_track and analyzer_track ~= helper and analyzer_fx then
+            local _, name = reaper.TrackFX_GetFXName(analyzer_track, analyzer_fx, "")
+            if name:find("TwelveTake MCP Analyzer", 1, true) then
+                reaper.TrackFX_Delete(analyzer_track, analyzer_fx)
+            end
+        end
+        if helper then reaper.DeleteTrack(helper) end
+        for _, m in ipairs(saved.muted) do reaper.SetMediaItemInfo_Value(m[1], "B_MUTE", m[2]) end
+        for _, e in ipairs(saved.tracks) do reaper.SetTrackSelected(e[1], e[2]) end
+        reaper.SetTrackSelected(master, saved.master_selected)
+        reaper.GetSet_LoopTimeRange2(0, true, false, saved.ts_start, saved.ts_end, false)
+        reaper.GetSet_LoopTimeRange2(0, true, true, saved.loop_start, saved.loop_end, false)
+        reaper.SetEditCurPos(saved.cursor, false, false)
+    end
+
+    local function run()
+        local note
+        for _, e in ipairs(saved.tracks) do reaper.SetTrackSelected(e[1], false) end
+        reaper.SetTrackSelected(master, false)
+        if track ~= master then reaper.SetTrackSelected(track, true) end
+        if ranged then reaper.GetSet_LoopTimeRange2(0, true, false, start_t, end_t, false) end
+        if item then
+            for i = 0, reaper.CountTrackMediaItems(track) - 1 do
+                local it = reaper.GetTrackMediaItem(track, i)
+                if it ~= item then
+                    local pos = reaper.GetMediaItemInfo_Value(it, "D_POSITION")
+                    local len = reaper.GetMediaItemInfo_Value(it, "D_LENGTH")
+                    if pos < end_t and pos + len > start_t then
+                        saved.muted[#saved.muted + 1] = {it, reaper.GetMediaItemInfo_Value(it, "B_MUTE")}
+                        reaper.SetMediaItemInfo_Value(it, "B_MUTE", 1)
+                    end
+                end
+            end
+        end
+
+        local rel = want_analyzer and analyzer_path() or nil
+        if want_analyzer and not rel then
+            note = "The TwelveTake MCP Analyzer is not installed, so true peak and the spectrum are unavailable. " .. ANALYZER_HINT
+        end
+        if rel then
+            if track == master then
+                if reaper.GetMediaTrackInfo_Value(master, "I_FXEN") == 0 then
+                    note = "The master's FX chain is bypassed, so the analyzer could not run there."
+                    rel = nil
+                else
+                    analyzer_track = master
+                end
+            else
+                reaper.InsertTrackAtIndex(0, false)
+                helper = reaper.GetTrack(0, 0)
+                reaper.GetSetMediaTrackInfo_String(helper, "P_NAME", MEASURE_HELPER_NAME, true)
+                reaper.SetMediaTrackInfo_Value(helper, "B_MAINSEND", 0)
+                reaper.SetMediaTrackInfo_Value(helper, "D_VOL", 1)
+                reaper.SetMediaTrackInfo_Value(helper, "D_PAN", 0)
+                reaper.SetMediaTrackInfo_Value(helper, "B_SOLO_DEFEAT", 1)
+                local send = reaper.CreateTrackSend(track, helper)
+                for key, value in pairs({I_SENDMODE = 0, D_VOL = 1, D_PAN = 0, B_MUTE = 0, B_PHASE = 0,
+                                         B_MONO = 0, I_SRCCHAN = 0, I_DSTCHAN = 0}) do
+                    reaper.SetTrackSendInfo_Value(track, 0, send, key, value)
+                end
+                reaper.SetTrackSelected(helper, true)
+                analyzer_track = helper
+            end
+        end
+        if rel then
+            if analyzer_track == helper then
+                analyzer_fx = add_analyzer_quietly(helper, rel)
+            else
+                analyzer_fx = reaper.TrackFX_AddByName(analyzer_track, "JS:" .. rel, false, -1)
+            end
+            if analyzer_fx < 0 then
+                note = "The TwelveTake MCP Analyzer could not be loaded. " .. ANALYZER_HINT
+                analyzer_fx = nil
+            elseif reaper.TrackFX_GetParam(analyzer_track, analyzer_fx, 0) ~= ANALYZER_PROTOCOL then
+                note = "The installed TwelveTake MCP Analyzer does not match this bridge. " .. ANALYZER_HINT
+            else
+                reaper.gmem_attach(ANALYZER_GMEM)
+                for i = 0, ANALYZER_BIN_BASE + 3 * ANALYZER_BINS do reaper.gmem_write(i, 0) end
+                reaper.gmem_write(17, reaper.time_precise())
+                reaper.gmem_write(0, 1)
+            end
+        end
+
+        local action
+        if track == master then action = ranged and "42441" or "42440"
+        else action = ranged and "42439" or "42438" end
+        local _, text = reaper.GetSetProjectInfo_String(0, "RENDER_STATS", action, false)
+        local raw
+        if analyzer_fx and not note then
+            reaper.gmem_write(0, 0)
+            raw = read_analyzer()
+            if not raw.ran then
+                note = "The TwelveTake MCP Analyzer did not run during the measurement (is the FX chain bypassed or offline?)."
+                raw = nil
+            end
+        end
+
+        local entries = parse_render_stats(text)
+        local stats = helper and entries[2] or entries[1]
+        if not stats then
+            return nil, {ok = false, error = "REAPER returned no measurement for this target", stats = text}
+        end
+
+        local gain = 1
+        if raw and track == master then gain = reaper.GetMediaTrackInfo_Value(master, "D_VOL") end
+        local master_note = "The master's pan, width or automation changes the signal after the master FX, where true peak and the spectrum are measured, so those figures are approximate."
+        if raw and track == master and master_output_altered(master) then note = master_note end
+        if raw and not note and finite(stats.PEAK) then
+            local seen = db_amp(raw.peak * gain)
+            if not seen or math.abs(seen - stats.PEAK) > 0.05 then
+                if track == master then
+                    note = master_note
+                else
+                    note = "The analyzer's view differs from REAPER's by " .. tostring(round_to((seen or -999) - stats.PEAK, 2)) .. " dB, so true peak and the spectrum are approximate."
+                end
+            end
+        end
+        return {
+            target = item and "item" or (track == master and "master" or "track"),
+            stats = stats, analyzer = raw, gain = gain, note = note,
+        }
+    end
+
+    local on_master = track == master and want_analyzer
+    reaper.PreventUIRefresh(1)
+    if on_master then reaper.Undo_BeginBlock() end
+    local ok, result, err = pcall(run)
+    restore()
+    if on_master then reaper.Undo_EndBlock2(0, "", 0) end
+    reaper.PreventUIRefresh(-1)
+    reaper.UpdateArrange()
+    if not ok then return nil, {ok = false, error = "Measurement failed: " .. tostring(result)} end
+    return result, err
+end
+
+local function MeasureLoudness(track_index, item_index, start_t, end_t)
+    local m, err = measure_target(track_index, item_index, start_t, end_t, true)
+    if not m then return err end
+    local s = m.stats
+    local out = {
+        ok = true, target = m.target, duration = round_to(s.length, 3),
+        integrated_lufs = round_to(s.LUFSI, 2), short_term_max_lufs = round_to(s.LUFSSMAX, 2),
+        momentary_max_lufs = round_to(s.LUFSMMAX, 2), loudness_range_lu = round_to(s.LRA, 1),
+        sample_peak_dbfs = round_to(s.PEAK, 2),
+    }
+    if m.analyzer then
+        out.true_peak_dbtp = round_to(db_amp(m.analyzer.true_peak * m.gain), 2)
+        out.samples_over_0dbfs = m.analyzer.overs
+    end
+    out.note = m.note
+    return out
+end
+
+local function MeasureSpectrum(track_index, item_index, start_t, end_t)
+    if not analyzer_path() then
+        return {ok = false, error = "The TwelveTake MCP Analyzer is not installed", hint = ANALYZER_HINT}
+    end
+    local m, err = measure_target(track_index, item_index, start_t, end_t, true)
+    if not m then return err end
+    if not m.analyzer then return {ok = false, error = m.note or "The analyzer did not run"} end
+    local a = m.analyzer
+    local out = {ok = true, target = m.target, duration = round_to(m.stats.length, 3)}
+    if a.samples > 0 then
+        out.rms_dbfs = round_to(db_power((a.sll + a.srr) / a.samples) + db_power(m.gain * m.gain), 1)
+    end
+    local spectrum = spectrum_from_bins(a.pl, a.pr, a.cross, a.bins, a.frames, a.srate, a.n_fft, a.wsum2)
+    if spectrum then
+        local offset = db_power(m.gain * m.gain) or 0
+        for _, b in ipairs(spectrum.bands) do
+            if finite(b.dbfs) then b.dbfs = round_to(b.dbfs + offset, 1) end
+        end
+        out.bands = spectrum.bands
+        out.centroid_hz = spectrum.centroid_hz
+        out.tilt_db_per_octave = spectrum.tilt_db_per_octave
+        out.low_correlation = spectrum.low_correlation
+    else
+        out.note = "The range is too short for a spectrum (it needs at least 0.1 s)."
+    end
+    local stereo = stereo_from_sums(a.sll, a.srr, a.slr)
+    out.correlation = round_to(stereo.correlation, 3)
+    out.side_to_mid_db = round_to(stereo.side_to_mid_db, 1)
+    out.balance_db = round_to(stereo.balance_db, 1)
+    out.note = m.note or out.note
+    return out
+end
+
+DSL_FUNCTIONS.MeasureLoudness = MeasureLoudness
+DSL_FUNCTIONS.MeasureSpectrum = MeasureSpectrum
+_G.__MEASURE_TEST = {parse_render_stats = parse_render_stats, parse_duration = parse_duration,
+                     stereo_from_sums = stereo_from_sums, spectrum_from_bins = spectrum_from_bins,
+                     round_to = round_to, measure_target = measure_target}
 
 -- Scan the mailbox with ONE directory enumeration per tick: collect the request
 -- slots that actually have a file on disk, plus every response file present (for
@@ -3176,7 +3611,7 @@ local function dispatch_call(fname, args)
                     elseif fname == "GetProjectName" then
                         -- GetProjectName writes into an out-buffer, so Lua returns the name
                         -- as the FIRST and only value. Unpacking it as the second return
-                        -- left both fields empty for every caller, always. The neighbouring
+                        -- left both fields empty for every caller, always. The neighboring
                         -- GetProjectPath handler below has always done this correctly.
                         local project_name = reaper.GetProjectName(args[1] or 0, "")
                         if type(project_name) ~= "string" then project_name = "" end

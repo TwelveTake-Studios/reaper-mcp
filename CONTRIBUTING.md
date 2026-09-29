@@ -68,7 +68,7 @@ change does nothing until you deploy it *and* re-run the script in REAPER
   the deployed bridge's version and refuses to run against one too old. Skip the bump and
   users with a stale script get a confusing per-tool error instead of "your bridge is out of
   date".
-- **Array-valued fields must be wrapped in `as_array({})`** so an empty list serialises as
+- **Array-valued fields must be wrapped in `as_array({})`** so an empty list serializes as
   `[]` and not `{}`. An entire release exists because that regressed once.
 - **Errors use `{ok = false, error = "..."}`.** Match the shape of the handler next to yours.
 - **A tool must not report success for work it did not do.** Several of the bugs fixed in

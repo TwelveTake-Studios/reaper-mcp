@@ -94,6 +94,35 @@ def test_foreign_id_is_never_returned(mailbox):
     assert res.get("ret") != 999
 
 
+async def _answer_raw(mailbox, text):
+    deadline = time.time() + 2.0
+    while time.time() < deadline:
+        for r in mailbox.glob("request_*.json"):
+            if not r.read_text().strip():
+                continue
+            slot = r.name[len("request_"):-len(".json")]
+            (mailbox / f"response_{slot}.json").write_text(text)
+            return
+        await asyncio.sleep(0.005)
+    raise AssertionError("no request file ever appeared")
+
+
+def test_a_reply_that_stays_malformed_is_reported_not_waited_out(mailbox, monkeypatch):
+    monkeypatch.setattr(srv, "FILE_TIMEOUT", 5.0)
+    monkeypatch.setattr(srv, "MALFORMED_REPLY_SECONDS", 0.05)
+
+    async def go():
+        task = asyncio.ensure_future(srv.reaper_call_file("DevThing", []))
+        await _answer_raw(mailbox, '{"ok": true, "value": inf}')
+        started = time.time()
+        return await task, time.time() - started
+    res, waited = run(go())
+    assert res["ok"] is False and "not valid JSON" in res["error"], res
+    assert res["reply_start"].startswith('{"ok": true, "value": inf')
+    assert waited < 2.0
+    assert not list(mailbox.glob("response_*.json"))
+
+
 def test_foreign_response_is_left_for_its_owner(mailbox):
     """Deleting it would strand the process that is still waiting for it."""
     async def go():
@@ -109,7 +138,7 @@ def test_foreign_response_is_left_for_its_owner(mailbox):
 def test_response_without_an_id_is_still_accepted(mailbox):
     """A bridge older than the echo, and the malformed-JSON path which has no id to echo.
 
-    The first is exactly today's behaviour and must not regress into a timeout; the
+    The first is exactly today's behavior and must not regress into a timeout; the
     second hands back an error rather than a plausible answer, so it is safe to take.
     """
     async def go():

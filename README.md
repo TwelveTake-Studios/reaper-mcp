@@ -2,7 +2,7 @@
 
 A [TwelveTake Studios](https://twelvetake.com) project.
 
-[![Tools](https://img.shields.io/badge/tools-177-blue)](https://github.com/TwelveTake-Studios/reaper-mcp)
+[![Tools](https://img.shields.io/badge/tools-179-blue)](https://github.com/TwelveTake-Studios/reaper-mcp)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow)](https://buymeacoffee.com/twelvetake)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-ff5e5b)](https://ko-fi.com/twelvetake)
 
@@ -12,7 +12,7 @@ Listed in the [MCP Registry](https://registry.modelcontextprotocol.io/) as `mcp-
 
 A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control REAPER DAW for mixing, mastering, MIDI composition, and full music production workflows.
 
-**Version:** 1.7.8
+**Version:** 1.8.0
 
 ## Why This Server
 
@@ -31,10 +31,11 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
 ### Zero Configuration
 
 - **File-based communication** works immediately — no network setup, no ports to configure
-- **Stock REAPER Lua only** — the bridge script has no dependencies, nothing extra to install in REAPER
+- **Stock REAPER only**: the bridge is a plain Lua script and the analyzer is a JSFX plugin, so you
+  don't install anything else in REAPER
 - Copy the script, run it, connect your AI assistant
 
-### 177 Tools Covering Real Production Needs
+### 179 Tools Covering Real Production Needs
 
 - **Full FX control** — add/remove plugins, get/set any parameter by index, manage presets, bypass
 - **FX parameter automation** — automate any plugin knob (flanger depth, filter cutoff, etc.)
@@ -45,6 +46,9 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
   strum, velocity ramps — each targetable by pitch range, beat window, or channel
 - **Audio items** — import, split, duplicate, fade, position, mute
 - **Markers & regions** — create, edit, navigate, render by region
+- **Measurement**: loudness, loudness range, true peak, the octave-band spectrum and stereo
+  correlation for the master, a track or an item. It passes the EBU's synthetic compliance signals
+  for loudness, true peak and loudness range.
 - **Undoable edits**: every change the AI makes is one named step in REAPER's undo history
   ("MCP: delete track"), so Ctrl+Z in REAPER reverses one tool call at a time
 
@@ -67,9 +71,10 @@ through it. Install it one of three ways.
 uvx twelvetake-reaper-mcp --install-bridge
 ```
 
-That copies `reaper_mcp_bridge.lua` into REAPER's Scripts folder for your platform, backing
-up a different copy if one is already there. It writes nothing else, and the server never
-touches your REAPER installation on its own. Pass a path if REAPER is portable or installed
+That copies `reaper_mcp_bridge.lua` into REAPER's Scripts folder for your platform, and the
+TwelveTake MCP Analyzer, a JSFX plugin that the measurement tools use, into `Effects/TwelveTake`.
+If a different copy of the bridge is already there, it backs that copy up first. It writes nothing
+else, and the server never touches your REAPER installation on its own. Pass a path if REAPER is portable or installed
 somewhere unusual: `--install-bridge "/path/to/REAPER/Scripts"`.
 
 Then load it in REAPER. Open **Actions → Show action list**:
@@ -114,7 +119,8 @@ right-click it, choose **Install**, and click **OK**:
 
 ![ReaPack's package browser with Install highlighted for the bridge](https://raw.githubusercontent.com/TwelveTake-Studios/reaper-mcp/main/images/reapack-install.png)
 
-ReaPack adds the script to the action list. Run it from there as in option A.
+ReaPack adds the script to the action list and installs the analyzer. Run the script from there
+as in option A.
 
 **Option C: by hand**
 
@@ -122,7 +128,9 @@ ReaPack adds the script to the action list. Run it from there as in option A.
    - Windows: `%APPDATA%\REAPER\Scripts\`
    - macOS: `~/Library/Application Support/REAPER/Scripts/`
    - Linux: `~/.config/REAPER/Scripts/`
-2. Load and run it as in option A.
+2. Copy `twelvetake_mcp_analyzer.jsfx` to `Effects/TwelveTake/`, next to that Scripts folder.
+   The measurement tools need it; nothing else does.
+3. Load and run the script as in option A.
 
 #### Start the bridge with REAPER
 
@@ -582,6 +590,17 @@ what is already there. It is flagged `destructive` so a client can prompt first.
 | `get_time_selection()` | Get time selection |
 | `clear_time_selection()` | Clear time selection |
 | `delete_selected_items()` | Delete selected items |
+
+### Measurement (2 tools)
+
+| Tool | Description |
+|------|-------------|
+| `measure_loudness(track, item, start, end)` | Integrated, short-term max and momentary max LUFS, loudness range, sample peak, true peak |
+| `measure_spectrum(track, item, start, end)` | Octave-band levels, spectral centroid, tilt, stereo correlation, side-to-mid, balance |
+
+Both measure the master mix unless you give them a track or an item. The loudness figures come
+from REAPER's own loudness measurement. True peak, the spectrum and the stereo figures come from the
+TwelveTake MCP Analyzer, which `--install-bridge` installs and the ReaPack package includes.
 
 ### Mixing Helpers (6 tools)
 

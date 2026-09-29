@@ -12,7 +12,7 @@ License: MIT
 Version: 1.6.5
 """
 
-__version__ = "1.7.8"
+__version__ = "1.8.0"
 
 import os
 import asyncio
@@ -119,7 +119,7 @@ BRIDGE_DIR_PROBLEM = bridge_dir_problem(BRIDGE_DIR)
 # The bridge script version this server needs. REAPER runs whatever copy is deployed in
 # its Scripts folder, deployed by hand, so the halves drift. Anything older cannot answer
 # GetBridgeVersion and is reported as out of date instead of failing in obscure ways.
-MIN_BRIDGE_VERSION = "1.7.8"
+MIN_BRIDGE_VERSION = "1.8.0"
 
 # How long to wait for the bridge to answer. Configurable because the bridge answers
 # only after the work finishes and renders run at roughly realtime, so 5s reports a
@@ -133,6 +133,7 @@ try:
 except ValueError:
     FILE_TIMEOUT = 5.0
 FILE_POLL_INTERVAL = 0.02
+MALFORMED_REPLY_SECONDS = 0.5
 
 # Deadline for calls that block the bridge for as long as the work takes. Renders run at
 # roughly realtime, so the 5s transport default reports a failure for anything past five
@@ -178,9 +179,9 @@ CONVENTIONS (apply to every tool unless its own description says otherwise):
   (start_time/end_time) and beats (start_beat/end_beat). Two opt-outs, both defaulting to
   the full list: pass fields=["pitch","start_beat"] to keep only the keys you need (asking
   for beats and dropping selected/muted roughly halves it), or return_notes=False on a
-  write you are not reading back. An unrecognised field name is reported in
+  write you are not reading back. An unrecognized field name is reported in
   `fields_ignored` and changes nothing.
-- Every tool call that edits the project is ONE step in REAPER's undo history, labelled
+- Every tool call that edits the project is ONE step in REAPER's undo history, labeled
   "MCP: <tool name>", so undo() reverses one tool call at a time; get_undo_state shows
   whether the next step is yours or the user's. Transport, view,
   selection, run_action and project open/save/render are not undo steps.
@@ -393,8 +394,10 @@ async def reaper_call_file(func: str, args: list, timeout: float = None, calls: 
     try:
         # Wait for response
         start_time = time.time()
+        malformed_text, malformed_since = None, 0.0
         while time.time() - start_time < deadline:
             if response_file.exists():
+                response_text = None
                 try:
                     response_text = response_file.read_text(encoding="utf-8")
                     if response_text.strip():
@@ -410,7 +413,7 @@ async def reaper_call_file(func: str, args: list, timeout: float = None, calls: 
                             continue
                         # No id at all means a bridge older than the echo, or the
                         # malformed-JSON path which never decoded an id to echo. Both are
-                        # safe to take: the first is exactly today's behaviour, and the
+                        # safe to take: the first is exactly today's behavior, and the
                         # second hands back an error rather than a plausible answer.
                         try:
                             request_file.unlink(missing_ok=True)
@@ -419,7 +422,20 @@ async def reaper_call_file(func: str, args: list, timeout: float = None, calls: 
                             pass
                         return response_data
                 except (json.JSONDecodeError, UnicodeDecodeError):
-                    pass
+                    if response_text is not None and response_text == malformed_text:
+                        if time.time() - malformed_since >= MALFORMED_REPLY_SECONDS:
+                            try:
+                                request_file.unlink(missing_ok=True)
+                                response_file.unlink(missing_ok=True)
+                            except OSError:
+                                pass
+                            return {
+                                "ok": False,
+                                "error": f"{func}: the bridge answered with text that is not valid JSON",
+                                "reply_start": response_text[:200],
+                            }
+                    else:
+                        malformed_text, malformed_since = response_text, time.time()
                 except OSError:
                     pass
             await asyncio.sleep(FILE_POLL_INTERVAL)
@@ -2791,6 +2807,59 @@ async def render_project(
     )
 
 
+def _measure_args(track_index, item_index, start_time, end_time):
+    return [
+        track_index,
+        -1 if item_index is None else item_index,
+        -1 if start_time is None else start_time,
+        -1 if end_time is None else end_time,
+    ]
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def measure_loudness(
+    track_index: int = -1,
+    item_index: int = None,
+    start_time: float = None,
+    end_time: float = None,
+) -> dict:
+    """
+    Measure loudness as REAPER's loudness window does: integrated LUFS, short-term and
+    momentary max, loudness range, sample peak, plus true peak.
+
+    Target: the master (default), a track, or one item (its track's output over the item,
+    other items muted). start_time/end_time limit it to a range. It runs a render dry run, so
+    it writes no files, puts selections back and adds no undo step. Measuring the master marks
+    the project as modified, even though nothing in it changes.
+
+    Returns:
+        integrated_lufs, short_term_max_lufs, momentary_max_lufs, loudness_range_lu,
+        sample_peak_dbfs, true_peak_dbtp, samples_over_0dbfs, duration; a note when a
+        figure is approximate or unavailable.
+    """
+    return await reaper_call("MeasureLoudness", *_measure_args(track_index, item_index, start_time, end_time),
+                             timeout=RENDER_TIMEOUT)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def measure_spectrum(
+    track_index: int = -1,
+    item_index: int = None,
+    start_time: float = None,
+    end_time: float = None,
+) -> dict:
+    """
+    Measure tonal balance and stereo image: octave-band levels (31.5 Hz to 16 kHz),
+    spectral centroid, tilt in dB per octave, stereo correlation overall and below 150 Hz,
+    side-to-mid level and left/right balance.
+
+    Same targets and range as measure_loudness. Levels are dBFS with a full-scale sine at 0,
+    as in REAPER. Needs the TwelveTake MCP Analyzer, which --install-bridge installs.
+    """
+    return await reaper_call("MeasureSpectrum", *_measure_args(track_index, item_index, start_time, end_time),
+                             timeout=RENDER_TIMEOUT)
+
+
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def render_region(region_index: int, output_path: str) -> dict:
     """
@@ -3960,12 +4029,14 @@ UNDO_STEP_TOOLS = wrap_tools_in_undo_steps()
 # --- MAIN ---
 
 BRIDGE_SCRIPT_NAME = "reaper_mcp_bridge.lua"
+ANALYZER_NAME = "twelvetake_mcp_analyzer.jsfx"
 
 USAGE = f"""twelvetake-reaper-mcp {__version__}
 
   twelvetake-reaper-mcp                      Run the MCP server (stdio).
   twelvetake-reaper-mcp --install-bridge     Copy {BRIDGE_SCRIPT_NAME} into REAPER's
-                                             Scripts folder, backing up a different copy.
+                                             Scripts folder, backing up a different copy,
+                                             and {ANALYZER_NAME} into Effects/TwelveTake.
   twelvetake-reaper-mcp --install-bridge DIR Install into an explicit folder instead
                                              (portable installs, non-standard locations).
   twelvetake-reaper-mcp --install-bridge --autostart
@@ -3990,6 +4061,26 @@ def bundled_bridge_script() -> Optional[Path]:
     """The bridge script shipped alongside this module, if it is there."""
     candidate = Path(__file__).resolve().parent / BRIDGE_SCRIPT_NAME
     return candidate if candidate.is_file() else None
+
+
+def bundled_analyzer() -> Optional[Path]:
+    candidate = Path(__file__).resolve().parent / ANALYZER_NAME
+    return candidate if candidate.is_file() else None
+
+
+def install_analyzer(scripts_dir: Path) -> None:
+    source = bundled_analyzer()
+    if source is None:
+        print(f"warning: {ANALYZER_NAME} was not found next to {Path(__file__).name}; "
+              "measure_spectrum and true peak will be unavailable.", file=sys.stderr)
+        return
+    target = Path(scripts_dir).parent / "Effects" / "TwelveTake" / ANALYZER_NAME
+    if target.is_file() and target.read_bytes() == source.read_bytes():
+        print(f"{ANALYZER_NAME} is already this version in: {target}")
+        return
+    target.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copy2(source, target)
+    print(f"Installed {ANALYZER_NAME} to: {target}")
 
 
 def install_bridge(dest_dir: Optional[Path] = None, autostart: bool = False) -> int:
@@ -4027,6 +4118,7 @@ def install_bridge(dest_dir: Optional[Path] = None, autostart: bool = False) -> 
             print(f"Backed up existing script to: {backup}")
         shutil.copy2(source, target)
         print(f"Installed {BRIDGE_SCRIPT_NAME} to: {target}")
+    install_analyzer(scripts_dir)
     print(f"Bridge data directory: {BRIDGE_DIR}")
     if autostart:
         enable_autostart(scripts_dir, target, explicit_dir=dest_dir is not None)

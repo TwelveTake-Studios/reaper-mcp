@@ -92,3 +92,11 @@ def test_mcp_dependency_is_capped_below_2():
     assert "<2" in pin.replace(" ", ""), (
         f"mcp dependency has no upper bound ({pin}); mcp 2.0 breaks the import"
     )
+
+
+def test_wheel_and_sdist_ship_the_analyzer():
+    wheel = table("tool.hatch.build.targets.wheel") + table("tool.hatch.build.targets.wheel.force-include")
+    assert srv.ANALYZER_NAME in wheel
+    assert srv.ANALYZER_NAME in table("tool.hatch.build.targets.sdist")
+    found = srv.bundled_analyzer()
+    assert found is not None and found.is_file()

@@ -58,7 +58,7 @@ def test_timeout_is_keyword_only():
         run(srv.reaper_call("CountTracks", 0, 99.0, _positional_deadline=True))
 
 
-# --- the transport actually honours it -------------------------------------------
+# --- the transport actually honors it -------------------------------------------
 
 def test_transport_waits_the_per_call_deadline_not_the_global(monkeypatch, tmp_path):
     """A short global must not cut a call that asked for longer."""
@@ -71,7 +71,7 @@ def test_transport_waits_the_per_call_deadline_not_the_global(monkeypatch, tmp_p
     elapsed = time.time() - start
     assert res["ok"] is False
     assert elapsed >= 0.4, (
-        f"gave up after {elapsed:.2f}s; the per-call deadline was ignored in favour "
+        f"gave up after {elapsed:.2f}s; the per-call deadline was ignored in favor "
         "of the global one"
     )
     assert "0.45s" in res["error"], "the message must name the deadline actually used"

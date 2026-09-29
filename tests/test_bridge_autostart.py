@@ -139,6 +139,27 @@ def test_installing_over_a_different_bridge_backs_it_up(monkeypatch, tmp_path):
     assert [b.read_text(encoding="utf-8") for b in backups] == ["-- an older or edited bridge\n"]
 
 
+def test_install_bridge_puts_the_analyzer_in_effects(monkeypatch, tmp_path, capsys):
+    _install_offline(monkeypatch, tmp_path / "Scripts")
+    (tmp_path / "Scripts").mkdir()
+    assert srv.install_bridge(tmp_path / "Scripts") == 0
+    installed = tmp_path / "Effects" / "TwelveTake" / srv.ANALYZER_NAME
+    assert installed.read_bytes() == srv.bundled_analyzer().read_bytes()
+    assert srv.install_bridge(tmp_path / "Scripts") == 0
+    assert f"{srv.ANALYZER_NAME} is already this version" in capsys.readouterr().out
+
+
+def test_a_stale_analyzer_is_replaced_without_leaving_a_backup(monkeypatch, tmp_path):
+    _install_offline(monkeypatch, tmp_path / "Scripts")
+    (tmp_path / "Scripts").mkdir()
+    effects = tmp_path / "Effects" / "TwelveTake"
+    effects.mkdir(parents=True)
+    (effects / srv.ANALYZER_NAME).write_text("desc:old analyzer\n", encoding="utf-8")
+    assert srv.install_bridge(tmp_path / "Scripts") == 0
+    assert (effects / srv.ANALYZER_NAME).read_bytes() == srv.bundled_analyzer().read_bytes()
+    assert sorted(p.name for p in effects.iterdir()) == [srv.ANALYZER_NAME]
+
+
 def _dispatch_script(replies):
     calls = []
 

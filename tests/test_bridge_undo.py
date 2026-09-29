@@ -83,13 +83,13 @@ def bridge(tmp_path):
     return send
 
 
-def test_a_labelled_request_is_one_named_undo_block(bridge):
+def test_a_labeled_request_is_one_named_undo_block(bridge):
     response = bridge({"func": "StubWrite", "args": ["a"], "id": "x", "undo": "MCP: set thing"})
     assert response["ok"] is True
     assert bridge.undo_log() == ["begin", "end:MCP: set thing:-1"]
 
 
-def test_an_unlabelled_request_opens_no_block(bridge):
+def test_an_unlabeled_request_opens_no_block(bridge):
     response = bridge({"func": "CountTracks", "args": [0], "id": "x"})
     assert response["ok"] is True
     assert bridge.undo_log() == []
