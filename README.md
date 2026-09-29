@@ -12,7 +12,7 @@ Listed in the [MCP Registry](https://registry.modelcontextprotocol.io/) as `mcp-
 
 A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control REAPER DAW for mixing, mastering, MIDI composition, and full music production workflows.
 
-**Version:** 1.7.7
+**Version:** 1.7.8
 
 ## Why This Server
 
@@ -58,29 +58,105 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
 
 ### 1. Install the Bridge Script in REAPER
 
-The bridge script runs inside REAPER and handles communication with the MCP server.
+The bridge is a Lua script that runs inside REAPER. The MCP server works on your project
+through it. Install it one of three ways.
 
-The package can deploy it for you:
+**Option A: one command, then run it once in REAPER**
 
 ```bash
 uvx twelvetake-reaper-mcp --install-bridge
 ```
 
 That copies `reaper_mcp_bridge.lua` into REAPER's Scripts folder for your platform, backing
-up any existing copy first. It writes nothing else, and the server never touches your REAPER
-installation on its own. Pass a path if REAPER is portable or installed somewhere unusual:
-`--install-bridge "/path/to/REAPER/Scripts"`.
+up a different copy if one is already there. It writes nothing else, and the server never
+touches your REAPER installation on its own. Pass a path if REAPER is portable or installed
+somewhere unusual: `--install-bridge "/path/to/REAPER/Scripts"`.
 
-To do it by hand instead:
+Then load it in REAPER. Open **Actions → Show action list**:
+
+![REAPER's Actions menu with Show action list highlighted](https://raw.githubusercontent.com/TwelveTake-Studios/reaper-mcp/main/images/bridge-actions-menu.png)
+
+Click **New action → Load ReaScript**:
+
+![The action list with the New action menu open and Load ReaScript highlighted](https://raw.githubusercontent.com/TwelveTake-Studios/reaper-mcp/main/images/bridge-load-reascript.png)
+
+Select `reaper_mcp_bridge.lua` in the Scripts folder and click **Open**:
+
+![The Load Script dialog in REAPER's Scripts folder with reaper_mcp_bridge.lua selected](https://raw.githubusercontent.com/TwelveTake-Studios/reaper-mcp/main/images/bridge-load-dialog.png)
+
+The script is now in the action list. Select it and click **Run**:
+
+![The action list filtered to the bridge script, ready to run](https://raw.githubusercontent.com/TwelveTake-Studios/reaper-mcp/main/images/bridge-run.png)
+
+REAPER's console confirms the bridge is running:
+
+![REAPER's console showing the bridge has started](https://raw.githubusercontent.com/TwelveTake-Studios/reaper-mcp/main/images/bridge-started.png)
+
+Next time, find it by typing `mcp bridge` in the action list's filter box, or have REAPER
+start it for you (below).
+
+**Option B: ReaPack**
+
+If you use [ReaPack](https://reapack.com/), open **Extensions → ReaPack → Import repositories**:
+
+![REAPER's Extensions menu with ReaPack's Import repositories highlighted](https://raw.githubusercontent.com/TwelveTake-Studios/reaper-mcp/main/images/reapack-menu.png)
+
+and paste this address:
+
+```
+https://github.com/TwelveTake-Studios/reaper-mcp/raw/main/index.xml
+```
+
+![ReaPack's Import repositories dialog with the address pasted in](https://raw.githubusercontent.com/TwelveTake-Studios/reaper-mcp/main/images/reapack-import.png)
+
+Then open **Extensions → ReaPack → Browse packages**, find **TwelveTake REAPER MCP bridge**,
+right-click it, choose **Install**, and click **OK**:
+
+![ReaPack's package browser with Install highlighted for the bridge](https://raw.githubusercontent.com/TwelveTake-Studios/reaper-mcp/main/images/reapack-install.png)
+
+ReaPack adds the script to the action list. Run it from there as in option A.
+
+**Option C: by hand**
 
 1. Copy `reaper_mcp_bridge.lua` to your REAPER Scripts folder:
    - Windows: `%APPDATA%\REAPER\Scripts\`
    - macOS: `~/Library/Application Support/REAPER/Scripts/`
    - Linux: `~/.config/REAPER/Scripts/`
-2. In REAPER: **Actions → Show action list → Load ReaScript**
-3. Select `reaper_mcp_bridge.lua` and click **Run**
+2. Load and run it as in option A.
 
-You should see "REAPER MCP Bridge (File-based, Full API) started" in REAPER's console.
+#### Start the bridge with REAPER
+
+A script stops when REAPER closes. To have REAPER start the bridge every time it launches:
+
+```bash
+uvx twelvetake-reaper-mcp --install-bridge --autostart
+```
+
+That adds a marked block to `__startup.lua` in REAPER's Scripts folder, backing the file up
+first, and leaves anything else in it alone. `--remove-autostart` takes the block out again.
+If you installed with ReaPack, run `uvx twelvetake-reaper-mcp --autostart` instead; it points
+REAPER at the ReaPack copy.
+
+#### Updating
+
+From 1.7.8 on, an update needs no step inside REAPER:
+
+```bash
+uvx twelvetake-reaper-mcp@latest --install-bridge
+```
+
+The running bridge loads the new script by itself, and the command tells you so, for example:
+
+```
+The running bridge reloaded itself: 1.7.8 -> 1.7.9.
+```
+
+With ReaPack, **Extensions → ReaPack → Synchronize packages** fetches the new script. It runs
+the next time the bridge starts, or right away with `uvx twelvetake-reaper-mcp --reload-bridge`. The server also asks a running bridge to reload
+when the bridge is too old for it.
+
+Updating from 1.7.7 or older needs one last manual step: run the script in REAPER again after
+installing it.
 
 ### 2. Install and Configure the MCP Server
 

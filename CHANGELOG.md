@@ -5,6 +5,41 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.7.8] - 2026-09-29
+
+**The bridge changed. Redeploy it by hand one last time** (`twelvetake-reaper-mcp --install-bridge`,
+then re-run the script in REAPER). From this version on, installing an update reloads the running
+bridge for you.
+
+### Added
+- **Updates reload the bridge for you.** `--install-bridge` now asks a running bridge to load the
+  new script, so an update needs no step inside REAPER. The server also asks an out-of-date bridge
+  to reload before refusing it, which covers updates installed any other way.
+- **REAPER can start the bridge by itself.** `--install-bridge --autostart` adds a marked block to
+  REAPER's `Scripts/__startup.lua` and leaves anything else in that file alone;
+  `--remove-autostart` takes it out again. It is opt-in because it changes your REAPER setup.
+- **The bridge is a ReaPack package.** Import
+  `https://github.com/TwelveTake-Studios/reaper-mcp/raw/main/index.xml` in
+  Extensions > ReaPack > Import repositories and install "TwelveTake REAPER MCP bridge"; ReaPack
+  then fetches new versions when it synchronizes. `--autostart` on its own sets up auto-start
+  for a bridge that is already installed, and prefers the ReaPack copy. Both this and the
+  auto-start block follow the approach in Reaper Daemon.
+- `--reload-bridge` asks the running bridge to reload its script.
+- The setup instructions in the README show each step of loading the bridge with screenshots.
+
+### Changed
+- A second copy of the bridge no longer runs alongside the first. It sees the running one and
+  exits with a message in REAPER's console.
+- `--install-bridge` says so when the running bridge was loaded from a different file than the
+  one it just installed, such as a ReaPack copy, since that bridge keeps its own version.
+
+### Fixed
+- `get_time_signature` always reported a denominator of 4 and read tempo in REAPER's own beat
+  unit, so a 6/8 project came back as 6/4 at 240 BPM. It now reads the time signature and tempo
+  REAPER is actually using: 6/8 at 120.
+- `--install-bridge` no longer leaves a backup when the bridge in REAPER's Scripts folder is
+  already identical. Each run used to add another timestamped copy.
+
 ## [1.7.7] - 2026-09-28
 
 The bridge did not change, so there is nothing to redeploy.

@@ -4,7 +4,16 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.7.6"
+local BRIDGE_VERSION = "1.7.8"
+local BRIDGE_SOURCE = debug and debug.getinfo and debug.getinfo(1, "S").source or ""
+local BRIDGE_PATH = BRIDGE_SOURCE:sub(1, 1) == "@" and BRIDGE_SOURCE:sub(2) or ""
+local INSTANCE_SECTION = "TwelveTake_REAPER_MCP"
+
+local last_beat = tonumber(reaper.GetExtState(INSTANCE_SECTION, "heartbeat"))
+if last_beat and reaper.time_precise() - last_beat < 2 then
+    reaper.ShowConsoleMsg("REAPER MCP Bridge " .. BRIDGE_VERSION .. " not started: another copy is already running.\n")
+    return
+end
 
 local bridge_dir = reaper.GetResourcePath() .. '/Scripts/mcp_bridge_data/'
 
@@ -936,18 +945,8 @@ local function SetTempo(bpm)
 end
 
 local function GetTimeSignature()
-    -- GetProjectTimeSignature2 returns: bpm (tempo), bpi (beats per measure = numerator)
-    local bpm, bpi = reaper.GetProjectTimeSignature2(0)
-    -- TimeMap_GetTimeSigAtTime at position 0 gives us the time signature
-    -- Returns: retval, timesig_num, timesig_denom, tempo
-    -- But Lua binding may differ - let's capture all and find correct values
-    local r1, r2, r3, r4 = reaper.TimeMap_GetTimeSigAtTime(0, 0)
-    -- Based on testing: r1=num(4), r2=tempo(92), so denominator not directly available
-    -- For standard time signatures, denominator is typically 4 (quarter note)
-    -- Use TimeMap2_timeToBeats to get more accurate info if needed
-    local numerator = bpi  -- beats per measure
-    local denominator = 4  -- assume quarter note (most common)
-    return {ok = true, numerator = numerator, denominator = denominator, tempo = bpm}
+    local numerator, denominator, tempo = reaper.TimeMap_GetTimeSigAtTime(0, 0)
+    return {ok = true, numerator = numerator, denominator = denominator, tempo = tempo}
 end
 
 -- Get or create an FX parameter envelope
@@ -1236,13 +1235,28 @@ end
 -- "Unknown function: GetBridgeVersion", which the server reads as "too old to
 -- identify itself" and turns into an actionable redeploy message.
 local function GetBridgeVersion()
-    return {ok = true, version = BRIDGE_VERSION}
+    return {ok = true, version = BRIDGE_VERSION, can_reload = BRIDGE_PATH ~= "", path = BRIDGE_PATH}
+end
+
+local pending_reload = nil
+
+local function ReloadBridge()
+    if BRIDGE_PATH == "" then
+        return {ok = false, error = "The bridge cannot tell which file it was loaded from, so it cannot reload itself. Re-run it in REAPER."}
+    end
+    local chunk, err = loadfile(BRIDGE_PATH)
+    if not chunk then
+        return {ok = false, error = "Could not load " .. BRIDGE_PATH .. ": " .. tostring(err)}
+    end
+    pending_reload = chunk
+    return {ok = true, reloading = true, from_version = BRIDGE_VERSION, path = BRIDGE_PATH}
 end
 
 -- Export function table for DSL
 DSL_FUNCTIONS = {
     -- Bridge metadata
     GetBridgeVersion = GetBridgeVersion,
+    ReloadBridge = ReloadBridge,
 
     -- Track info
     GetTrackInfo = GetTrackInfo,
@@ -7487,6 +7501,17 @@ local function process_request()
 end
 
 -- Main loop
+local beat_at = 0
+local function heartbeat()
+    local now = reaper.time_precise()
+    if now - beat_at >= 0.5 then
+        reaper.SetExtState(INSTANCE_SECTION, "heartbeat", tostring(now), false)
+        beat_at = now
+    end
+end
+heartbeat()
+reaper.atexit(function() reaper.DeleteExtState(INSTANCE_SECTION, "heartbeat", false) end)
+
 ensure_dir()
 -- The version goes in the banner because REAPER runs the DEPLOYED copy of this script
 -- and no package upgrade updates it. Without it there is no way to see which bridge is
@@ -7497,6 +7522,20 @@ reaper.ShowConsoleMsg("Bridge directory: " .. bridge_dir .. "\n")
 
 function main()
     process_request()
+    if pending_reload then
+        local chunk = pending_reload
+        pending_reload = nil
+        local previous_main = main
+        reaper.DeleteExtState(INSTANCE_SECTION, "heartbeat", false)
+        local ok, err = pcall(chunk)
+        if ok then
+            return
+        end
+        reaper.ShowConsoleMsg("REAPER MCP Bridge reload failed, " .. BRIDGE_VERSION .. " keeps running: " .. tostring(err) .. "\n")
+        main = previous_main
+        beat_at = 0
+    end
+    heartbeat()
     reaper.defer(main)
 end
 

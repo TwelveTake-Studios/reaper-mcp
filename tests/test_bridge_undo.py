@@ -14,6 +14,9 @@ lupa = pytest.importorskip("lupa")
 BRIDGE = Path(__file__).resolve().parent.parent / "reaper_mcp_bridge.lua"
 
 STUB = """
+ext_state = {}
+at_exit = {}
+clock = 1000
 undo_log = {}
 written = {}
 reaper = {
@@ -21,6 +24,11 @@ reaper = {
     RecursiveCreateDirectory = function() return 1 end,
     ShowConsoleMsg = function() end,
     defer = function() end,
+    GetExtState = function(section, key) return (ext_state[section .. "/" .. key]) or "" end,
+    SetExtState = function(section, key, value, persist) ext_state[section .. "/" .. key] = value end,
+    DeleteExtState = function(section, key, persist) ext_state[section .. "/" .. key] = nil end,
+    time_precise = function() clock = clock + 0.01; return clock end,
+    atexit = function(fn) at_exit[#at_exit + 1] = fn end,
     EnumerateFiles = function(dir, i) return list_dir(dir, i) end,
     Undo_BeginBlock = function() undo_log[#undo_log + 1] = "begin" end,
     Undo_EndBlock = function(label, flags)

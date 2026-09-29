@@ -173,3 +173,13 @@ def test_readme_carries_the_registry_ownership_marker():
     assert f"mcp-name: {name}" in README.read_text(encoding="utf-8"), (
         f"README.md must contain 'mcp-name: {name}' or the MCP registry refuses the publish"
     )
+
+
+def test_reapack_index_carries_this_version():
+    text = (REPO / "index.xml").read_text(encoding="utf-8")
+    assert f'<version name="{package_version()}"' in text, (
+        f"index.xml does not publish {package_version()}; run scripts/build_reapack_index.py"
+    )
+    assert f"/raw/v{package_version()}/reaper_mcp_bridge.lua" in text, (
+        "index.xml must fetch the bridge from this version's tag"
+    )

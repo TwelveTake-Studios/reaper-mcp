@@ -12,7 +12,7 @@ License: MIT
 Version: 1.6.5
 """
 
-__version__ = "1.7.7"
+__version__ = "1.7.8"
 
 import os
 import asyncio
@@ -119,7 +119,7 @@ BRIDGE_DIR_PROBLEM = bridge_dir_problem(BRIDGE_DIR)
 # The bridge script version this server needs. REAPER runs whatever copy is deployed in
 # its Scripts folder, deployed by hand, so the halves drift. Anything older cannot answer
 # GetBridgeVersion and is reported as out of date instead of failing in obscure ways.
-MIN_BRIDGE_VERSION = "1.7.6"
+MIN_BRIDGE_VERSION = "1.7.8"
 
 # How long to wait for the bridge to answer. Configurable because the bridge answers
 # only after the work finishes and renders run at roughly realtime, so 5s reports a
@@ -508,6 +508,10 @@ async def ensure_bridge_current() -> Optional[dict]:
 
     if result.get("ok") and result.get("version"):
         deployed = str(result["version"])
+        if version_tuple(deployed) < version_tuple(MIN_BRIDGE_VERSION) and result.get("can_reload"):
+            reloaded = await reload_running_bridge()
+            if reloaded.get("version"):
+                deployed = str(reloaded["version"])
         _bridge_check["claims_ok"] = (
             version_tuple(deployed) >= version_tuple(SLOT_CLAIM_BRIDGE_VERSION)
         )
@@ -534,6 +538,36 @@ async def ensure_bridge_current() -> Optional[dict]:
     # Timeout, misconfigured directory, REAPER closed: not a version verdict. Say nothing
     # and let the real call surface its own (already actionable) error.
     return None
+
+
+async def reload_running_bridge(probe_timeout: float = 2.0, settle_seconds: float = 4.0) -> dict:
+    """Ask a running, reload-capable bridge to load its script file again.
+
+    Returns {"state": ...} with one of: "not_running", "cannot_reload", "failed",
+    "reloaded", "unchanged", plus "version", "previous", "path" and "error" where known.
+    """
+    probe = await dispatch("GetBridgeVersion", [], timeout=probe_timeout)
+    if not probe.get("ok"):
+        return {"state": "not_running", "error": probe.get("error")}
+    previous = str(probe.get("version") or "")
+    if not probe.get("can_reload"):
+        return {"state": "cannot_reload", "version": previous}
+    request = await dispatch("ReloadBridge", [], timeout=probe_timeout)
+    if not request.get("ok"):
+        return {"state": "failed", "version": previous, "error": request.get("error")}
+    deadline = time.monotonic() + settle_seconds
+    current = {}
+    while time.monotonic() < deadline:
+        await asyncio.sleep(0.25)
+        current = await dispatch("GetBridgeVersion", [], timeout=probe_timeout)
+        if current.get("ok"):
+            break
+    if not current.get("ok"):
+        return {"state": "failed", "version": previous, "path": request.get("path"),
+                "error": "the bridge did not answer after reloading"}
+    version = str(current.get("version") or "")
+    return {"state": "reloaded" if version != previous else "unchanged", "version": version,
+            "previous": previous, "path": request.get("path")}
 
 
 async def reaper_call(func: str, *args, timeout: float = None) -> dict:
@@ -3931,13 +3965,21 @@ USAGE = f"""twelvetake-reaper-mcp {__version__}
 
   twelvetake-reaper-mcp                      Run the MCP server (stdio).
   twelvetake-reaper-mcp --install-bridge     Copy {BRIDGE_SCRIPT_NAME} into REAPER's
-                                             Scripts folder, backing up any existing copy.
+                                             Scripts folder, backing up a different copy.
   twelvetake-reaper-mcp --install-bridge DIR Install into an explicit folder instead
                                              (portable installs, non-standard locations).
+  twelvetake-reaper-mcp --install-bridge --autostart
+                                             Also have REAPER start the bridge by itself at
+                                             launch (adds a marked block to __startup.lua).
+  twelvetake-reaper-mcp --autostart [PATH]   Only set up auto-start, for a bridge that is
+                                             already installed (a ReaPack copy is preferred).
+  twelvetake-reaper-mcp --remove-autostart   Remove that block, leaving the rest of the file.
+  twelvetake-reaper-mcp --reload-bridge      Ask the running bridge to reload its script.
   twelvetake-reaper-mcp --version            Print the version.
 
-After installing, load the script in REAPER: Actions > Show action list > Load ReaScript,
-select {BRIDGE_SCRIPT_NAME}, then run it.
+If REAPER is running a bridge from 1.7.8 on, --install-bridge reloads it for you.
+Otherwise load it once in REAPER: Actions > Show action list > Load ReaScript, select
+{BRIDGE_SCRIPT_NAME}, then run it.
 
 Environment:
   REAPER_BRIDGE_DIR   Override the bridge data directory.
@@ -3950,7 +3992,7 @@ def bundled_bridge_script() -> Optional[Path]:
     return candidate if candidate.is_file() else None
 
 
-def install_bridge(dest_dir: Optional[Path] = None) -> int:
+def install_bridge(dest_dir: Optional[Path] = None, autostart: bool = False) -> int:
     """Copy the bundled bridge script into REAPER's Scripts folder. Returns an exit code.
 
     Deliberately an explicit command rather than something the server does on startup:
@@ -3976,17 +4018,164 @@ def install_bridge(dest_dir: Optional[Path] = None) -> int:
 
     scripts_dir.mkdir(parents=True, exist_ok=True)
     target = scripts_dir / BRIDGE_SCRIPT_NAME
-    if target.exists():
-        backup = target.parent / f"{target.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
-        shutil.copy2(target, backup)
-        print(f"Backed up existing script to: {backup}")
-    shutil.copy2(source, target)
-    print(f"Installed {BRIDGE_SCRIPT_NAME} to: {target}")
+    if target.is_file() and target.read_bytes() == source.read_bytes():
+        print(f"{BRIDGE_SCRIPT_NAME} is already this version in: {target}")
+    else:
+        if target.exists():
+            backup = target.parent / f"{target.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+            shutil.copy2(target, backup)
+            print(f"Backed up existing script to: {backup}")
+        shutil.copy2(source, target)
+        print(f"Installed {BRIDGE_SCRIPT_NAME} to: {target}")
     print(f"Bridge data directory: {BRIDGE_DIR}")
+    if autostart:
+        enable_autostart(scripts_dir, target, explicit_dir=dest_dir is not None)
     print("")
-    print("Next, in REAPER: Actions > Show action list > Load ReaScript, select the file")
-    print("above, then run it. Re-run it after every upgrade of this package.")
+    report_reload(asyncio.run(reload_running_bridge()), target,
+                  autostart or autostart_enabled(scripts_dir))
     return 0
+
+
+AUTOSTART_BEGIN = "-- TwelveTake REAPER MCP bridge: start"
+AUTOSTART_END = "-- TwelveTake REAPER MCP bridge: end"
+
+
+def _lua_string(text: str) -> str:
+    return '"' + text.replace("\\", "/").replace('"', '\\"') + '"'
+
+
+def autostart_block(target: Path, explicit_dir: bool) -> str:
+    if explicit_dir:
+        path_expr = _lua_string(str(target.resolve()))
+    else:
+        path_expr = f'reaper.GetResourcePath() .. "/Scripts/{BRIDGE_SCRIPT_NAME}"'
+    return (
+        f"{AUTOSTART_BEGIN}\n"
+        "do\n"
+        f"    local ok, err = pcall(dofile, {path_expr})\n"
+        "    if not ok then\n"
+        '        reaper.ShowConsoleMsg("TwelveTake REAPER MCP bridge did not start: " .. tostring(err) .. "\\n")\n'
+        "    end\n"
+        "end\n"
+        f"{AUTOSTART_END}\n"
+    )
+
+
+def _without_autostart(text: str) -> str:
+    begin = text.find(AUTOSTART_BEGIN)
+    if begin == -1:
+        return text
+    end = text.find(AUTOSTART_END, begin)
+    if end == -1:
+        return text
+    end += len(AUTOSTART_END)
+    if text[end:end + 1] == "\n":
+        end += 1
+    return text[:begin] + text[end:]
+
+
+def find_bridge_copies(scripts_dir: Path) -> dict:
+    scripts_dir = Path(scripts_dir)
+    default = scripts_dir / BRIDGE_SCRIPT_NAME
+    reapack = sorted(p for p in scripts_dir.glob(f"*/*/{BRIDGE_SCRIPT_NAME}") if p.is_file())
+    return {"default": default if default.is_file() else None, "reapack": reapack}
+
+
+def autostart_command(path: Optional[Path] = None, scripts_dir: Optional[Path] = None) -> int:
+    scripts_dir = Path(scripts_dir) if scripts_dir else reaper_resource_dir() / "Scripts"
+    if path is not None:
+        target = Path(path)
+        if not target.is_file():
+            print(f"error: no bridge script at {target}", file=sys.stderr)
+            return 1
+        enable_autostart(scripts_dir, target, explicit_dir=True)
+        return 0
+    copies = find_bridge_copies(scripts_dir)
+    if copies["reapack"]:
+        target = copies["reapack"][0]
+        enable_autostart(scripts_dir, target, explicit_dir=True)
+        print(f"Using the ReaPack copy, which ReaPack keeps up to date: {target}")
+        return 0
+    if copies["default"]:
+        enable_autostart(scripts_dir, copies["default"], explicit_dir=False)
+        return 0
+    print(f"error: no {BRIDGE_SCRIPT_NAME} found in {scripts_dir}.", file=sys.stderr)
+    print("Install it first: twelvetake-reaper-mcp --install-bridge --autostart", file=sys.stderr)
+    return 1
+
+
+def autostart_enabled(scripts_dir: Path) -> bool:
+    startup = Path(scripts_dir) / "__startup.lua"
+    return startup.is_file() and AUTOSTART_BEGIN in startup.read_text(encoding="utf-8", errors="replace")
+
+
+def _backup_startup(startup: Path) -> None:
+    if startup.exists():
+        backup = startup.parent / f"{startup.name}.bak-{time.strftime('%Y%m%d-%H%M%S')}"
+        shutil.copy2(startup, backup)
+        print(f"Backed up {startup.name} to: {backup}")
+
+
+def enable_autostart(scripts_dir: Path, target: Path, explicit_dir: bool = False) -> None:
+    startup = Path(scripts_dir) / "__startup.lua"
+    existing = startup.read_text(encoding="utf-8", errors="replace") if startup.exists() else ""
+    remaining = _without_autostart(existing)
+    if remaining and not remaining.endswith("\n"):
+        remaining += "\n"
+    updated = remaining + ("\n" if remaining.strip() else "") + autostart_block(target, explicit_dir)
+    if updated == existing:
+        print(f"Auto-start already set up in: {startup}")
+        return
+    _backup_startup(startup)
+    startup.write_text(updated, encoding="utf-8", newline="\n")
+    print(f"Auto-start {'updated' if AUTOSTART_BEGIN in existing else 'added'} in: {startup}")
+    print("REAPER will start the bridge by itself every time it launches.")
+
+
+def disable_autostart(scripts_dir: Path) -> int:
+    startup = Path(scripts_dir) / "__startup.lua"
+    if not autostart_enabled(scripts_dir):
+        print(f"Auto-start is not set up in: {startup}")
+        return 0
+    existing = startup.read_text(encoding="utf-8", errors="replace")
+    updated = _without_autostart(existing).rstrip("\n")
+    updated = updated + "\n" if updated else ""
+    _backup_startup(startup)
+    startup.write_text(updated, encoding="utf-8", newline="\n")
+    print(f"Auto-start removed from: {startup}")
+    print("Anything else in that file was left as it was.")
+    return 0
+
+
+def report_reload(result: dict, target: Path, autostart: bool) -> None:
+    state = result.get("state")
+    if state == "reloaded":
+        print(f"The running bridge reloaded itself: {result.get('previous')} -> {result.get('version')}.")
+        return
+    if state == "unchanged":
+        loaded = result.get("path")
+        if loaded and Path(loaded).resolve() != target.resolve():
+            print(f"The running bridge reloaded, but it was loaded from {loaded},")
+            print(f"not from {target}, so it is still {result.get('version')}.")
+        else:
+            print(f"The running bridge reloaded its script (version {result.get('version')}).")
+        return
+    if state == "cannot_reload":
+        print(f"REAPER is running bridge {result.get('version')}, which predates hot reload.")
+        print("Re-run it in REAPER once (Actions > Show action list > Load ReaScript, or run it")
+        print("from the list). From 1.7.8 on, installing an update reloads it automatically.")
+        return
+    if state == "failed":
+        print(f"The running bridge could not reload: {result.get('error')}")
+        print("Re-run it in REAPER to load the new version.")
+        return
+    if autostart:
+        print("REAPER is not running the bridge right now. It starts by itself the next time")
+        print("REAPER launches.")
+    else:
+        print("REAPER is not running the bridge right now. To start it: Actions > Show action")
+        print("list > Load ReaScript, select the file above, then run it. To have REAPER start it")
+        print("by itself every time, run: twelvetake-reaper-mcp --install-bridge --autostart")
 
 
 def main():
@@ -3994,7 +4183,20 @@ def main():
     argv = sys.argv[1:]
 
     if argv and argv[0] in ("--install-bridge", "install-bridge"):
-        raise SystemExit(install_bridge(Path(argv[1]) if len(argv) > 1 else None))
+        rest = argv[1:]
+        dirs = [a for a in rest if not a.startswith("--")]
+        raise SystemExit(install_bridge(Path(dirs[0]) if dirs else None,
+                                        autostart="--autostart" in rest))
+    if argv and argv[0] == "--autostart":
+        raise SystemExit(autostart_command(Path(argv[1]) if len(argv) > 1 else None))
+    if argv and argv[0] == "--remove-autostart":
+        scripts_dir = Path(argv[1]) if len(argv) > 1 else reaper_resource_dir() / "Scripts"
+        raise SystemExit(disable_autostart(scripts_dir))
+    if argv and argv[0] == "--reload-bridge":
+        report_reload(asyncio.run(reload_running_bridge()),
+                      reaper_resource_dir() / "Scripts" / BRIDGE_SCRIPT_NAME,
+                      autostart_enabled(reaper_resource_dir() / "Scripts"))
+        raise SystemExit(0)
     if argv and argv[0] in ("--version", "-V"):
         print(__version__)
         raise SystemExit(0)

@@ -16,6 +16,9 @@ lupa = pytest.importorskip("lupa")
 BRIDGE = Path(__file__).resolve().parent.parent / "reaper_mcp_bridge.lua"
 
 STUB = """
+ext_state = {}
+at_exit = {}
+clock = 1000
 inserted = {}
 markers_set = {}
 PPQ = 960
@@ -36,6 +39,11 @@ reaper = {
     RecursiveCreateDirectory = function() return 1 end,
     ShowConsoleMsg = function() end,
     defer = function() end,
+    GetExtState = function(section, key) return (ext_state[section .. "/" .. key]) or "" end,
+    SetExtState = function(section, key, value, persist) ext_state[section .. "/" .. key] = value end,
+    DeleteExtState = function(section, key, persist) ext_state[section .. "/" .. key] = nil end,
+    time_precise = function() clock = clock + 0.01; return clock end,
+    atexit = function(fn) at_exit[#at_exit + 1] = fn end,
     EnumerateFiles = function(dir, i) return list_dir(dir, i) end,
     Undo_BeginBlock = function() end,
     Undo_EndBlock = function() end,
@@ -106,6 +114,7 @@ def bridge(tmp_path):
 
     send.inserted = lambda: rows("inserted")
     send.markers_set = lambda: rows("markers_set")
+    send.lua = lua
     return send
 
 
@@ -145,3 +154,10 @@ def test_time_signature_keeps_the_start_tempo(bridge):
     assert response["ok"] is True
     [marker] = bridge.markers_set()
     assert marker == {"t": 0, "bpm": 140, "num": 3, "den": 4}
+
+
+def test_time_signature_reports_the_real_denominator(bridge):
+    bridge.lua.execute("reaper.TimeMap_GetTimeSigAtTime = function(_, t) return 6, 8, 120 end")
+    response = bridge("GetTimeSignature")
+    assert response["ok"] is True
+    assert (response["numerator"], response["denominator"], response["tempo"]) == (6, 8, 120)
