@@ -4,7 +4,7 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.8.0"
+local BRIDGE_VERSION = "1.9.0"
 local BRIDGE_SOURCE = debug and debug.getinfo and debug.getinfo(1, "S").source or ""
 local BRIDGE_PATH = BRIDGE_SOURCE:sub(1, 1) == "@" and BRIDGE_SOURCE:sub(2) or ""
 local INSTANCE_SECTION = "TwelveTake_REAPER_MCP"
@@ -506,6 +506,84 @@ local function InsertAudioFile(track_index, file_path, position)
     }
 end
 
+-- Click track
+local INSERT_CLICK_SOURCE = 40013
+
+local function CreateClickTrack(start_pos, end_pos, name)
+    start_pos = math.max(tonumber(start_pos) or 0, 0)
+    end_pos = tonumber(end_pos) or -1
+    if end_pos < 0 then end_pos = reaper.GetProjectLength(0) end
+    if end_pos <= start_pos then
+        if end_pos == 0 then
+            return {ok = false, error = "The project is empty, so there is no song to cover; pass end"}
+        end
+        return {ok = false, error = "end must be after start"}
+    end
+    if type(name) ~= "string" or name == "" then name = "Click" end
+
+    local index = reaper.CountTracks(0)
+    local saved_cursor = reaper.GetCursorPosition()
+    local saved_touched = reaper.GetLastTouchedTrack()
+    local master = reaper.GetMasterTrack(0)
+    local saved_master = reaper.IsTrackSelected(master)
+    local saved_tracks = {}
+    for i = 0, index - 1 do
+        saved_tracks[i] = reaper.IsTrackSelected(reaper.GetTrack(0, i))
+    end
+    local saved_items = {}
+    for i = 0, reaper.CountMediaItems(0) - 1 do
+        local item = reaper.GetMediaItem(0, i)
+        saved_items[#saved_items + 1] = {item = item, selected = reaper.IsMediaItemSelected(item)}
+    end
+
+    reaper.PreventUIRefresh(1)
+    reaper.InsertTrackAtIndex(index, true)
+    local track = reaper.GetTrack(0, index)
+    reaper.GetSetMediaTrackInfo_String(track, "P_NAME", name, true)
+    reaper.SetTrackSelected(master, false)
+    for i = 0, index - 1 do
+        reaper.SetTrackSelected(reaper.GetTrack(0, i), false)
+    end
+    reaper.SetTrackSelected(track, true)
+    reaper.Main_OnCommand(40914, 0)
+    reaper.SetEditCurPos(start_pos, false, false)
+    reaper.Main_OnCommand(INSERT_CLICK_SOURCE, 0)
+
+    local item = reaper.CountTrackMediaItems(track) == 1 and reaper.GetTrackMediaItem(track, 0)
+    local take = item and reaper.GetActiveTake(item)
+    local source = take and reaper.GetMediaItemTake_Source(take)
+    local is_click = source and reaper.GetMediaSourceType(source, "") == "CLICK" or false
+    if is_click then
+        reaper.SetMediaItemInfo_Value(item, "D_POSITION", start_pos)
+        reaper.SetMediaItemInfo_Value(item, "D_LENGTH", end_pos - start_pos)
+        reaper.SetMediaItemSelected(item, false)
+    end
+
+    for _, saved in ipairs(saved_items) do
+        reaper.SetMediaItemSelected(saved.item, saved.selected)
+    end
+    reaper.SetTrackSelected(track, false)
+    if saved_touched then
+        reaper.SetTrackSelected(saved_touched, true)
+        reaper.Main_OnCommand(40914, 0)
+        reaper.SetTrackSelected(saved_touched, false)
+    end
+    for i = 0, index - 1 do
+        reaper.SetTrackSelected(reaper.GetTrack(0, i), saved_tracks[i] and true or false)
+    end
+    reaper.SetTrackSelected(master, saved_master and true or false)
+    reaper.SetEditCurPos(saved_cursor, false, false)
+    if not is_click then reaper.DeleteTrack(track) end
+    reaper.PreventUIRefresh(-1)
+    reaper.UpdateArrange()
+
+    if not is_click then
+        return {ok = false, error = "REAPER did not create a click source"}
+    end
+    return {ok = true, track_index = index, item_index = 0, name = name,
+            start = start_pos, ["end"] = end_pos}
+end
+
 -- Get the FX chain on a track: index, name, bypass and offline state per FX.
 --
 -- GetTrackInfo carries only fx_names, a flat array of strings with no index and no
@@ -677,8 +755,7 @@ local function GetSelectedItems()
             -- or one left by explode_takes) would crash on GetTakeName(item).
             local name = ""
             if take then
-                local _
-                _, name = reaper.GetTakeName(take)
+                name = reaper.GetTakeName(take) or ""
             end
             
             table.insert(items, {
@@ -712,8 +789,7 @@ local function GetAllItems()
                 -- Guard: GetTakeName needs a take; an item with no active take would crash.
                 local name = ""
                 if take then
-                    local _
-                    _, name = reaper.GetTakeName(take)
+                    name = reaper.GetTakeName(take) or ""
                 end
                 
                 table.insert(items, {
@@ -750,8 +826,7 @@ local function GetTrackItems(track_index)
             -- or one left by explode_takes) would crash on GetTakeName(item).
             local name = ""
             if take then
-                local _
-                _, name = reaper.GetTakeName(take)
+                name = reaper.GetTakeName(take) or ""
             end
             
             table.insert(items, {
@@ -1026,6 +1101,7 @@ local function AddFXEnvelopePoint(track_index, fx_index, param_index, time, valu
         point_index = reaper.GetEnvelopePointByTime(envelope, time),
         time = time,
         value = value,
+        shown = reaper.Envelope_FormatValue(envelope, value),
         shape = shape or 0
     }
 end
@@ -1058,6 +1134,7 @@ local function GetFXEnvelopePoints(track_index, fx_index, param_index)
                 index = i,
                 time = time,
                 value = value,
+                shown = reaper.Envelope_FormatValue(envelope, value),
                 shape = shape,
                 tension = tension,
                 selected = selected
@@ -1265,6 +1342,7 @@ DSL_FUNCTIONS = {
     GetTrackInfo = GetTrackInfo,
     GetTrackFXList = GetTrackFXList,
     InsertAudioFile = InsertAudioFile,
+    CreateClickTrack = CreateClickTrack,
     GetAllTracksInfo = GetAllTracksInfo,
     GetSelectedTracks = GetSelectedTracks,
     SetTrackNotes = SetTrackNotes,
@@ -1381,7 +1459,68 @@ local function resolve_envelope(track_index, env_name)
         return nil, "Envelope '" .. tostring(env_name) .. "' not found on track "
             .. tostring(track_index) .. " (create/show it in REAPER first)"
     end
-    return env, nil
+    return env, nil, track
+end
+
+-- Envelope values
+local VOLUME_ENVELOPE_CHUNKS = {"<VOLENV", "<VOLENV2", "<VOLENV3"}
+local ENVELOPE_SILENCE_DB = -150
+
+local function is_volume_envelope(track, env)
+    for _, chunk_name in ipairs(VOLUME_ENVELOPE_CHUNKS) do
+        if reaper.GetTrackEnvelopeByChunkName(track, chunk_name) == env then return true end
+    end
+    return false
+end
+
+local function envelope_scaling(env)
+    return reaper.GetEnvelopeScalingMode(env) == 1 and "fader" or "amplitude"
+end
+
+local function envelope_db_to_value(env, db)
+    local gain = db > ENVELOPE_SILENCE_DB and 10 ^ (db / 20) or 0
+    return reaper.ScaleToEnvelopeMode(reaper.GetEnvelopeScalingMode(env), gain)
+end
+
+local function envelope_value_to_db(env, value)
+    local gain = reaper.ScaleFromEnvelopeMode(reaper.GetEnvelopeScalingMode(env), value)
+    if not gain or gain <= 0 then return ENVELOPE_SILENCE_DB end
+    local db = 20 * math.log(gain, 10)
+    if db <= ENVELOPE_SILENCE_DB then return ENVELOPE_SILENCE_DB end
+    return math.floor(db * 100 + 0.5) / 100
+end
+
+local function describe_envelope_point(env, volume, point)
+    point.shown = reaper.Envelope_FormatValue(env, point.value)
+    if volume then point.value_db = envelope_value_to_db(env, point.value) end
+    return point
+end
+
+local function insert_track_envelope_point(track, env, time, value, value_db, shape, tension, selected)
+    local volume = is_volume_envelope(track, env)
+    if value_db ~= nil then
+        if not volume then
+            return {ok = false, error = "value_db applies only to Volume, Volume (Pre-FX) and Trim Volume; pass value"}
+        end
+        value = envelope_db_to_value(env, value_db)
+    elseif value == nil then
+        return {ok = false, error = "Pass value or value_db"}
+    elseif volume and value < 0 then
+        return {ok = false, error = "A volume envelope value below 0 is silence; pass the level in dB as value_db"}
+    end
+    local inserted = reaper.InsertEnvelopePoint(env, time, value, shape or 0, tension or 0,
+        selected and true or false, false)
+    reaper.Envelope_SortPoints(env)
+    reaper.UpdateArrange()
+    if not inserted then
+        return {ok = false, ret = false, error = "InsertEnvelopePoint failed"}
+    end
+    local index = reaper.GetEnvelopePointByTime(env, time)
+    local _, at, stored = reaper.GetEnvelopePoint(env, index)
+    local result = describe_envelope_point(env, volume,
+        {ok = true, ret = true, point_index = index, time = at, value = stored})
+    if volume then result.scaling = envelope_scaling(env) end
+    return result
 end
 
 -- Resolve the active MIDI take of (track_index, item_index).
@@ -3099,16 +3238,11 @@ local function dispatch_call(fname, args)
                         --   (track_index, envelope_name, time, value, shape, tension, selected, noSort)
                         -- Legacy convention kept for compatibility: (envelope_userdata, time, value, ...)
                         if type(args[1]) == "number" and type(args[2]) == "string" then
-                            local env, err = resolve_envelope(args[1], args[2])
+                            local env, err, track = resolve_envelope(args[1], args[2])
                             if env then
-                                local result = reaper.InsertEnvelopePoint(
-                                    env, args[3], args[4], args[5] or 0, args[6] or 0,
-                                    args[7] and true or false, false)
-                                reaper.Envelope_SortPoints(env)
-                                reaper.UpdateArrange()
-                                response.ok = result and true or false
-                                response.ret = result
-                                if not result then response.error = "InsertEnvelopePoint failed" end
+                                local result = insert_track_envelope_point(track, env,
+                                    args[3], args[4], args[9], args[5], args[6], args[7])
+                                for k, v in pairs(result) do response[k] = v end
                             else
                                 response.error = err
                                 response.ok = false
@@ -6639,22 +6773,24 @@ local function dispatch_call(fname, args)
                     elseif fname == "GetEnvelopePoints" then
                         -- args: track, envelope_name
                         if #args >= 2 then
-                            local env, err = resolve_envelope(args[1], args[2])
+                            local env, err, track = resolve_envelope(args[1], args[2])
                             if env then
+                                local volume = is_volume_envelope(track, env)
                                 local points = as_array({})
                                 local count = reaper.CountEnvelopePoints(env)
                                 for p = 0, count - 1 do
                                     local ok2, time, value, shape, tension, selected =
                                         reaper.GetEnvelopePoint(env, p)
                                     if ok2 then
-                                        points[#points + 1] = {
+                                        points[#points + 1] = describe_envelope_point(env, volume, {
                                             index = p, time = time, value = value,
                                             shape = shape, tension = tension, selected = selected
-                                        }
+                                        })
                                     end
                                 end
                                 response.points = points
                                 response.ret = count
+                                if volume then response.scaling = envelope_scaling(env) end
                                 response.ok = true
                             else
                                 response.error = err

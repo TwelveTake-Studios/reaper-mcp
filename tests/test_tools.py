@@ -270,7 +270,9 @@ def test_item_edit_tools_marshalling(reaper):
 
 def test_envelope_tools_marshalling(reaper):
     run(srv.add_envelope_point(0, "Volume", 1.5, 0.7))
-    assert reaper.last == ("InsertEnvelopePoint", [0, "Volume", 1.5, 0.7, 0, 0, False, False])
+    assert reaper.last == ("InsertEnvelopePoint", [0, "Volume", 1.5, 0.7, 0, 0, False, False, None])
+    run(srv.add_envelope_point(0, "Volume", 1.5, value_db=-6.0, shape=2))
+    assert reaper.last == ("InsertEnvelopePoint", [0, "Volume", 1.5, None, 2, 0, False, False, -6.0])
     run(srv.get_envelope_point_count(0, "Volume"))
     assert reaper.last == ("CountEnvelopePoints", [0, "Volume"])
     run(srv.get_envelope_points(0, "Volume"))
@@ -281,6 +283,21 @@ def test_envelope_tools_marshalling(reaper):
     assert reaper.last == ("ClearEnvelope", [0, "Pan"])
     run(srv.arm_track_envelope(0, "Volume", True))
     assert reaper.last == ("SetEnvelopeArm", [0, "Volume", True])
+
+
+def test_create_click_track_marshalling(reaper):
+    run(srv.create_click_track())
+    assert reaper.last == ("CreateClickTrack", [0.0, -1, "Click"])
+    run(srv.create_click_track(4.0, 60.0, "Metronome"))
+    assert reaper.last == ("CreateClickTrack", [4.0, 60.0, "Metronome"])
+
+
+@pytest.mark.parametrize("kwargs", [{}, {"value": 0.5, "value_db": -6.0}])
+def test_add_envelope_point_takes_exactly_one_of_value_or_value_db(reaper, kwargs):
+    out = run(srv.add_envelope_point(0, "Volume", 1.0, **kwargs))
+    assert out["ok"] is False
+    assert "value_db" in out["error"]
+    assert reaper.calls == []
 
 
 def test_undo_state_and_time_signature(reaper):

@@ -58,6 +58,13 @@ The largest external contribution to this project, across three releases.
   one-line fix, running action 40914 once the target track is selected, already tested on a
   six-line dialogue alternating between two tracks. Shipped in **v1.7.6**.
 
+### [@gitickle](https://github.com/gitickle)
+
+- **[Issue #20](https://github.com/TwelveTake-Studios/reaper-mcp/issues/20)** - found that a
+  sine-wave volume envelope drawn with `add_envelope_point` ended up entirely silent, traced it
+  to the tool describing values as 0.0-1.0 while the bridge passed them to REAPER unconverted,
+  and supplied a reproduction and a prompt that works around it. Shipped in **v1.9.0**.
+
 ---
 
 ## Work in forks that this project has benefited from

@@ -19,17 +19,17 @@
         <link rel="website">https://twelvetake.com/tools/reaper-mcp/</link>
         <link rel="repository">https://github.com/TwelveTake-Studios/reaper-mcp</link>
       </metadata>
-      <version name="1.8.0" author="TwelveTake Studios" time="2026-09-29T20:01:58Z">
-        <changelog><![CDATA[After you update, run twelvetake-reaper-mcp --install-bridge. It installs the new bridge and the analyzer plugin that the measurement tools need. If REAPER is running the 1.7.8 bridge, you don't have to do anything in REAPER. If you installed with ReaPack, synchronize your packages instead.
-Added:
-- measure_loudness gives you integrated loudness, short-term and momentary maximum, loudness range, sample peak and true peak for the master, a track or a single item, over the whole project or a time range you choose. The loudness figures are REAPER's own. It passes the EBU's synthetic compliance signals within the EBU's tolerances: Tech 3341 loudness cases 1 to 5 and true-peak cases 15 to 19, and Tech 3342 loudness range cases 1 to 4.
-- measure_spectrum gives you octave-band levels from 31.5 Hz to 16 kHz, the spectral centroid, the tilt in dB per octave, the stereo correlation overall and below 150 Hz, the side-to-mid level and the left/right balance.
-- The TwelveTake MCP Analyzer is a small JSFX plugin that measures true peak, the spectrum and the stereo figures. --install-bridge installs it in REAPER's Effects/TwelveTake folder, and the ReaPack package includes it. Without it, measure_loudness still gives you REAPER's figures and tells you what it couldn't measure.
-- Measuring doesn't write any files or add steps to your undo history. When it finishes, your selections, time selection and edit cursor are where you left them. It measures a track or item after its fader and pan. Measuring the master does mark the project as modified, even though nothing in it changed: REAPER can't add a plugin to the master without setting that flag.
+      <version name="1.9.0" author="TwelveTake Studios" time="2026-10-17T13:01:08Z">
+        <changelog><![CDATA[After you update, run twelvetake-reaper-mcp --install-bridge. If REAPER is running the 1.7.8 bridge or later, you don't have to do anything in REAPER. If you installed with ReaPack, synchronize your packages instead.
 Fixed:
-- When a bridge reply contained an infinite or undefined number, such as the level of silence, the server couldn't read it. It waited out its whole timeout and then told you the call had timed out. The bridge now sends those numbers as null, and when a reply can't be read, the server tells you so within half a second.]]></changelog>
-        <source main="main">https://github.com/TwelveTake-Studios/reaper-mcp/raw/v1.8.0/reaper_mcp_bridge.lua</source>
-        <source type="effect" file="twelvetake_mcp_analyzer.jsfx">https://github.com/TwelveTake-Studios/reaper-mcp/raw/v1.8.0/twelvetake_mcp_analyzer.jsfx</source>
+- Volume automation from add_envelope_point could play as silence. The tool described envelope values as 0.0 to 1.0, but a volume envelope's scale depends on its scaling mode. With fader scaling, REAPER stores 0 dB as 716.2, so every value from 0.0 to 1.0 was silence. A negative value, which AI clients sent when they worked in dB, was silence in either mode. You can now give a level in dB with value_db on Volume, Volume (Pre-FX) and Trim Volume, and the tool converts it for the envelope's scaling mode. If you send a negative raw value to a volume envelope, the tool refuses it and points you to value_db. *(Reported by @gitickle in issue #20.)*
+- The envelope tool descriptions now give the units REAPER uses. A pan envelope runs from +1 for left to -1 for right, the reverse of set_track_pan. An FX parameter envelope takes the parameter's own value, inside the range track_fx_get_param reports, so a JSFX dB slider takes dB.
+Added:
+- create_click_track gives you a click track for the song, on a new track at the end of the track list. It uses REAPER's click source, so it follows tempo and time signature changes and accents each downbeat. It covers the whole project unless you give it a start and end.
+- Envelope points now come back as REAPER displays them. add_envelope_point, get_envelope_points, add_fx_envelope_point and get_fx_envelope_points include shown, for example "-6.00dB", "50%L" or "UNMUTE". On a volume envelope you also get value_db, and scaling, which is "fader" or "amplitude".
+- add_envelope_point now returns the new point's point_index, as its description said it would.]]></changelog>
+        <source main="main">https://github.com/TwelveTake-Studios/reaper-mcp/raw/v1.9.0/reaper_mcp_bridge.lua</source>
+        <source type="effect" file="twelvetake_mcp_analyzer.jsfx">https://github.com/TwelveTake-Studios/reaper-mcp/raw/v1.9.0/twelvetake_mcp_analyzer.jsfx</source>
       </version>
     </reapack>
   </category>

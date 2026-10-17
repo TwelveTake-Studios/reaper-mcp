@@ -5,6 +5,40 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.0] - 2026-10-17
+
+**After you update, run `twelvetake-reaper-mcp --install-bridge`.** If REAPER is running the 1.7.8
+bridge or later, you don't have to do anything in REAPER. If you installed with ReaPack,
+synchronize your packages instead.
+
+### Fixed
+- **Volume automation from `add_envelope_point` could play as silence.** The tool described
+  envelope values as 0.0 to 1.0, but a volume envelope's scale depends on its scaling mode. With
+  fader scaling, REAPER stores 0 dB as 716.2, so every value from 0.0 to 1.0 was silence. A
+  negative value, which AI clients sent when they worked in dB, was silence in either mode. You
+  can now give a level in dB with `value_db` on Volume, Volume (Pre-FX) and Trim Volume, and the
+  tool converts it for the envelope's scaling mode. If you send a negative raw value to a volume
+  envelope, the tool refuses it and points you to `value_db`.
+  *(Reported by [@gitickle](https://github.com/gitickle) in
+  [issue #20](https://github.com/TwelveTake-Studios/reaper-mcp/issues/20).)*
+- **The envelope tool descriptions now give the units REAPER uses.** A pan envelope runs from +1
+  for left to -1 for right, the reverse of `set_track_pan`. An FX parameter envelope takes the
+  parameter's own value, inside the range `track_fx_get_param` reports, so a JSFX dB slider
+  takes dB.
+- **`get_track_items` and `get_selected_items` left out each item's name.** They now include
+  the take name, as `get_item_info` does.
+
+### Added
+- **`create_click_track`** gives you a click track for the song, on a new track at the end of
+  the track list. It uses REAPER's click source, so it follows tempo and time signature changes
+  and accents each downbeat. It covers the whole project unless you give it a start and end.
+- **Envelope points now come back as REAPER displays them.** `add_envelope_point`,
+  `get_envelope_points`, `add_fx_envelope_point` and `get_fx_envelope_points` include `shown`,
+  for example "-6.00dB", "50%L" or "UNMUTE". On a volume envelope you also get `value_db`, and
+  `scaling`, which is "fader" or "amplitude".
+- `add_envelope_point` now returns the new point's `point_index`, as its description said it
+  would.
+
 ## [1.8.0] - 2026-09-29
 
 **After you update, run `twelvetake-reaper-mcp --install-bridge`.** It installs the new bridge and

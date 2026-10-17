@@ -12,7 +12,7 @@ License: MIT
 Version: 1.6.5
 """
 
-__version__ = "1.8.0"
+__version__ = "1.9.0"
 
 import os
 import asyncio
@@ -119,7 +119,7 @@ BRIDGE_DIR_PROBLEM = bridge_dir_problem(BRIDGE_DIR)
 # The bridge script version this server needs. REAPER runs whatever copy is deployed in
 # its Scripts folder, deployed by hand, so the halves drift. Anything older cannot answer
 # GetBridgeVersion and is reported as out of date instead of failing in obscure ways.
-MIN_BRIDGE_VERSION = "1.8.0"
+MIN_BRIDGE_VERSION = "1.9.0"
 
 # How long to wait for the bridge to answer. Configurable because the bridge answers
 # only after the work finishes and renders run at roughly realtime, so 5s reports a
@@ -674,6 +674,22 @@ async def insert_track(index: int = None, name: str = None) -> dict:
     if not batch.get("ok"):
         return {"ok": False, "error": batch.get("error", "unknown error")}
     return batch["results"][0]
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
+async def create_click_track(start: float = 0.0, end: Optional[float] = None, name: str = "Click") -> dict:
+    """
+    Add a click track at the end of the track list. It holds REAPER's click source, which follows the tempo map and time signature changes and accents each downbeat.
+
+    Args:
+        start: Start in seconds.
+        end: End in seconds (default: the end of the project).
+        name: Track name.
+
+    Returns:
+        track_index, item_index, start, end.
+    """
+    return await reaper_call("CreateClickTrack", start, -1 if end is None else end, name)
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
@@ -3007,8 +3023,9 @@ async def add_envelope_point(
     track_index: int,
     envelope_name: str,
     time: float,
-    value: float,
-    shape: int = 0
+    value: Optional[float] = None,
+    shape: int = 0,
+    value_db: Optional[float] = None
 ) -> dict:
     """
     Add a point to an envelope.
@@ -3016,13 +3033,16 @@ async def add_envelope_point(
     Args:
         envelope_name: Envelope name.
         time: Time position in seconds.
-        value: Envelope value (0.0-1.0 for most envelopes).
+        value: Raw value. Pan -1..1 with +1 = LEFT (the reverse of set_track_pan); Width -1..1; Mute 0 = muted, 1 = unmuted. A raw volume value depends on the envelope's scaling, so use value_db there.
         shape: Point shape (0=linear, 1=square, 2=slow start/end, 3=fast start, 4=fast end, 5=bezier).
+        value_db: Level in dB for Volume, Volume (Pre-FX) and Trim Volume; -150 is silence. Pass this or value.
 
     Returns:
-        Object with point index.
+        point_index, value, and shown: the value as REAPER displays it ("-6.00dB", "50%L").
     """
-    return await reaper_call("InsertEnvelopePoint", track_index, envelope_name, time, value, shape, 0, False, False)
+    if (value is None) == (value_db is None):
+        return {"ok": False, "error": "Pass exactly one of value or value_db"}
+    return await reaper_call("InsertEnvelopePoint", track_index, envelope_name, time, value, shape, 0, False, False, value_db)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
@@ -3034,7 +3054,7 @@ async def get_envelope_points(track_index: int, envelope_name: str) -> dict:
         envelope_name: Envelope name.
 
     Returns:
-        Object with list of points (time, value, shape).
+        points (time, value, shape, shown). A volume envelope adds value_db to each point, and scaling.
     """
     return await reaper_call("GetEnvelopePoints", track_index, envelope_name)
 
@@ -3121,11 +3141,11 @@ async def add_fx_envelope_point(
 
     Args:
         time: Time position in seconds.
-        value: Parameter value (typically 0.0-1.0, normalized).
+        value: The parameter's own value, within the min..max track_fx_get_param reports (a JSFX dB slider takes dB).
         shape: Point shape (0=linear, 1=square, 2=slow start/end, 3=fast start, 4=fast end, 5=bezier).
 
     Returns:
-        Object with point_index and confirmation.
+        point_index, value, and shown: the value as REAPER displays it.
     """
     return await reaper_call("AddFXEnvelopePoint", track_index, fx_index, param_index, time, value, shape)
 
@@ -3136,7 +3156,7 @@ async def get_fx_envelope_points(track_index: int, fx_index: int, param_index: i
     Get all automation points from an FX parameter envelope.
 
     Returns:
-        Object with list of points (time, value, shape, tension, selected).
+        Object with list of points (time, value, shown, shape, tension, selected).
     """
     return await reaper_call("GetFXEnvelopePoints", track_index, fx_index, param_index)
 

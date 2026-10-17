@@ -2,7 +2,7 @@
 
 A [TwelveTake Studios](https://twelvetake.com) project.
 
-[![Tools](https://img.shields.io/badge/tools-179-blue)](https://github.com/TwelveTake-Studios/reaper-mcp)
+[![Tools](https://img.shields.io/badge/tools-180-blue)](https://github.com/TwelveTake-Studios/reaper-mcp)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow)](https://buymeacoffee.com/twelvetake)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-ff5e5b)](https://ko-fi.com/twelvetake)
 
@@ -12,7 +12,7 @@ Listed in the [MCP Registry](https://registry.modelcontextprotocol.io/) as `mcp-
 
 A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control REAPER DAW for mixing, mastering, MIDI composition, and full music production workflows.
 
-**Version:** 1.8.0
+**Version:** 1.9.0
 
 ## Why This Server
 
@@ -35,7 +35,7 @@ Most MCP servers just wrap REAPER's API and call it a day. This one includes **p
   don't install anything else in REAPER
 - Copy the script, run it, connect your AI assistant
 
-### 179 Tools Covering Real Production Needs
+### 180 Tools Covering Real Production Needs
 
 - **Full FX control** — add/remove plugins, get/set any parameter by index, manage presets, bypass
 - **FX parameter automation** — automate any plugin knob (flanger depth, filter cutoff, etc.)
@@ -343,6 +343,7 @@ ever reached REAPER. `REAPER_COMM_MODE` no longer does anything.
 | `get_all_tracks()` | Get info for all tracks |
 | `get_master_track()` | Get master track info |
 | `insert_track(index, name)` | Create a new track |
+| `create_click_track(start, end, name)` | Add a click track that follows the tempo map |
 | `delete_track(index)` | Delete a track |
 | `set_track_name(index, name)` | Rename a track |
 | `set_track_volume(index, db)` | Set volume in dB |
@@ -558,7 +559,7 @@ what is already there. It is flagged `destructive` so a client can prompt first.
 |------|-------------|
 | `get_track_envelope(track, name)` | Get envelope by name |
 | `get_envelope_point_count(track, name)` | Count envelope points |
-| `add_envelope_point(track, name, time, value, shape)` | Add automation point |
+| `add_envelope_point(track, name, time, value, shape, value_db)` | Add automation point (`value_db`: a volume level in dB) |
 | `get_envelope_points(track, name)` | Get all points |
 | `delete_envelope_point(track, name, index)` | Delete point |
 | `clear_envelope(track, name)` | Clear all points |
