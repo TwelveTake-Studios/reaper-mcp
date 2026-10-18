@@ -12,7 +12,7 @@ License: MIT
 Version: 1.6.5
 """
 
-__version__ = "1.9.0"
+__version__ = "1.9.1"
 
 import os
 import asyncio
@@ -119,7 +119,7 @@ BRIDGE_DIR_PROBLEM = bridge_dir_problem(BRIDGE_DIR)
 # The bridge script version this server needs. REAPER runs whatever copy is deployed in
 # its Scripts folder, deployed by hand, so the halves drift. Anything older cannot answer
 # GetBridgeVersion and is reported as out of date instead of failing in obscure ways.
-MIN_BRIDGE_VERSION = "1.9.0"
+MIN_BRIDGE_VERSION = "1.9.1"
 
 # How long to wait for the bridge to answer. Configurable because the bridge answers
 # only after the work finishes and renders run at roughly realtime, so 5s reports a
@@ -192,6 +192,7 @@ IMPORTANT: The REAPER bridge script must be running in REAPER for tools to work.
 
 Use get_project_summary() first to get complete project context in one call."""
 )
+mcp._mcp_server.version = __version__
 
 # Where this process starts in the 999-slot ring.
 #
@@ -2785,11 +2786,14 @@ async def render_project(
     start_time: float = None,
     end_time: float = None,
     tail_seconds: float = 0,
-    overwrite: bool = False
+    overwrite: bool = False,
+    skip_postprocessing: bool = False,
 ) -> dict:
     """
-    Render the project's master mix to an audio file (uses REAPER's last render settings
-    for format details; a .wav extension selects WAV output).
+    Render the project's master mix to an audio file. Apart from the path, source and
+    range, the project's own render settings apply: its format (a .wav extension selects
+    WAV), and its normalization, limiter, fades, trim and pad, which the response lists in
+    `processing` (empty when none applies).
 
     If the target file already exists, this returns an error unless overwrite=True
     (which deletes the existing file first). This is explicit because REAPER's own
@@ -2802,9 +2806,11 @@ async def render_project(
         end_time: End time in seconds (None = project end).
         tail_seconds: Extra seconds to render at end for reverb tails.
         overwrite: True to replace an existing file at output_path.
+        skip_postprocessing: True to render without the project's normalization, limiter,
+            fades, trim and pad, for a file you will measure or compare.
 
     Returns:
-        Object with render status and REAPER's computed output target(s).
+        Object with render status, REAPER's computed output target(s) and `processing`.
     """
     # None -> -1 sentinels: JSON nulls become Lua nils, which corrupt the bridge's
     # positional argument handling.
@@ -2819,6 +2825,7 @@ async def render_project(
         -1 if end_time is None else end_time,
         tail_seconds or 0,
         bool(overwrite),
+        bool(skip_postprocessing),
         timeout=RENDER_TIMEOUT,
     )
 
@@ -3028,7 +3035,9 @@ async def add_envelope_point(
     value_db: Optional[float] = None
 ) -> dict:
     """
-    Add a point to an envelope.
+    Add a point to an envelope. A missing Volume, Pan, Width, Mute or Trim Volume envelope
+    (or a Pre-FX one) is created first: REAPER starts it with a point at 0:00 holding the
+    track's current value, and the response has envelope_created.
 
     Args:
         envelope_name: Envelope name.

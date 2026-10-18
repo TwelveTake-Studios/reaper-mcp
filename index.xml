@@ -19,18 +19,16 @@
         <link rel="website">https://twelvetake.com/tools/reaper-mcp/</link>
         <link rel="repository">https://github.com/TwelveTake-Studios/reaper-mcp</link>
       </metadata>
-      <version name="1.9.0" author="TwelveTake Studios" time="2026-10-17T13:13:30Z">
+      <version name="1.9.1" author="TwelveTake Studios" time="2026-10-18T10:46:37Z">
         <changelog><![CDATA[After you update, run twelvetake-reaper-mcp --install-bridge. If REAPER is running the 1.7.8 bridge or later, you don't have to do anything in REAPER. If you installed with ReaPack, synchronize your packages instead.
 Fixed:
-- Volume automation from add_envelope_point could play as silence. The tool described envelope values as 0.0 to 1.0, but a volume envelope's scale depends on its scaling mode. With fader scaling, REAPER stores 0 dB as 716.2, so every value from 0.0 to 1.0 was silence. A negative value, which AI clients sent when they worked in dB, was silence in either mode. You can now give a level in dB with value_db on Volume, Volume (Pre-FX) and Trim Volume, and the tool converts it for the envelope's scaling mode. If you send a negative raw value to a volume envelope, the tool refuses it and points you to value_db. *(Reported by @gitickle in issue #20.)*
-- The envelope tool descriptions now give the units REAPER uses. A pan envelope runs from +1 for left to -1 for right, the reverse of set_track_pan. An FX parameter envelope takes the parameter's own value, inside the range track_fx_get_param reports, so a JSFX dB slider takes dB.
-- get_track_items and get_selected_items left out each item's name. They now include the take name, as get_item_info does.
+- add_envelope_point refused on a track that didn't have that envelope yet. It asked you to create the envelope in REAPER first. It now creates a missing Volume, Pan, Width, Mute or Trim Volume envelope, or a Pre-FX one, the way REAPER does when you show it: the new envelope starts with a point at 0:00 holding the track's current value. Your track selection stays as it was. *(Found while answering a follow-up from @gitickle in issue #20.)*
+- render_project erased the project's render start delay. Every render through the tool reset the delay to 0 seconds, and rendered without the project's options to embed metadata, stretch markers and take markers or to render in two passes. The tool now uses those options and leaves the delay as you set it. It still renders without the delay, because REAPER's countdown window would stop the bridge until someone closed it.
+- The server reported the wrong version to your AI client. 1.8.0 and 1.9.0 said they were version 1.30.0, the version of the MCP library they're built on. The server now reports its own version.
 Added:
-- create_click_track gives you a click track for the song, on a new track at the end of the track list. It uses REAPER's click source, so it follows tempo and time signature changes and accents each downbeat. It covers the whole project unless you give it a start and end.
-- Envelope points now come back as REAPER displays them. add_envelope_point, get_envelope_points, add_fx_envelope_point and get_fx_envelope_points include shown, for example "-6.00dB", "50%L" or "UNMUTE". On a volume envelope you also get value_db, and scaling, which is "fader" or "amplitude".
-- add_envelope_point now returns the new point's point_index, as its description said it would.]]></changelog>
-        <source main="main">https://github.com/TwelveTake-Studios/reaper-mcp/raw/v1.9.0/reaper_mcp_bridge.lua</source>
-        <source type="effect" file="twelvetake_mcp_analyzer.jsfx">https://github.com/TwelveTake-Studios/reaper-mcp/raw/v1.9.0/twelvetake_mcp_analyzer.jsfx</source>
+- render_project tells you what the project's render settings did to the file. A render uses the project's own normalization, limiter, fades, silence trimming and padding. The response now lists the ones that applied in processing, for example a -11 LUFS normalization target or a 3.5 s fade-out. Pass skip_postprocessing to render without them, for a file you want to measure or compare. The tool's description used to say that only the file format came from the project.]]></changelog>
+        <source main="main">https://github.com/TwelveTake-Studios/reaper-mcp/raw/v1.9.1/reaper_mcp_bridge.lua</source>
+        <source type="effect" file="twelvetake_mcp_analyzer.jsfx">https://github.com/TwelveTake-Studios/reaper-mcp/raw/v1.9.1/twelvetake_mcp_analyzer.jsfx</source>
       </version>
     </reapack>
   </category>

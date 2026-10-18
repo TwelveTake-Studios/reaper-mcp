@@ -17,9 +17,28 @@ at_exit = {}
 clock = 1000
 FADER_0DB = 716.21785031261
 
-local function new_track(name) return {name = name, envs = {}} end
-tracks = {new_track("Drums")}
+local function new_track(name) return {name = name, envs = {}, selected = false, seed = 0.5} end
+tracks = {new_track("Drums"), new_track("Fresh")}
 master = new_track("MASTER")
+actions_run = {}
+local ENVELOPE_ACTIONS = {
+    [40406] = {"Volume", "<VOLENV2", 1}, [40407] = {"Pan", "<PANENV2", 0},
+    [40408] = {"Volume (Pre-FX)", "<VOLENV", 0}, [40409] = {"Pan (Pre-FX)", "<PANENV", 0},
+    [40867] = {"Mute", "<MUTEENV", 0}, [42020] = {"Trim Volume", "<VOLENV3", 1},
+    [41870] = {"Width", "<WIDTHENV2", 0}, [41869] = {"Width (Pre-FX)", "<WIDTHENV", 0},
+}
+local function all_tracks()
+    local out = {master}
+    for _, t in ipairs(tracks) do out[#out + 1] = t end
+    return out
+end
+local function selected_tracks()
+    local out = {}
+    for _, t in ipairs(all_tracks()) do
+        if t.selected then out[#out + 1] = t end
+    end
+    return out
+end
 
 function add_env(track, name, chunk, mode)
     local env = {name = name, chunk = chunk, mode = mode, points = {}}
@@ -83,6 +102,28 @@ reaper = {
         return true, p.time, p.value, p.shape, 0, false
     end,
     GetFXEnvelope = function() return fx_env end,
+    CountSelectedTracks2 = function() return #selected_tracks() end,
+    GetSelectedTrack2 = function(_, i) return selected_tracks()[i + 1] end,
+    SetTrackSelected = function(t, sel) t.selected = sel end,
+    ValidatePtr2 = function() return true end,
+    Main_OnCommand = function(cmd)
+        actions_run[#actions_run + 1] = cmd
+        local spec = ENVELOPE_ACTIONS[cmd]
+        for _, t in ipairs(selected_tracks()) do
+            if spec and not t.envs[spec[1]] then
+                local env = add_env(t, spec[1], spec[2], spec[3])
+                env.points[1] = {time = 0, value = t.seed, shape = 0}
+            end
+        end
+    end,
+    DeleteEnvelopePointRange = function(env, from, to)
+        local kept = {}
+        for _, p in ipairs(env.points) do
+            if p.time < from or p.time >= to then kept[#kept + 1] = p end
+        end
+        env.points = kept
+        return true
+    end,
 }
 """
 
@@ -124,7 +165,12 @@ def bridge(tmp_path, monkeypatch):
         env = (lua.globals().master if track == -1 else lua.globals().tracks[track + 1]).envs[name]
         return [(p.time, p.value) for p in env.points.values()]
 
+    def has_envelope(track, name):
+        return (lua.globals().master if track == -1 else lua.globals().tracks[track + 1]).envs[name] is not None
+
     send.points = points
+    send.has_envelope = has_envelope
+    send.lua = lua
     return send
 
 
@@ -235,3 +281,78 @@ def test_fx_envelope_writes_and_reads_report_shown(bridge):
     assert out["shown"] == "Gain / ReaEQ=0.2500"
     points = run(srv.get_fx_envelope_points(0, 0, 1))["points"]
     assert points[0]["shown"] == "Gain / ReaEQ=0.2500"
+
+
+CREATABLE = [
+    ("Volume", {"value_db": -12.0}, 40406),
+    ("Pan", {"value": 0.5}, 40407),
+    ("Volume (Pre-FX)", {"value_db": -12.0}, 40408),
+    ("Pan (Pre-FX)", {"value": 0.5}, 40409),
+    ("Mute", {"value": 0.0}, 40867),
+    ("Trim Volume", {"value_db": -12.0}, 42020),
+    ("Width", {"value": 0.5}, 41870),
+    ("Width (Pre-FX)", {"value": 0.5}, 41869),
+]
+
+
+@pytest.mark.parametrize("name, kwargs, action", CREATABLE)
+def test_a_missing_track_envelope_is_created_then_written(bridge, name, kwargs, action):
+    assert not bridge.has_envelope(1, name)
+    out = run(srv.add_envelope_point(1, name, 2.0, **kwargs))
+    assert out["ok"] is True, out
+    assert out["envelope_created"] is True
+    assert list(bridge.lua.globals().actions_run.values()) == [action]
+    points = bridge.points(1, name)
+    assert [t for t, _ in points] == [0, 2.0]
+    assert points[0][1] == 0.5
+
+
+def test_a_first_point_at_the_seed_time_replaces_the_seed(bridge):
+    out = run(srv.add_envelope_point(1, "Volume", 0.0, value_db=0.0))
+    assert out["ok"] is True, out
+    assert bridge.points(1, "Volume") == [(0.0, pytest.approx(716.21785031261))]
+
+
+def test_creating_an_envelope_puts_the_track_selection_back(bridge):
+    lua = bridge.lua.globals()
+    lua.tracks[1].selected = True
+    lua.master.selected = True
+    out = run(srv.add_envelope_point(1, "Pan", 1.0, value=0.0))
+    assert out["ok"] is True, out
+    assert (lua.master.selected, lua.tracks[1].selected, lua.tracks[2].selected) == (True, True, False)
+
+
+def test_a_refused_value_creates_no_envelope(bridge):
+    out = run(srv.add_envelope_point(1, "Pan", 1.0, value_db=-6.0))
+    assert out["ok"] is False
+    assert "value_db applies only to" in out["error"]
+    assert not bridge.has_envelope(1, "Pan")
+    assert list(bridge.lua.globals().actions_run.values()) == []
+
+
+def test_a_negative_raw_volume_value_creates_no_envelope(bridge):
+    out = run(srv.add_envelope_point(1, "Volume", 1.0, value=-0.5))
+    assert out["ok"] is False
+    assert "value_db" in out["error"]
+    assert not bridge.has_envelope(1, "Volume")
+
+
+def test_an_existing_envelope_is_written_without_creating_one(bridge):
+    out = run(srv.add_envelope_point(0, "Volume", 1.0, value_db=-6.0))
+    assert out["ok"] is True, out
+    assert "envelope_created" not in out
+    assert list(bridge.lua.globals().actions_run.values()) == []
+
+
+def test_an_envelope_the_tool_cannot_create_is_still_an_error(bridge):
+    out = run(srv.add_envelope_point(1, "Tempo map", 1.0, value=0.5))
+    assert out["ok"] is False
+    assert "create/show it in REAPER first" in out["error"]
+    assert list(bridge.lua.globals().actions_run.values()) == []
+
+
+def test_reading_a_missing_creatable_envelope_names_the_tool_that_creates_it(bridge):
+    out = run(srv.get_envelope_points(1, "Volume"))
+    assert out["ok"] is False
+    assert "add_envelope_point creates it" in out["error"]
+    assert not bridge.has_envelope(1, "Volume")

@@ -309,9 +309,11 @@ def test_undo_state_and_time_signature(reaper):
 
 def test_render_project_none_becomes_sentinels(reaper):
     run(srv.render_project("C:/tmp/out.wav"))
-    assert reaper.last == ("RenderProject", ["C:/tmp/out.wav", -1, -1, 0, False])
+    assert reaper.last == ("RenderProject", ["C:/tmp/out.wav", -1, -1, 0, False, False])
     run(srv.render_project("C:/tmp/out.wav", 1.0, 3.0, 0.5, overwrite=True))
-    assert reaper.last == ("RenderProject", ["C:/tmp/out.wav", 1.0, 3.0, 0.5, True])
+    assert reaper.last == ("RenderProject", ["C:/tmp/out.wav", 1.0, 3.0, 0.5, True, False])
+    run(srv.render_project("C:/tmp/out.wav", skip_postprocessing=True))
+    assert reaper.last == ("RenderProject", ["C:/tmp/out.wav", -1, -1, 0, False, True])
 
 
 def test_render_region_documented_error(reaper):

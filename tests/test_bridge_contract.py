@@ -190,7 +190,14 @@ def test_current_bridge_passes(monkeypatch):
 
 
 def test_newer_bridge_passes(monkeypatch):
-    monkeypatch.setattr(srv, "dispatch", _fake_dispatch({"ok": True, "version": "1.9.0"}))
+    major, minor, patch = srv.version_tuple(srv.MIN_BRIDGE_VERSION)
+    newer = f"{major}.{minor}.{patch + 1}"
+    monkeypatch.setattr(srv, "dispatch", _fake_dispatch({"ok": True, "version": newer}))
+    assert run(srv.ensure_bridge_current()) is None
+
+
+def test_the_minimum_bridge_passes(monkeypatch):
+    monkeypatch.setattr(srv, "dispatch", _fake_dispatch({"ok": True, "version": srv.MIN_BRIDGE_VERSION}))
     assert run(srv.ensure_bridge_current()) is None
 
 

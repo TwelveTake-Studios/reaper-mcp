@@ -12,7 +12,7 @@ Listed in the [MCP Registry](https://registry.modelcontextprotocol.io/) as `mcp-
 
 A comprehensive Model Context Protocol (MCP) server that enables AI assistants to control REAPER DAW for mixing, mastering, MIDI composition, and full music production workflows.
 
-**Version:** 1.9.0
+**Version:** 1.9.1
 
 ## Why This Server
 
@@ -474,7 +474,7 @@ Multi-take workflows: list/switch/delete takes, explode/crop, REAPER 7 fixed-lan
 | `set_tempo(bpm)` | Set project tempo |
 | `get_time_signature()` | Get time signature |
 | `set_time_signature(num, denom)` | Set time signature |
-| `render_project(path, start, end, tail)` | Render to audio file |
+| `render_project(path, start, end, tail, skip_postprocessing)` | Render to audio file; lists the project's normalization, fades and other processing, or skips them |
 | `render_region(index, path)` | Render specific region |
 | `zoom_to_selection()` | Zoom to time selection |
 | `zoom_to_project()` | Zoom to show entire project |
@@ -559,7 +559,7 @@ what is already there. It is flagged `destructive` so a client can prompt first.
 |------|-------------|
 | `get_track_envelope(track, name)` | Get envelope by name |
 | `get_envelope_point_count(track, name)` | Count envelope points |
-| `add_envelope_point(track, name, time, value, shape, value_db)` | Add automation point (`value_db`: a volume level in dB) |
+| `add_envelope_point(track, name, time, value, shape, value_db)` | Add automation point, creating the envelope if the track has none (`value_db`: a volume level in dB) |
 | `get_envelope_points(track, name)` | Get all points |
 | `delete_envelope_point(track, name, index)` | Delete point |
 | `clear_envelope(track, name)` | Clear all points |

@@ -183,3 +183,8 @@ def test_reapack_index_carries_this_version():
     assert f"/raw/v{package_version()}/reaper_mcp_bridge.lua" in text, (
         "index.xml must fetch the bridge from this version's tag"
     )
+
+
+def test_the_mcp_handshake_reports_this_version():
+    options = srv.mcp._mcp_server.create_initialization_options()
+    assert options.server_version == package_version()

@@ -4,7 +4,7 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.9.0"
+local BRIDGE_VERSION = "1.9.1"
 local BRIDGE_SOURCE = debug and debug.getinfo and debug.getinfo(1, "S").source or ""
 local BRIDGE_PATH = BRIDGE_SOURCE:sub(1, 1) == "@" and BRIDGE_SOURCE:sub(2) or ""
 local INSTANCE_SECTION = "TwelveTake_REAPER_MCP"
@@ -1443,6 +1443,12 @@ local function run_item_action(track_index, item_index, cmd_id)
     return true, nil
 end
 
+local TRACK_ENVELOPE_ACTIONS = {
+    ["Volume"] = 40406, ["Pan"] = 40407, ["Volume (Pre-FX)"] = 40408, ["Pan (Pre-FX)"] = 40409,
+    ["Mute"] = 40867, ["Trim Volume"] = 42020, ["Width"] = 41870, ["Width (Pre-FX)"] = 41869,
+}
+local VOLUME_ENVELOPE_NAMES = {["Volume"] = true, ["Volume (Pre-FX)"] = true, ["Trim Volume"] = true}
+
 -- Resolve a track envelope by name from (track_index, env_name). -1 = master track.
 local function resolve_envelope(track_index, env_name)
     local track
@@ -1456,10 +1462,29 @@ local function resolve_envelope(track_index, env_name)
     end
     local env = reaper.GetTrackEnvelopeByName(track, env_name)
     if not env then
+        local how = TRACK_ENVELOPE_ACTIONS[env_name] and "add_envelope_point creates it"
+            or "create/show it in REAPER first"
         return nil, "Envelope '" .. tostring(env_name) .. "' not found on track "
-            .. tostring(track_index) .. " (create/show it in REAPER first)"
+            .. tostring(track_index) .. " (" .. how .. ")", track
     end
     return env, nil, track
+end
+
+local function create_track_envelope(track, env_name)
+    local action = TRACK_ENVELOPE_ACTIONS[env_name]
+    if not action then return nil end
+    local selected = {}
+    for i = 0, reaper.CountSelectedTracks2(0, true) - 1 do
+        selected[#selected + 1] = reaper.GetSelectedTrack2(0, i, true)
+    end
+    for _, t in ipairs(selected) do reaper.SetTrackSelected(t, false) end
+    reaper.SetTrackSelected(track, true)
+    reaper.Main_OnCommand(action, 0)
+    reaper.SetTrackSelected(track, false)
+    for _, t in ipairs(selected) do
+        if reaper.ValidatePtr2(0, t, "MediaTrack*") then reaper.SetTrackSelected(t, true) end
+    end
+    return reaper.GetTrackEnvelopeByName(track, env_name)
 end
 
 -- Envelope values
@@ -1496,17 +1521,27 @@ local function describe_envelope_point(env, volume, point)
     return point
 end
 
-local function insert_track_envelope_point(track, env, time, value, value_db, shape, tension, selected)
-    local volume = is_volume_envelope(track, env)
+local function refuse_envelope_value(volume, value, value_db)
     if value_db ~= nil then
         if not volume then
-            return {ok = false, error = "value_db applies only to Volume, Volume (Pre-FX) and Trim Volume; pass value"}
+            return "value_db applies only to Volume, Volume (Pre-FX) and Trim Volume; pass value"
         end
-        value = envelope_db_to_value(env, value_db)
     elseif value == nil then
-        return {ok = false, error = "Pass value or value_db"}
+        return "Pass value or value_db"
     elseif volume and value < 0 then
-        return {ok = false, error = "A volume envelope value below 0 is silence; pass the level in dB as value_db"}
+        return "A volume envelope value below 0 is silence; pass the level in dB as value_db"
+    end
+    return nil
+end
+
+local function insert_track_envelope_point(track, env, time, value, value_db, shape, tension, selected)
+    local volume = is_volume_envelope(track, env)
+    local refusal = refuse_envelope_value(volume, value, value_db)
+    if refusal then
+        return {ok = false, error = refusal}
+    end
+    if value_db ~= nil then
+        value = envelope_db_to_value(env, value_db)
     end
     local inserted = reaper.InsertEnvelopePoint(env, time, value, shape or 0, tension or 0,
         selected and true or false, false)
@@ -2225,7 +2260,7 @@ _G.__MIDI_TEST = {note_in_filter = note_in_filter, transpose_notes_pure = transp
 -- Render the master mix via "render using last settings", leaving the project's
 -- render settings exactly as they were found. Extracted from the dispatcher so the
 -- lupa suite can pin its exit paths; the wire name and arguments are unchanged.
-local function RenderProject(path, start_t, end_t, tail, overwrite)
+local function RenderProject(path, start_t, end_t, tail, overwrite, skip_postprocessing)
     local dir = path:match("^(.*)[/\\]") or ""
     local file = path:match("[^/\\]+$") or path
     local base = file:gsub("%.[A-Za-z0-9]+$", "")
@@ -2242,10 +2277,6 @@ local function RenderProject(path, start_t, end_t, tail, overwrite)
         return target_size(p) ~= nil
     end
 
-    -- Everything below writes project render settings, which are the user's own
-    -- and persist in the project (#12). Snapshot all seven keys this handler can
-    -- touch, and restore on EVERY exit — including the refusal below, which used
-    -- to mutate the settings and then render nothing.
     local prev_file     = select(2, reaper.GetSetProjectInfo_String(0, "RENDER_FILE", "", false)) or ""
     local prev_pattern  = select(2, reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", "", false)) or ""
     local prev_format   = select(2, reaper.GetSetProjectInfo_String(0, "RENDER_FORMAT", "", false)) or ""
@@ -2253,6 +2284,8 @@ local function RenderProject(path, start_t, end_t, tail, overwrite)
     local prev_bounds   = reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 0, false)
     local prev_start    = reaper.GetSetProjectInfo(0, "RENDER_STARTPOS", 0, false)
     local prev_end      = reaper.GetSetProjectInfo(0, "RENDER_ENDPOS", 0, false)
+    local prev_delay    = reaper.GetSetProjectInfo(0, "RENDER_DELAY", 0, false)
+    local prev_post     = reaper.GetSetProjectInfo(0, "RENDER_NORMALIZE", 0, false)
     local function restore_render_settings()
         reaper.GetSetProjectInfo_String(0, "RENDER_FILE", prev_file, true)
         reaper.GetSetProjectInfo_String(0, "RENDER_PATTERN", prev_pattern, true)
@@ -2261,6 +2294,45 @@ local function RenderProject(path, start_t, end_t, tail, overwrite)
         reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", prev_bounds, true)
         reaper.GetSetProjectInfo(0, "RENDER_STARTPOS", prev_start, true)
         reaper.GetSetProjectInfo(0, "RENDER_ENDPOS", prev_end, true)
+        reaper.GetSetProjectInfo(0, "RENDER_DELAY", prev_delay, true)
+        reaper.GetSetProjectInfo(0, "RENDER_NORMALIZE", prev_post, true)
+    end
+
+    local post_flags = math.floor(prev_post or 0)
+    local post_off = 4 << 16
+    local processing = {}
+    if skip_postprocessing then
+        reaper.GetSetProjectInfo(0, "RENDER_NORMALIZE", post_flags | post_off, true)
+    elseif post_flags & post_off == 0 then
+        local function value(key)
+            return reaper.GetSetProjectInfo(0, key, 0, false)
+        end
+        local function db(gain)
+            if not gain or gain <= 0 then return nil end
+            return math.floor(2000 * math.log(gain, 10) + 0.5) / 100
+        end
+        if post_flags & 1 ~= 0 then
+            local modes = {[0] = "LUFS-I", [2] = "RMS", [4] = "peak", [6] = "true peak",
+                           [8] = "LUFS-M max", [10] = "LUFS-S max"}
+            local when = "always"
+            if post_flags & (256 | 2048) == 256 then
+                when = "only if too loud"
+            elseif post_flags & (256 | 2048) == 2048 then
+                when = "only if too quiet"
+            end
+            processing.normalize = {mode = modes[post_flags & 14],
+                                    target_db = db(value("RENDER_NORMALIZE_TARGET")), when = when}
+        end
+        if post_flags & 64 ~= 0 then
+            processing.limit = {ceiling_db = db(value("RENDER_BRICKWALL")),
+                                true_peak = post_flags & 128 ~= 0}
+        end
+        if post_flags & 512 ~= 0 then processing.fade_in_s = value("RENDER_FADEIN") end
+        if post_flags & 1024 ~= 0 then processing.fade_out_s = value("RENDER_FADEOUT") end
+        if post_flags & 16384 ~= 0 then processing.trim_start_below_db = db(value("RENDER_TRIMSTART")) end
+        if post_flags & 32768 ~= 0 then processing.trim_end_below_db = db(value("RENDER_TRIMEND")) end
+        if post_flags & (1 << 16) ~= 0 then processing.pad_start_s = value("RENDER_PADSTART") end
+        if post_flags & (2 << 16) ~= 0 then processing.pad_end_s = value("RENDER_PADEND") end
     end
 
     reaper.GetSetProjectInfo_String(0, "RENDER_FILE", dir, true)
@@ -2269,7 +2341,8 @@ local function RenderProject(path, start_t, end_t, tail, overwrite)
         reaper.GetSetProjectInfo_String(0, "RENDER_FORMAT", "evaw", true)
     end
     -- master mix, source = master
-    reaper.GetSetProjectInfo(0, "RENDER_SETTINGS", 0, true)
+    local users_render_options = 256 | 512 | 1024 | 2048
+    reaper.GetSetProjectInfo(0, "RENDER_SETTINGS", math.floor(prev_settings or 0) & users_render_options, true)
     if start_t >= 0 and end_t > start_t then
         reaper.GetSetProjectInfo(0, "RENDER_BOUNDSFLAG", 0, true) -- custom bounds
         reaper.GetSetProjectInfo(0, "RENDER_STARTPOS", start_t, true)
@@ -2381,7 +2454,7 @@ local function RenderProject(path, start_t, end_t, tail, overwrite)
             .. " Ask for a .wav path, or set the project's render format to match."}
     end
 
-    return {ok = true, ret = true, output = path, targets = targets}
+    return {ok = true, ret = true, output = path, targets = targets, processing = processing}
 end
 
 -- Audio measurement
@@ -3239,9 +3312,25 @@ local function dispatch_call(fname, args)
                         -- Legacy convention kept for compatibility: (envelope_userdata, time, value, ...)
                         if type(args[1]) == "number" and type(args[2]) == "string" then
                             local env, err, track = resolve_envelope(args[1], args[2])
+                            local created = false
+                            if not env and track and TRACK_ENVELOPE_ACTIONS[args[2]] then
+                                local refusal = refuse_envelope_value(
+                                    VOLUME_ENVELOPE_NAMES[args[2]] or false, args[4], args[9])
+                                if refusal then
+                                    err = refusal
+                                else
+                                    env = create_track_envelope(track, args[2])
+                                    created = env ~= nil
+                                    if created then
+                                        local at = tonumber(args[3]) or 0
+                                        reaper.DeleteEnvelopePointRange(env, at - 0.000001, at + 0.000001)
+                                    end
+                                end
+                            end
                             if env then
                                 local result = insert_track_envelope_point(track, env,
                                     args[3], args[4], args[9], args[5], args[6], args[7])
+                                if created and result.ok then result.envelope_created = true end
                                 for k, v in pairs(result) do response[k] = v end
                             else
                                 response.error = err
@@ -6896,13 +6985,11 @@ local function dispatch_call(fname, args)
                         end
 
                     elseif fname == "RenderProject" then
-                        -- args: output_path, start_time (-1 = project start), end_time (-1 = project end),
-                        --       tail_seconds, overwrite. The handler snapshots and restores the
-                        --       project's render settings itself (#12) and verifies the output.
                         if #args >= 1 and type(args[1]) == "string" and args[1] ~= "" then
                             local result = RenderProject(args[1], tonumber(args[2]) or -1,
                                                          tonumber(args[3]) or -1,
-                                                         tonumber(args[4]) or 0, args[5])
+                                                         tonumber(args[4]) or 0, args[5],
+                                                         args[6] == true)
                             for k, v in pairs(result) do
                                 response[k] = v
                             end

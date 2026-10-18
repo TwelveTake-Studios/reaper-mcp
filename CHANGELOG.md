@@ -5,6 +5,36 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.1] - 2026-10-18
+
+**After you update, run `twelvetake-reaper-mcp --install-bridge`.** If REAPER is running the 1.7.8
+bridge or later, you don't have to do anything in REAPER. If you installed with ReaPack,
+synchronize your packages instead.
+
+### Fixed
+- **`add_envelope_point` refused on a track that didn't have that envelope yet.** It asked you to
+  create the envelope in REAPER first. It now creates a missing Volume, Pan, Width, Mute or Trim
+  Volume envelope, or a Pre-FX one, the way REAPER does when you show it: the new envelope starts
+  with a point at 0:00 holding the track's current value. Your track selection stays as it was.
+  *(Found while answering a follow-up from [@gitickle](https://github.com/gitickle) in
+  [issue #20](https://github.com/TwelveTake-Studios/reaper-mcp/issues/20).)*
+- **`render_project` erased the project's render start delay.** Every render through the tool
+  reset the delay to 0 seconds, and rendered without the project's options to embed metadata,
+  stretch markers and take markers or to render in two passes. The tool now uses those options
+  and leaves the delay as you set it. It still renders without the delay, because REAPER's
+  countdown window would stop the bridge until someone closed it.
+- **The server reported the wrong version to your AI client.** 1.8.0 and 1.9.0 said they were
+  version 1.30.0, the version of the MCP library they're built on. The server now reports its
+  own version.
+
+### Added
+- **`render_project` tells you what the project's render settings did to the file.** A render
+  uses the project's own normalization, limiter, fades, silence trimming and padding. The response
+  now lists the ones that applied in `processing`, for example a -11 LUFS normalization target or
+  a 3.5 s fade-out. Pass `skip_postprocessing` to render without them, for a file you want to
+  measure or compare. The tool's description used to say that only the file format came from the
+  project.
+
 ## [1.9.0] - 2026-10-17
 
 **After you update, run `twelvetake-reaper-mcp --install-bridge`.** If REAPER is running the 1.7.8

@@ -93,6 +93,7 @@ string_settings = {{
 }}
 numeric_settings = {{
     RENDER_SETTINGS = 3, RENDER_BOUNDSFLAG = 2, RENDER_STARTPOS = 10.5, RENDER_ENDPOS = 99.25,
+    RENDER_DELAY = 2.5, RENDER_NORMALIZE = 1024, RENDER_FADEOUT = 3.5,
 }}
 function all_settings()
     local merged = {{}}
@@ -159,7 +160,8 @@ def test_render_success_shape_unchanged(render_call, lua_tmp):
         stub_render_reaper(action_lua=make_file_action(target)),
         f'RenderProject("{target}", -1, -1, 0, nil)',
     )
-    assert out["response"] == {"ok": True, "ret": True, "output": target, "targets": target}
+    assert out["response"] == {"ok": True, "ret": True, "output": target, "targets": target,
+                               "processing": {"fade_out_s": 3.5}}
     assert out["render_ran"] is True
     assert out["during_render"]["cmd"] == 42230
 
@@ -192,6 +194,120 @@ def test_render_restores_settings_after_success(render_call, lua_tmp):
     assert out["during_render"]["RENDER_SETTINGS"] == 0
     assert out["during_render"]["RENDER_FILE"] == lua_tmp.as_posix()
     assert out["during_render"]["RENDER_PATTERN"] == "mix"
+
+
+DELAY_START = 16 << 16
+SOURCE_BITS = 1 | 2 | 4 | 8 | 16 | 32 | 64 | 128 | 4096 | 8192 | 16384 | (8 << 16)
+
+
+def test_render_keeps_the_users_render_options_and_selects_the_master_mix(render_call, lua_tmp):
+    target = (lua_tmp / "mix.wav").as_posix()
+    users = 256 | 512 | 1024 | 2048
+    out = render_call(
+        stub_render_reaper(action_lua=make_file_action(target)),
+        f'RenderProject("{target}", 2, 5, 0, nil)',
+        prelude=f"numeric_settings.RENDER_SETTINGS = {users | SOURCE_BITS}\ninitial = all_settings()",
+    )
+    assert out["response"]["ok"] is True, out["response"]
+    assert out["during_render"]["RENDER_SETTINGS"] == users
+    assert out["settings"] == out["initial"]
+
+
+def test_render_turns_off_the_render_delay_prompt_and_restores_it(render_call, lua_tmp):
+    target = (lua_tmp / "mix.wav").as_posix()
+    out = render_call(
+        stub_render_reaper(action_lua=make_file_action(target)),
+        f'RenderProject("{target}", 2, 5, 0, nil)',
+        prelude=f"numeric_settings.RENDER_SETTINGS = {DELAY_START | 2048}\ninitial = all_settings()",
+    )
+    assert out["response"]["ok"] is True, out["response"]
+    assert out["during_render"]["RENDER_SETTINGS"] == 2048
+    assert out["settings"]["RENDER_SETTINGS"] == DELAY_START | 2048
+    assert out["settings"] == out["initial"]
+
+
+def test_render_delay_value_survives_a_render_that_clears_it(render_call, lua_tmp):
+    target = (lua_tmp / "mix.wav").as_posix()
+    out = render_call(
+        stub_render_reaper(
+            action_lua=make_file_action(target) + "\nnumeric_settings.RENDER_DELAY = 0",
+        ),
+        f'RenderProject("{target}", 2, 5, 0, nil)',
+    )
+    assert out["response"]["ok"] is True, out["response"]
+    assert out["during_render"]["RENDER_DELAY"] == 2.5
+    assert out["settings"]["RENDER_DELAY"] == 2.5
+    assert out["settings"] == out["initial"]
+
+
+POST_OFF = 4 << 16
+EVERY_PROCESS = 1 | 4 | 256 | 64 | 128 | 512 | 1024 | 16384 | 32768 | (1 << 16) | (2 << 16)
+PROCESS_VALUES = (
+    "numeric_settings.RENDER_NORMALIZE_TARGET = 0.281838\n"
+    "numeric_settings.RENDER_BRICKWALL = 0.891251\n"
+    "numeric_settings.RENDER_FADEIN = 0.01\n"
+    "numeric_settings.RENDER_TRIMSTART = 0.001\n"
+    "numeric_settings.RENDER_TRIMEND = 0.000316228\n"
+    "numeric_settings.RENDER_PADSTART = 0.25\n"
+    "numeric_settings.RENDER_PADEND = 1.5\n"
+)
+
+
+def render_with_processing(render_call, lua_tmp, flags, skip=False):
+    target = (lua_tmp / "mix.wav").as_posix()
+    return render_call(
+        stub_render_reaper(action_lua=make_file_action(target)),
+        f'RenderProject("{target}", 2, 5, 0, nil, {"true" if skip else "false"})',
+        prelude=PROCESS_VALUES + f"numeric_settings.RENDER_NORMALIZE = {flags}\ninitial = all_settings()",
+    )
+
+
+def test_render_reports_every_kind_of_project_processing(render_call, lua_tmp):
+    out = render_with_processing(render_call, lua_tmp, EVERY_PROCESS)
+    assert out["response"]["ok"] is True, out["response"]
+    assert out["response"]["processing"] == {
+        "normalize": {"mode": "peak", "target_db": -11.0, "when": "only if too loud"},
+        "limit": {"ceiling_db": -1.0, "true_peak": True},
+        "fade_in_s": 0.01,
+        "fade_out_s": 3.5,
+        "trim_start_below_db": -60.0,
+        "trim_end_below_db": -70.0,
+        "pad_start_s": 0.25,
+        "pad_end_s": 1.5,
+    }
+    assert out["during_render"]["RENDER_NORMALIZE"] == EVERY_PROCESS
+    assert out["settings"] == out["initial"]
+
+
+@pytest.mark.parametrize("flags, mode, when", [
+    (1, "LUFS-I", "always"),
+    (1 | 2, "RMS", "always"),
+    (1 | 6, "true peak", "always"),
+    (1 | 8, "LUFS-M max", "only if too quiet"),
+    (1 | 10, "LUFS-S max", "always"),
+])
+def test_render_names_the_normalize_mode_and_condition(render_call, lua_tmp, flags, mode, when):
+    if when == "only if too quiet":
+        flags |= 2048
+    out = render_with_processing(render_call, lua_tmp, flags)
+    assert out["response"]["processing"] == {
+        "normalize": {"mode": mode, "target_db": -11.0, "when": when},
+    }
+
+
+def test_render_skip_postprocessing_turns_it_off_for_the_render_only(render_call, lua_tmp):
+    out = render_with_processing(render_call, lua_tmp, EVERY_PROCESS, skip=True)
+    assert out["response"]["ok"] is True, out["response"]
+    assert out["response"]["processing"] == {}
+    assert out["during_render"]["RENDER_NORMALIZE"] == EVERY_PROCESS | POST_OFF
+    assert out["settings"]["RENDER_NORMALIZE"] == EVERY_PROCESS
+    assert out["settings"] == out["initial"]
+
+
+def test_render_reports_nothing_when_the_project_turns_postprocessing_off(render_call, lua_tmp):
+    out = render_with_processing(render_call, lua_tmp, EVERY_PROCESS | POST_OFF)
+    assert out["response"]["processing"] == {}
+    assert out["during_render"]["RENDER_NORMALIZE"] == EVERY_PROCESS | POST_OFF
 
 
 def test_render_refusal_restores_settings_and_does_not_render(render_call, lua_tmp):
@@ -455,6 +571,7 @@ if response.ret ~= nil then out.ret = response.ret end
 if captured then
     out.n = captured.n
     out.a1, out.a2, out.a3, out.a4, out.a5 = captured[1], captured[2], captured[3], captured[4], captured[5]
+    out.a6 = captured[6]
 end
 return encode_json(out)
 """
@@ -465,26 +582,28 @@ return encode_json(out)
 def test_dispatch_positional_order_is_the_wire_contract(dispatch_render):
     """path, start, end, tail, overwrite — in that order, matching what
     test_tools.py pins on the Python side."""
-    out = dispatch_render('{"func":"RenderProject","args":["D:/out/mix.wav",2,5,1,true]}')
+    out = dispatch_render('{"func":"RenderProject","args":["D:/out/mix.wav",2,5,1,true,true]}')
     assert out["ok"] is True and out["ret"] is True
-    assert (out["a1"], out["a2"], out["a3"], out["a4"], out["a5"]) == \
-        ("D:/out/mix.wav", 2, 5, 1, True)
-    assert out["n"] == 5
+    assert (out["a1"], out["a2"], out["a3"], out["a4"], out["a5"], out["a6"]) == \
+        ("D:/out/mix.wav", 2, 5, 1, True, True)
+    assert out["n"] == 6
 
 
 def test_dispatch_json_false_reaches_the_handler_as_false(dispatch_render):
     """The server always sends overwrite explicitly; false must not decay to nil
     anywhere between JSON and the handler."""
-    out = dispatch_render('{"func":"RenderProject","args":["D:/out/mix.wav",-1,-1,0,false]}')
+    out = dispatch_render('{"func":"RenderProject","args":["D:/out/mix.wav",-1,-1,0,false,false]}')
     assert out["a5"] is False
-    assert out["n"] == 5
+    assert out["a6"] is False
+    assert out["n"] == 6
 
 
 def test_dispatch_missing_args_get_the_documented_defaults(dispatch_render):
     out = dispatch_render('{"func":"RenderProject","args":["D:/out/mix.wav"]}')
     assert (out["a2"], out["a3"], out["a4"]) == (-1, -1, 0)
     assert "a5" not in out
-    assert out["n"] == 5
+    assert out["a6"] is False
+    assert out["n"] == 6
 
 
 def test_dispatch_numeric_strings_are_coerced(dispatch_render):
