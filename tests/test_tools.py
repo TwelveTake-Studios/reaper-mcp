@@ -316,6 +316,41 @@ def test_render_project_none_becomes_sentinels(reaper):
     assert reaper.last == ("RenderProject", ["C:/tmp/out.wav", -1, -1, 0, False, True])
 
 
+def test_render_project_with_only_an_end_starts_at_zero(reaper):
+    run(srv.render_project("C:/tmp/out.wav", end_time=8.0, tail_seconds=1.5))
+    assert reaper.calls == [("RenderProject", ["C:/tmp/out.wav", 0.0, 8.0, 1.5, False, False])]
+
+
+def test_render_project_with_only_a_start_ends_at_the_project_length(reaper):
+    reaper.response = {"ok": True, "ret": 42.0}
+    run(srv.render_project("C:/tmp/out.wav", start_time=3.0, tail_seconds=1.5))
+    assert reaper.calls == [
+        ("GetProjectLength", [0]),
+        ("RenderProject", ["C:/tmp/out.wav", 3.0, 42.0, 1.5, False, False]),
+    ]
+
+
+def test_render_project_reports_a_failed_length_lookup_and_does_not_render(reaper):
+    reaper.response = {"ok": False, "error": "GetProjectLength timed out after 5s"}
+    result = run(srv.render_project("C:/tmp/out.wav", start_time=3.0))
+    assert result == {"ok": False, "error": "GetProjectLength timed out after 5s"}
+    assert [func for func, _ in reaper.calls] == ["GetProjectLength"]
+
+
+@pytest.mark.parametrize("start, end", [(4.0, 2.0), (4.0, 4.0), (None, 0.0), (None, -1.0)])
+def test_render_project_refuses_an_end_at_or_before_the_start_without_calling_reaper(reaper, start, end):
+    result = run(srv.render_project("C:/tmp/out.wav", start_time=start, end_time=end))
+    assert result["ok"] is False
+    assert "end_time" in result["error"]
+    assert reaper.calls == []
+
+
+@pytest.mark.parametrize("name", ["save_fx_preset", "render_region"])
+def test_a_tool_that_always_fails_says_so_in_its_description(name):
+    tool = {t.name: t for t in srv.mcp._tool_manager.list_tools()}[name]
+    assert "always returns an error" in " ".join(tool.description.split())
+
+
 def test_render_region_documented_error(reaper):
     """Fails usefully without reaching the bridge, and names no version.
 

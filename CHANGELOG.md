@@ -5,6 +5,46 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.2] - 2026-10-20
+
+This release updates the server only. The bridge script remains at version 1.9.1 and does not
+need to be redeployed.
+
+### Fixed
+- **`render_project` rendered the entire project when given only part of a range.** With only
+  `start_time`, only `end_time`, or an `end_time` at or before `start_time`, the tool ignored the
+  range. It now renders from `start_time` to the end of the project, or from the start of the
+  project to `end_time`, as its description states, and it returns an error when `end_time` is
+  not later than `start_time`. `tail_seconds` still extends the render past the end.
+- **Render and measurement timeouts named the wrong setting.** When `render_project`,
+  `measure_loudness` or `measure_spectrum` timed out, the error advised raising
+  `REAPER_FILE_TIMEOUT` (default 5 seconds). These tools wait for `REAPER_RENDER_TIMEOUT`
+  (default 600 seconds), and the error now names that setting. `--help` now lists
+  `REAPER_RENDER_TIMEOUT`.
+- **Installing from `requirements.txt` could install an incompatible MCP library.** The file
+  allowed version 2 of the `mcp` package, which removed the `mcp.server.fastmcp` module the
+  server is built on, so a source installation failed at startup. `requirements.txt` now
+  requires `mcp>=1.2.0,<2.0`, as the package does.
+- **Failed deletions returned no explanation.** `delete_marker`, `delete_region` and
+  `delete_send` returned `ok: false` without an `error` when the marker, region or send did not
+  exist. They now report what was not found, for example "No marker numbered 7". Every tool now
+  includes an `error` whenever it returns `ok: false`.
+- **`test_connection.py` used a Windows-only path to the bridge directory.** It now locates the
+  directory the same way the server does.
+- **`save_fx_preset` and `render_region` were presented as working.** Both tools always return
+  an error: REAPER's API cannot save a named FX preset, and `render_region` is not implemented.
+  Their descriptions and the README now say so. To render a region, use `render_project` with
+  the region's start and end from `get_regions`.
+
+### Added
+- **Python 3.14 support.** The server is tested on Python 3.14, and the package lists it as
+  supported.
+
+### Changed
+- **Unknown command-line options are refused.** A mistyped option such as `--instal-bridge`
+  previously started the server, which then waited for a client. The command now prints its
+  usage and exits with status 2.
+
 ## [1.9.1] - 2026-10-18
 
 **After you update, run `twelvetake-reaper-mcp --install-bridge`.** If REAPER is running the 1.7.8

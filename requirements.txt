@@ -1,5 +1,5 @@
 # REAPER MCP Server Dependencies
 
 # MCP protocol implementation
-mcp>=1.0.0
+mcp>=1.2.0,<2.0
 

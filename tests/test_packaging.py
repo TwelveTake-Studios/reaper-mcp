@@ -12,6 +12,7 @@ Nothing here needs a network, a build backend or a TOML parser, so it cannot qui
 stop running.
 """
 
+import re
 from pathlib import Path
 
 import reaper_mcp_server as srv
@@ -92,6 +93,23 @@ def test_mcp_dependency_is_capped_below_2():
     assert "<2" in pin.replace(" ", ""), (
         f"mcp dependency has no upper bound ({pin}); mcp 2.0 breaks the import"
     )
+
+
+def test_classifiers_claim_exactly_the_pythons_ci_tests():
+    ci = (REPO / ".github" / "workflows" / "ci.yml").read_text(encoding="utf-8")
+    matrix = re.search(r"python-version: \[(.*?)\]", ci)
+    assert matrix, "no python-version matrix in ci.yml"
+    tested = set(re.findall(r'"(3\.\d+)"', matrix.group(1)))
+    claimed = set(re.findall(r'"Programming Language :: Python :: (3\.\d+)"', table("project")))
+    assert claimed == tested
+    assert "3.14" in tested
+
+
+def test_requirements_txt_pins_mcp_as_pyproject_does():
+    pin = next(e for e in array("dependencies", "project") if e.strip('",').startswith("mcp"))
+    lines = [ln.strip() for ln in (REPO / "requirements.txt").read_text(encoding="utf-8").splitlines()]
+    mcp_lines = [ln for ln in lines if ln.startswith("mcp")]
+    assert mcp_lines == [pin.strip('",')]
 
 
 def test_wheel_and_sdist_ship_the_analyzer():

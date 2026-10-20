@@ -9,11 +9,6 @@ beyond running the bridge script inside REAPER.
 
 Usage:
     python test_connection.py
-
-The bridge directory defaults to %APPDATA%\\REAPER\\Scripts\\mcp_bridge_data and can be
-overridden with the REAPER_BRIDGE_DIR environment variable (mirrors the MCP server).
-
-Pure standard library — no third-party dependencies required.
 """
 
 import os
@@ -22,11 +17,9 @@ import json
 import time
 from pathlib import Path
 
-# Mirror the MCP server's bridge-directory resolution.
-BRIDGE_DIR = Path(
-    os.getenv("REAPER_BRIDGE_DIR")
-    or os.path.expandvars(r"%APPDATA%\REAPER\Scripts\mcp_bridge_data")
-)
+from reaper_mcp_server import default_bridge_dir
+
+BRIDGE_DIR = Path(os.getenv("REAPER_BRIDGE_DIR") or default_bridge_dir())
 
 TIMEOUT = 5.0
 POLL_INTERVAL = 0.05

@@ -9,10 +9,9 @@ A TwelveTake Studios project - https://twelvetake.com
 
 Author: TwelveTake Studios LLC
 License: MIT
-Version: 1.6.5
 """
 
-__version__ = "1.9.1"
+__version__ = "1.9.2"
 
 import os
 import asyncio
@@ -52,8 +51,13 @@ def _validate_indices(**named) -> Optional[dict]:
     return None
 
 
+def _explain_failure(result, message: str):
+    if isinstance(result, dict) and result.get("ok") is False and not result.get("error"):
+        result["error"] = message
+    return result
+
+
 # Configuration
-# File-based fallback configuration
 
 def reaper_resource_dir() -> Path:
     """REAPER's resource directory for this platform: the folder that holds Scripts/.
@@ -145,8 +149,6 @@ try:
         raise ValueError
 except ValueError:
     RENDER_TIMEOUT = 600.0
-
-# Communication mode: "file" (default), "http", or "auto" (http with file fallback)
 
 # Create MCP server
 mcp = FastMCP(
@@ -447,6 +449,10 @@ async def reaper_call_file(func: str, args: list, timeout: float = None, calls: 
         except:
             pass
 
+        if timeout is not None and timeout == RENDER_TIMEOUT:
+            setting, default = "REAPER_RENDER_TIMEOUT", "600"
+        else:
+            setting, default = "REAPER_FILE_TIMEOUT", "5.0"
         return {
             "ok": False,
             "error": f"{func} timed out after {deadline:g}s",
@@ -457,8 +463,8 @@ async def reaper_call_file(func: str, args: list, timeout: float = None, calls: 
                 "freezing, glueing, normalizing, opening or saving a project) reports a "
                 "timeout while REAPER completes it normally. Renders in particular run at "
                 "close to realtime unless the project's render settings say otherwise. "
-                "Set REAPER_FILE_TIMEOUT to a number of seconds that covers the work you "
-                "are asking for; it defaults to 5.0. "
+                f"Set {setting} to a number of seconds that covers the work you "
+                f"are asking for; it defaults to {default}. "
                 "Check the expected result before retrying. When retrying a render, do not "
                 "pass overwrite=true to clear a 'target already exists' error: REAPER "
                 "creates the target at zero bytes when a render starts, so that file is the "
@@ -1244,7 +1250,8 @@ async def delete_send(track_index: int, send_index: int) -> dict:
         send_index: Send index (0-based) to delete.
     """
     # RemoveTrackSend(track, category, sendidx) - category 0 = sends
-    return await reaper_call("RemoveTrackSend", track_index, 0, send_index)
+    return _explain_failure(await reaper_call("RemoveTrackSend", track_index, 0, send_index),
+                            f"Track {track_index} has no send with index {send_index}")
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
@@ -2812,6 +2819,18 @@ async def render_project(
     Returns:
         Object with render status, REAPER's computed output target(s) and `processing`.
     """
+    if start_time is None and end_time is not None:
+        start_time = 0.0
+    elif start_time is not None and end_time is None:
+        length = await reaper_call("GetProjectLength", 0)
+        if not length.get("ok"):
+            return length
+        end_time = length.get("ret") or 0
+        if end_time <= start_time:
+            return {"ok": False, "error": f"start_time {start_time:g} is not before the end of the "
+                                          f"project ({end_time:g} s)"}
+    if start_time is not None and end_time <= start_time:
+        return {"ok": False, "error": f"end_time {end_time:g} must be later than start_time {start_time:g}"}
     # None -> -1 sentinels: JSON nulls become Lua nils, which corrupt the bridge's
     # positional argument handling.
     # RenderProject blocks the bridge's defer loop for the whole render, and renders run
@@ -2886,10 +2905,8 @@ async def measure_spectrum(
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def render_region(region_index: int, output_path: str) -> dict:
     """
-    NOT IMPLEMENTED. Use render_project with the region's start/end from get_regions.
-
-    Args:
-        output_path: Full path for output file.
+    Not implemented: this tool always returns an error. Use render_project with the
+    region's start and end from get_regions.
     """
     return {
         "ok": False,
@@ -2965,7 +2982,8 @@ async def delete_marker(marker_index: int) -> dict:
     Delete a marker by index.
 
     """
-    return await reaper_call("DeleteProjectMarker", 0, marker_index, False)
+    return _explain_failure(await reaper_call("DeleteProjectMarker", 0, marker_index, False),
+                            f"No marker numbered {marker_index}")
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
@@ -2974,7 +2992,8 @@ async def delete_region(region_index: int) -> dict:
     Delete a region by index.
 
     """
-    return await reaper_call("DeleteProjectMarker", 0, region_index, True)
+    return _explain_failure(await reaper_call("DeleteProjectMarker", 0, region_index, True),
+                            f"No region numbered {region_index}")
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
@@ -3622,11 +3641,8 @@ async def set_fx_preset(track_index: int, fx_index: int, preset_name: str) -> di
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def save_fx_preset(track_index: int, fx_index: int, preset_name: str) -> dict:
     """
-    Save the current FX settings as a preset.
-
-    Args:
-        preset_name: Name for the new preset.
-
+    Not supported: REAPER's API cannot save a named FX preset, so this tool always returns
+    an error. Use get_track_fx_chunk to capture the current FX state.
     """
     return await reaper_call("TrackFX_SavePreset", track_index, fx_index, preset_name)
 
@@ -4055,6 +4071,26 @@ def wrap_tools_in_undo_steps() -> list:
 UNDO_STEP_TOOLS = wrap_tools_in_undo_steps()
 
 
+def _with_failure_reason(fn, name):
+    @functools.wraps(fn)
+    async def call(*args, **kwargs):
+        return _explain_failure(await fn(*args, **kwargs), f"{name} did not succeed; REAPER reported no reason")
+    return call
+
+
+def require_failure_reasons() -> list:
+    manager = getattr(mcp, "_tool_manager", None)
+    if manager is None or not callable(getattr(manager, "list_tools", None)):
+        return []
+    for tool in manager.list_tools():
+        tool.fn = _with_failure_reason(tool.fn, tool.name)
+        globals()[tool.name] = tool.fn
+    return [tool.name for tool in manager.list_tools()]
+
+
+FAILURE_REASON_TOOLS = require_failure_reasons()
+
+
 # --- MAIN ---
 
 BRIDGE_SCRIPT_NAME = "reaper_mcp_bridge.lua"
@@ -4082,7 +4118,9 @@ Otherwise load it once in REAPER: Actions > Show action list > Load ReaScript, s
 {BRIDGE_SCRIPT_NAME}, then run it.
 
 Environment:
-  REAPER_BRIDGE_DIR   Override the bridge data directory.
+  REAPER_BRIDGE_DIR       Override the bridge data directory.
+  REAPER_RENDER_TIMEOUT   Seconds to wait for render_project, measure_loudness and
+                          measure_spectrum to finish (default 600).
 """
 
 
@@ -4324,6 +4362,10 @@ def main():
     if argv and argv[0] in ("--help", "-h", "help"):
         print(USAGE)
         raise SystemExit(0)
+    if argv and argv[0].startswith("-"):
+        print(f"error: unknown option: {argv[0]}\n", file=sys.stderr)
+        print(USAGE, file=sys.stderr)
+        raise SystemExit(2)
 
     # Refuse to start against a bridge directory that cannot work, rather than creating a
     # junk folder and timing out against it on every call for the rest of the session.

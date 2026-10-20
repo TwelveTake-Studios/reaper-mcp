@@ -2,18 +2,18 @@
   "$schema": "https://static.modelcontextprotocol.io/schemas/2025-12-11/server.schema.json",
   "name": "com.twelvetake/reaper-mcp",
   "title": "REAPER MCP",
-  "description": "Lets an AI assistant work in your open REAPER project: mixing, MIDI, routing and rendering.",
+  "description": "Enables AI assistants to control REAPER for mixing, mastering, MIDI and music production.",
   "repository": {
     "url": "https://github.com/TwelveTake-Studios/reaper-mcp",
     "source": "github"
   },
   "websiteUrl": "https://twelvetake.com/tools/reaper-mcp/",
-  "version": "1.9.1",
+  "version": "1.9.2",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "twelvetake-reaper-mcp",
-      "version": "1.9.1",
+      "version": "1.9.2",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

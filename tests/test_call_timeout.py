@@ -7,6 +7,7 @@ that long to diagnose on EVERY call. So a call that knows its own work is slow c
 its own deadline, and the rest of the surface keeps the fast one.
 """
 import asyncio
+import sys
 import time
 
 import pytest
@@ -103,3 +104,47 @@ def test_render_timeout_default_is_generous_enough_for_a_realtime_render():
     assert srv.RENDER_TIMEOUT >= 60.0, (
         "renders run at roughly realtime; a small default reintroduces #11"
     )
+
+
+@pytest.fixture
+def unanswered_bridge_dir(monkeypatch, tmp_path):
+    monkeypatch.setattr(srv, "BRIDGE_DIR", tmp_path)
+    monkeypatch.setattr(srv, "BRIDGE_DIR_PROBLEM", None)
+    monkeypatch.setattr(srv, "FILE_POLL_INTERVAL", 0.01)
+    monkeypatch.setattr(srv, "FILE_TIMEOUT", 0.03)
+    monkeypatch.setattr(srv, "RENDER_TIMEOUT", 0.05)
+    monkeypatch.setattr(srv, "_bridge_check", {"done": False, "error": None, "claims_ok": False})
+    return tmp_path
+
+
+@pytest.mark.parametrize("call", [
+    lambda: srv.render_project("/tmp/out.wav", start_time=0.0, end_time=1.0),
+    lambda: srv.measure_loudness(),
+    lambda: srv.measure_spectrum(),
+], ids=["render_project", "measure_loudness", "measure_spectrum"])
+def test_a_render_or_measurement_timeout_names_the_render_setting(unanswered_bridge_dir, call):
+    result = run(call())
+    assert result["ok"] is False
+    assert "0.05s" in result["error"]
+    assert "REAPER_RENDER_TIMEOUT" in result["hint"]
+    assert "defaults to 600." in result["hint"]
+    assert "REAPER_FILE_TIMEOUT" not in result["hint"]
+
+
+def test_an_ordinary_timeout_names_the_file_setting(unanswered_bridge_dir):
+    result = run(srv.get_track_count())
+    assert result["ok"] is False
+    assert "0.03s" in result["error"]
+    assert "REAPER_FILE_TIMEOUT" in result["hint"]
+    assert "defaults to 5.0." in result["hint"]
+    assert "REAPER_RENDER_TIMEOUT" not in result["hint"]
+
+
+def test_help_lists_the_render_timeout(monkeypatch, capsys):
+    monkeypatch.setattr(sys, "argv", ["twelvetake-reaper-mcp", "--help"])
+    with pytest.raises(SystemExit) as stopped:
+        srv.main()
+    assert stopped.value.code == 0
+    out = capsys.readouterr().out
+    assert "REAPER_RENDER_TIMEOUT" in out
+    assert "(default 600)" in out

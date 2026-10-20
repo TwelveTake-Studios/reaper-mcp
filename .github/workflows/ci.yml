@@ -13,7 +13,7 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest]
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
+        python-version: ["3.10", "3.11", "3.12", "3.13", "3.14"]
         include:
           # The bridge directory was resolved with a Windows-only %APPDATA% string for a
           # year, and CI never noticed because CI was Linux only. One job per platform is
