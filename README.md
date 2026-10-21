@@ -12,7 +12,7 @@ Listed in the [MCP Registry](https://registry.modelcontextprotocol.io/) as `mcp-
 
 TwelveTake REAPER MCP is a Model Context Protocol server that enables AI assistants to control REAPER for mixing, mastering, MIDI composition and music production.
 
-**Version:** 1.9.2
+**Version:** 1.9.3
 
 ## Why This Server
 
@@ -93,9 +93,8 @@ The script is now in the action list. Select it and click **Run**:
 
 ![The action list filtered to the bridge script, ready to run](https://raw.githubusercontent.com/TwelveTake-Studios/reaper-mcp/main/images/bridge-run.png)
 
-REAPER's console confirms the bridge is running:
-
-![REAPER's console showing the bridge has started](https://raw.githubusercontent.com/TwelveTake-Studios/reaper-mcp/main/images/bridge-started.png)
+The bridge runs in the background, without opening a window, until you close REAPER. Step 3
+checks that it is working.
 
 Next time, find it by typing `mcp bridge` in the action list's filter box, or have REAPER
 start it for you (below).
@@ -652,7 +651,8 @@ Third-party plugins use their full name as shown in REAPER's FX browser.
 
 ### "Cannot connect to REAPER"
 1. Ensure REAPER is running
-2. Ensure the bridge script is running (check REAPER's console)
+2. Ensure the bridge script is running: start it from the action list (type `mcp bridge` in the
+   filter box)
 3. Verify the bridge directory exists
 
 ### "Track not found"
@@ -675,7 +675,7 @@ Third-party plugins use their full name as shown in REAPER's FX browser.
 | `REAPER_BRIDGE_DIR` | REAPER's `Scripts/mcp_bridge_data`, resolved per platform | File bridge directory |
 | `REAPER_FILE_TIMEOUT` | `5.0` | Seconds to wait for the bridge to answer a call, except for the render and measurement tools below. The bridge answers only after the work finishes, so a slow operation such as freezing a track or opening a project can report a timeout while REAPER completes it normally. A higher value also delays the report when the bridge is not running. |
 | `REAPER_RENDER_TIMEOUT` | `600` | Seconds to wait for `render_project`, `measure_loudness` and `measure_spectrum`, which run at roughly realtime. Raise it for renders longer than ten minutes. |
-| `REAPER_MCP_DEBUG` | unset | Set to `1` before launching REAPER for per-call bridge console logging |
+| `REAPER_MCP_DEBUG` | unset | Set to `1` before launching REAPER to see the bridge's start message and a console line for every call |
 
 ## Contributing
 

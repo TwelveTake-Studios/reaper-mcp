@@ -8,12 +8,12 @@
     "source": "github"
   },
   "websiteUrl": "https://twelvetake.com/tools/reaper-mcp/",
-  "version": "1.9.2",
+  "version": "1.9.3",
   "packages": [
     {
       "registryType": "pypi",
       "identifier": "twelvetake-reaper-mcp",
-      "version": "1.9.2",
+      "version": "1.9.3",
       "runtimeHint": "uvx",
       "transport": {
         "type": "stdio"

@@ -101,3 +101,10 @@ it. His fork works around it with a wrapper resolving
 directory and whether it exists, which is the same path and the same diagnostic v1.6.1 builds
 into the server. He also independently diagnosed and fixed the MIDI call-path bugs, reaching
 the same time-based `InsertMIDINote` and `CreateMIDIItem` routing that shipped in v1.3.1.
+
+### Kaan Özkan, [@ozzaii](https://github.com/ozzaii)
+
+- **[Issue #22](https://github.com/TwelveTake-Studios/reaper-mcp/issues/22)** - reported that
+  the bridge's start message opened REAPER's console on every launch once REAPER started the
+  bridge by itself, which musicians read as an error, and gave the fix: the two lines to change
+  and the existing `REAPER_MCP_DEBUG` switch to put them behind. Shipped in **v1.9.3**.

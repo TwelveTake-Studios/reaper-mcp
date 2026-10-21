@@ -5,6 +5,24 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.3] - 2026-10-21
+
+**After you update, run `twelvetake-reaper-mcp --install-bridge`.** If REAPER is running the 1.7.8
+bridge or later, you don't have to do anything in REAPER. If you installed with ReaPack,
+synchronize your packages instead.
+
+### Changed
+- **The bridge no longer writes to REAPER's console when it starts.** It wrote its version and
+  folder there every time it started. REAPER opens the console window when a script writes to it,
+  so the window could come up whenever the bridge started, including at launch when REAPER starts
+  the bridge for you. To see the message, launch REAPER with `REAPER_MCP_DEBUG=1` set. The console
+  still opens when there is something you need to act on: a second copy that did not start, a
+  request the bridge could not process, or a reload that failed.
+  *(Reported with the fix by Kaan Özkan ([@ozzaii](https://github.com/ozzaii)) in
+  [issue #22](https://github.com/TwelveTake-Studios/reaper-mcp/issues/22).)*
+- **`test_connection.py` told you to look for the start message.** When the bridge does not answer,
+  it now tells you how to run the bridge from the action list.
+
 ## [1.9.2] - 2026-10-20
 
 This release updates the server only. The bridge script remains at version 1.9.1 and does not

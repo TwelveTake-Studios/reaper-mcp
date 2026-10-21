@@ -14,6 +14,8 @@ ext_state = {}
 at_exit = {}
 console = {}
 clock = 1000
+env = {}
+os.getenv = function(name) return env[name] end
 reaper = {
     GetResourcePath = function() return RESOURCE end,
     RecursiveCreateDirectory = function() return 1 end,
@@ -81,8 +83,32 @@ def harness(tmp_path):
         end = source.index("\n", start)
         script.write_text(source[:start] + f'local BRIDGE_VERSION = "{text}"' + source[end:], encoding="utf-8")
 
-    h.load, h.send, h.console, h.with_version = load, send, console, with_version
+    def debug():
+        lua.globals().env["REAPER_MCP_DEBUG"] = "1"
+
+    h.load, h.send, h.console, h.with_version, h.debug = load, send, console, with_version, debug
     return h
+
+
+def test_a_bridge_starts_without_writing_to_the_console(harness):
+    harness.load()
+    assert harness.send("GetBridgeVersion")["ok"] is True
+    assert harness.console() == []
+
+
+def test_the_start_message_prints_with_reaper_mcp_debug(harness):
+    harness.debug()
+    harness.load()
+    version = harness.send("GetBridgeVersion")["version"]
+    assert f"REAPER MCP Bridge {version} (File-based, Full API) started\n" in harness.console()
+    assert any(line.startswith("Bridge directory: ") for line in harness.console())
+
+
+def test_a_request_that_fails_inside_the_bridge_still_reaches_the_console(harness):
+    harness.load()
+    answer = harness.send("CountTracks", [0])
+    assert answer["ok"] is False and answer["error"].startswith("Bridge error: ")
+    assert any(line.startswith("ERROR processing request 1: ") for line in harness.console())
 
 
 def test_a_bridge_loaded_from_a_file_can_reload(harness):
@@ -98,6 +124,15 @@ def test_reload_switches_to_the_file_on_disk(harness):
     answer = harness.send("ReloadBridge")
     assert answer["ok"] is True and answer["reloading"] is True
     assert answer["path"].replace("\\", "/").endswith("Scripts/reaper_mcp_bridge.lua")
+    assert harness.send("GetBridgeVersion")["version"] == "9.9.9"
+    assert harness.console() == []
+
+
+def test_a_reload_announces_the_new_version_with_reaper_mcp_debug(harness):
+    harness.debug()
+    harness.load()
+    harness.with_version("9.9.9")
+    assert harness.send("ReloadBridge")["ok"] is True
     assert harness.send("GetBridgeVersion")["version"] == "9.9.9"
     assert any("9.9.9 (File-based, Full API) started" in line for line in harness.console())
     assert not any("not started" in line for line in harness.console())

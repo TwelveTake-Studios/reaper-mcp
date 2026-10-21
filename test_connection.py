@@ -73,7 +73,7 @@ def main() -> int:
         print("\n   Make sure:")
         print("   1. REAPER is running")
         print("   2. reaper_mcp_bridge.lua is loaded and running in REAPER")
-        print('      (you should see "REAPER MCP Bridge (File-based, Full API) started" in the console)')
+        print("      (Actions > Show action list, type mcp bridge in the filter box, select it and click Run)")
         return 1
     print(f"   [PASS] Project has {result.get('ret')} tracks")
 

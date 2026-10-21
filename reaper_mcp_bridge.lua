@@ -4,7 +4,7 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.9.1"
+local BRIDGE_VERSION = "1.9.3"
 local BRIDGE_SOURCE = debug and debug.getinfo and debug.getinfo(1, "S").source or ""
 local BRIDGE_PATH = BRIDGE_SOURCE:sub(1, 1) == "@" and BRIDGE_SOURCE:sub(2) or ""
 local INSTANCE_SECTION = "TwelveTake_REAPER_MCP"
@@ -22,10 +22,6 @@ local function ensure_dir()
     reaper.RecursiveCreateDirectory(bridge_dir, 0)
 end
 
--- Per-call console logging is OFF by default. reaper.ShowConsoleMsg raises the console
--- window, so with it on every single tool call steals focus away from the arrange view.
--- Startup banners and errors still always print. Flip DEBUG to true here, or launch
--- REAPER with REAPER_MCP_DEBUG=1, when diagnosing the bridge.
 local DEBUG = (os.getenv and os.getenv("REAPER_MCP_DEBUG") == "1") or false
 local function log(msg)
     if DEBUG then reaper.ShowConsoleMsg(msg) end
@@ -8171,12 +8167,8 @@ heartbeat()
 reaper.atexit(function() reaper.DeleteExtState(INSTANCE_SECTION, "heartbeat", false) end)
 
 ensure_dir()
--- The version goes in the banner because REAPER runs the DEPLOYED copy of this script
--- and no package upgrade updates it. Without it there is no way to see which bridge is
--- actually running short of opening the file, which is exactly how the server's own
--- version came to be two releases stale without anyone noticing (#15).
-reaper.ShowConsoleMsg("REAPER MCP Bridge " .. BRIDGE_VERSION .. " (File-based, Full API) started\n")
-reaper.ShowConsoleMsg("Bridge directory: " .. bridge_dir .. "\n")
+log("REAPER MCP Bridge " .. BRIDGE_VERSION .. " (File-based, Full API) started\n")
+log("Bridge directory: " .. bridge_dir .. "\n")
 
 function main()
     process_request()
