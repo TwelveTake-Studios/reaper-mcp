@@ -36,7 +36,7 @@ def mid_claim_guard(bridge_src):
     request that was perfectly valid a microsecond later.
     """
     m = re.search(
-        r'^\s*(if request_data and request_data:match\(.*?\) then request_data = nil end)\s*$',
+        r'^\s*(if request_data and request_data:match\(.*?\) then request_data = nil; waiting = true end)\s*$',
         bridge_src,
         re.M,
     )

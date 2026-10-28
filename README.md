@@ -12,7 +12,7 @@ Listed in the [MCP Registry](https://registry.modelcontextprotocol.io/) as `mcp-
 
 TwelveTake REAPER MCP is a Model Context Protocol server that enables AI assistants to control REAPER for mixing, mastering, MIDI composition and music production.
 
-**Version:** 1.9.3
+**Version:** 1.9.4
 
 ## Why This Server
 

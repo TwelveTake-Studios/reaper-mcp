@@ -11,7 +11,7 @@ Author: TwelveTake Studios LLC
 License: MIT
 """
 
-__version__ = "1.9.3"
+__version__ = "1.9.4"
 
 import os
 import asyncio
@@ -123,7 +123,11 @@ BRIDGE_DIR_PROBLEM = bridge_dir_problem(BRIDGE_DIR)
 # The bridge script version this server needs. REAPER runs whatever copy is deployed in
 # its Scripts folder, deployed by hand, so the halves drift. Anything older cannot answer
 # GetBridgeVersion and is reported as out of date instead of failing in obscure ways.
-MIN_BRIDGE_VERSION = "1.9.1"
+def min_bridge_version(platform: str = sys.platform) -> str:
+    return "1.9.1" if platform == "win32" else "1.9.4"
+
+
+MIN_BRIDGE_VERSION = min_bridge_version()
 
 # How long to wait for the bridge to answer. Configurable because the bridge answers
 # only after the work finishes and renders run at roughly realtime, so 5s reports a
@@ -505,11 +509,25 @@ _bridge_check = {"done": False, "error": None, "claims_ok": False}
 SLOT_CLAIM_BRIDGE_VERSION = "1.6.6"
 
 _STALE_BRIDGE_HINT = (
-    "REAPER is running a bridge script older than this server needs. REAPER loads the "
-    "copy in its own Scripts folder, so upgrading the Python package does not update it. "
-    "Deploy the bundled script with `twelvetake-reaper-mcp --install-bridge`, then re-run "
-    "reaper_mcp_bridge.lua in REAPER (Actions > Show action list)."
+    "REAPER is running a bridge script older than this server needs. Updating the Python "
+    "package does not update the bridge script REAPER runs. Run "
+    f"`uvx twelvetake-reaper-mcp@{__version__} --install-bridge`, or "
+    "`twelvetake-reaper-mcp --install-bridge` for a pip install. Follow what the command "
+    "prints, then retry the tool call."
 )
+
+_STALE_REAPACK_HINT = (
+    "REAPER is running a bridge script from ReaPack that is older than this server needs. "
+    "In REAPER, synchronize your packages (Extensions > ReaPack > Synchronize packages), "
+    "then retry the tool call."
+)
+
+
+def stale_bridge_hint(running_path: Optional[str]) -> str:
+    path = Path(running_path) if running_path else None
+    if path and path.name == BRIDGE_SCRIPT_NAME and path.parent.parent.parent.name.lower() == "scripts":
+        return _STALE_REAPACK_HINT
+    return _STALE_BRIDGE_HINT
 
 
 async def ensure_bridge_current() -> Optional[dict]:
@@ -542,7 +560,7 @@ async def ensure_bridge_current() -> Optional[dict]:
             _bridge_check["error"] = {
                 "ok": False,
                 "error": f"Bridge script is out of date (deployed {deployed}, need {MIN_BRIDGE_VERSION})",
-                "hint": _STALE_BRIDGE_HINT,
+                "hint": stale_bridge_hint(result.get("path")),
             }
             return _bridge_check["error"]
         _bridge_check["error"] = None

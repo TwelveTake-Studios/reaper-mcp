@@ -108,3 +108,8 @@ the same time-based `InsertMIDINote` and `CreateMIDIItem` routing that shipped i
   the bridge's start message opened REAPER's console on every launch once REAPER started the
   bridge by itself, which musicians read as an error, and gave the fix: the two lines to change
   and the existing `REAPER_MCP_DEBUG` switch to put them behind. Shipped in **v1.9.3**.
+
+- **[Issue #23](https://github.com/TwelveTake-Studios/reaper-mcp/issues/23)** - reported that a
+  tool call could hang until it timed out because the bridge deleted a request file before the
+  server had written the request into it, showed it happening in the macOS file-system log, and
+  gave the fix: leave a request file the bridge reads empty for a later pass. Shipped in **v1.9.4**.

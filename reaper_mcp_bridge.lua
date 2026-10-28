@@ -4,7 +4,7 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.9.3"
+local BRIDGE_VERSION = "1.9.4"
 local BRIDGE_SOURCE = debug and debug.getinfo and debug.getinfo(1, "S").source or ""
 local BRIDGE_PATH = BRIDGE_SOURCE:sub(1, 1) == "@" and BRIDGE_SOURCE:sub(2) or ""
 local INSTANCE_SECTION = "TwelveTake_REAPER_MCP"
@@ -8070,6 +8070,7 @@ local function process_request()
             -- handler below lives outside the pcall closure and needs it too.
             local request_id = nil
             local undo_label = nil
+            local waiting = false
             -- Wrap in pcall to catch any errors
             local ok, err = pcall(function()
                 -- Read and process request
@@ -8082,7 +8083,7 @@ local function process_request()
                 -- are about to produce and delete it. So the empty window is real and
                 -- must be waited out. Answering it would hand the caller a false
                 -- "Malformed request JSON" for a request it was still writing.
-                if request_data and request_data:match("^%s*$") then request_data = nil end
+                if request_data and request_data:match("^%s*$") then request_data = nil; waiting = true end
                 if request_data then
                     log("Processing request " .. i .. ": " .. request_data .. "\n")
                     
@@ -8148,8 +8149,7 @@ local function process_request()
                 write_file(numbered_response_file, encode_json(error_response))
             end
             
-            -- Always clean up request file
-            delete_file(numbered_request_file)
+            if not waiting then delete_file(numbered_request_file) end
         end
     end
 end

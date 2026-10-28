@@ -343,3 +343,47 @@ def test_startup_banner_names_the_bridge_version():
         "the startup banner no longer names BRIDGE_VERSION, so a user cannot tell which "
         "bridge REAPER is running without opening the deployed file"
     )
+
+
+def test_windows_keeps_accepting_the_1_9_1_bridge():
+    assert srv.min_bridge_version("win32") == "1.9.1"
+
+
+@pytest.mark.parametrize("platform", ["darwin", "linux", "cygwin", "msys"])
+def test_other_platforms_require_the_bridge_that_keeps_an_empty_request(platform):
+    assert srv.min_bridge_version(platform) == "1.9.4"
+
+
+def test_the_stale_bridge_hint_names_this_server_version():
+    assert f"uvx twelvetake-reaper-mcp@{srv.__version__} --install-bridge" in srv._STALE_BRIDGE_HINT
+    assert "re-run" not in srv._STALE_BRIDGE_HINT
+
+
+@pytest.mark.parametrize("path", [
+    r"C:\Users\u\AppData\Roaming\REAPER/Scripts/TwelveTake REAPER MCP/TwelveTake/reaper_mcp_bridge.lua",
+    "/Users/u/Library/Application Support/REAPER/Scripts/TwelveTake REAPER MCP/TwelveTake/reaper_mcp_bridge.lua",
+    "/home/u/.config/REAPER/Scripts/TwelveTake REAPER MCP/TwelveTake/reaper_mcp_bridge.lua",
+])
+def test_a_bridge_running_from_reapack_is_told_to_sync(path):
+    hint = srv.stale_bridge_hint(path)
+    assert "Synchronize packages" in hint
+    assert "--install-bridge" not in hint
+
+
+@pytest.mark.parametrize("path", [
+    r"C:\Users\u\AppData\Roaming\REAPER/Scripts/reaper_mcp_bridge.lua",
+    "/home/u/.config/REAPER/Scripts/reaper_mcp_bridge.lua",
+    "/home/u/Downloads/reaper_mcp_bridge.lua",
+    None,
+    "",
+])
+def test_any_other_bridge_is_given_the_install_command(path):
+    assert srv.stale_bridge_hint(path) == srv._STALE_BRIDGE_HINT
+
+
+def test_the_refusal_picks_the_hint_from_the_running_bridge_path(monkeypatch):
+    reapack = "/home/u/.config/REAPER/Scripts/TwelveTake REAPER MCP/TwelveTake/reaper_mcp_bridge.lua"
+    monkeypatch.setattr(srv, "dispatch", _fake_dispatch({"ok": True, "version": "1.0.0", "path": reapack}))
+    verdict = run(srv.ensure_bridge_current())
+    assert verdict["ok"] is False
+    assert verdict["hint"] == srv._STALE_REAPACK_HINT

@@ -5,6 +5,26 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.4] - 2026-10-28
+
+**After you update, run `twelvetake-reaper-mcp --install-bridge`.** If REAPER is running the 1.7.8
+bridge or later, you don't have to do anything in REAPER. If you installed with ReaPack,
+synchronize your packages instead.
+
+### Fixed
+- **On macOS and Linux, a tool call could occasionally time out even though REAPER was idle.** The
+  server creates each request file first and writes the request into it a moment later. If the
+  bridge read the file in between, it found it empty and deleted it. The request never reached
+  REAPER, so the call waited until it timed out. The bridge now leaves an empty request file in
+  place and answers the request once the server has written it. Windows was not affected. On
+  macOS and Linux, the server now requires bridge 1.9.4 or later.
+  *(Reported with the fix by Kaan Özkan ([@ozzaii](https://github.com/ozzaii)) in
+  [issue #23](https://github.com/TwelveTake-Studios/reaper-mcp/issues/23).)*
+- **The error for an out-of-date bridge told you to re-run the bridge in REAPER, even when that
+  wasn't needed.** A running bridge at version 1.7.8 or later reloads itself when
+  `--install-bridge` replaces it. The error now gives the command to run, or tells you to
+  synchronize your packages when REAPER runs the bridge from ReaPack.
+
 ## [1.9.3] - 2026-10-21
 
 **After you update, run `twelvetake-reaper-mcp --install-bridge`.** If REAPER is running the 1.7.8

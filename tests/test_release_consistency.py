@@ -21,6 +21,8 @@ import json
 import re
 from pathlib import Path
 
+import pytest
+
 import reaper_mcp_server as srv
 
 REPO = Path(__file__).resolve().parent.parent
@@ -114,6 +116,11 @@ def test_min_bridge_version_is_reachable():
         f"{bridge_version()}: ensure_bridge_current would refuse all 176 tools and cache "
         "the refusal for the process lifetime, turning an upgrade into a total outage."
     )
+
+
+@pytest.mark.parametrize("platform", ["win32", "darwin", "linux", "cygwin"])
+def test_min_bridge_version_is_reachable_on_every_platform(platform):
+    assert srv.version_tuple(srv.min_bridge_version(platform)) <= srv.version_tuple(bridge_version())
 
 
 def test_slot_claim_version_is_reachable():
