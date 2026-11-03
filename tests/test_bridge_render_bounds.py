@@ -145,6 +145,22 @@ def test_both_bounds_render_exactly_that_range(bridge, tmp_path):
     assert renders(bridge) == [{"bounds": 0, "start": 5, "finish": 9}]
 
 
+def test_the_projects_render_delay_is_read_through_the_bridge_and_waited(bridge, tmp_path, monkeypatch):
+    waits = []
+
+    async def sleep(seconds):
+        waits.append((seconds, len(renders(bridge))))
+
+    monkeypatch.setattr(srv.asyncio, "sleep", sleep)
+    bridge.numeric_settings.RENDER_SETTINGS = 16 << 16
+    bridge.numeric_settings.RENDER_DELAY = 2.5
+    out = run(srv.render_project(output(tmp_path), start_time=5.0, end_time=9.0))
+    assert out["ok"] is True, out
+    assert out["delay_seconds"] == 2.5
+    assert waits == [(2.5, 0)]
+    assert len(renders(bridge)) == 1
+
+
 def test_no_bounds_still_render_the_entire_project(bridge, tmp_path):
     out = run(srv.render_project(output(tmp_path)))
     assert out["ok"] is True, out

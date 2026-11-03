@@ -23,7 +23,8 @@ def run(coro):
 
 def test_render_project_asks_for_the_render_deadline(reaper):
     run(srv.render_project("/tmp/out.wav", start_time=0.0, end_time=1.0))
-    assert reaper.last_timeout == srv.RENDER_TIMEOUT, (
+    deadlines = [t for (func, _), t in zip(reaper.calls, reaper.timeouts) if func == "RenderProject"]
+    assert deadlines == [srv.RENDER_TIMEOUT], (
         "render_project must carry its own deadline; without it a realtime render "
         "reports a timeout for work REAPER is completing normally (#11)"
     )
@@ -118,7 +119,7 @@ def unanswered_bridge_dir(monkeypatch, tmp_path):
 
 
 @pytest.mark.parametrize("call", [
-    lambda: srv.render_project("/tmp/out.wav", start_time=0.0, end_time=1.0),
+    lambda: srv.render_project("/tmp/out.wav", start_time=0.0, end_time=1.0, delay_seconds=0),
     lambda: srv.measure_loudness(),
     lambda: srv.measure_spectrum(),
 ], ids=["render_project", "measure_loudness", "measure_spectrum"])

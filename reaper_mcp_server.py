@@ -11,7 +11,7 @@ Author: TwelveTake Studios LLC
 License: MIT
 """
 
-__version__ = "1.9.4"
+__version__ = "1.9.5"
 
 import os
 import asyncio
@@ -153,6 +153,8 @@ try:
         raise ValueError
 except ValueError:
     RENDER_TIMEOUT = 600.0
+
+RENDER_DELAY_START = 16 << 16
 
 # Create MCP server
 mcp = FastMCP(
@@ -523,11 +525,32 @@ _STALE_REAPACK_HINT = (
 )
 
 
-def stale_bridge_hint(running_path: Optional[str]) -> str:
+def runs_from_reapack(running_path: Optional[str]) -> bool:
     path = Path(running_path) if running_path else None
-    if path and path.name == BRIDGE_SCRIPT_NAME and path.parent.parent.parent.name.lower() == "scripts":
-        return _STALE_REAPACK_HINT
-    return _STALE_BRIDGE_HINT
+    return bool(path and path.name == BRIDGE_SCRIPT_NAME and path.parent.parent.parent.name.lower() == "scripts")
+
+
+def stale_bridge_hint(running_path: Optional[str]) -> str:
+    return _STALE_REAPACK_HINT if runs_from_reapack(running_path) else _STALE_BRIDGE_HINT
+
+
+MEASURING_BRIDGE_VERSION = "1.9.5"
+
+
+def unmeasured_render_note(deployed: str, running_path: Optional[str]) -> str:
+    if runs_from_reapack(running_path):
+        return (
+            f"REAPER is running bridge script {deployed} from ReaPack, which renders but does not "
+            f"measure the file. Bridge {MEASURING_BRIDGE_VERSION} reports the file's peak level and "
+            "when its sound starts. In REAPER, synchronize your packages (Extensions > ReaPack > "
+            "Synchronize packages), then render again."
+        )
+    return (
+        f"REAPER is running bridge script {deployed}, which renders but does not measure the file. "
+        f"Bridge {MEASURING_BRIDGE_VERSION} reports the file's peak level and when its sound starts. "
+        f"Run `uvx twelvetake-reaper-mcp@{__version__} --install-bridge`, or "
+        "`twelvetake-reaper-mcp --install-bridge` for a pip install, then render again."
+    )
 
 
 async def ensure_bridge_current() -> Optional[dict]:
@@ -2813,6 +2836,8 @@ async def render_project(
     tail_seconds: float = 0,
     overwrite: bool = False,
     skip_postprocessing: bool = False,
+    delay_seconds: float = None,
+    sound_threshold_db: float = -60,
 ) -> dict:
     """
     Render the project's master mix to an audio file. Apart from the path, source and
@@ -2821,9 +2846,11 @@ async def render_project(
     `processing` (empty when none applies).
 
     If the target file already exists, this returns an error unless overwrite=True
-    (which deletes the existing file first). This is explicit because REAPER's own
-    behavior on existing files (prompt vs auto-increment) is a user preference, and the
-    overwrite prompt blocks unattended rendering.
+    (which deletes the existing file first), as REAPER's overwrite prompt would block.
+
+    A plugin still loading samples can render silence, or sound that starts later than the
+    music (`sound_starts_s`); delay_seconds waits before the render, like REAPER's "Delay
+    render start" but without its prompt.
 
     Args:
         output_path: Full path for output file (extension determines format).
@@ -2833,10 +2860,19 @@ async def render_project(
         overwrite: True to replace an existing file at output_path.
         skip_postprocessing: True to render without the project's normalization, limiter,
             fades, trim and pad, for a file you will measure or compare.
+        delay_seconds: Seconds to wait before rendering (None = the project's setting,
+            0 = no wait).
+        sound_threshold_db: Level (dBFS) the file must exceed to count as sound.
 
     Returns:
-        Object with render status, REAPER's computed output target(s) and `processing`.
+        Object with render status, REAPER's computed output target(s), `processing`,
+        `delay_seconds` waited, the file's `peak_dbfs`, `silent` (no signal at all), and
+        `sound_starts_s` (seconds into the file, None if never); a `note` says what to try.
     """
+    if delay_seconds is not None and not (math.isfinite(delay_seconds) and delay_seconds >= 0):
+        return {"ok": False, "error": f"delay_seconds must be 0 or more, got {delay_seconds!r}"}
+    if not math.isfinite(sound_threshold_db):
+        return {"ok": False, "error": f"sound_threshold_db must be a number of dBFS, got {sound_threshold_db!r}"}
     if start_time is None and end_time is not None:
         start_time = 0.0
     elif start_time is not None and end_time is None:
@@ -2849,13 +2885,25 @@ async def render_project(
                                           f"project ({end_time:g} s)"}
     if start_time is not None and end_time <= start_time:
         return {"ok": False, "error": f"end_time {end_time:g} must be later than start_time {start_time:g}"}
+    if delay_seconds is None:
+        settings = await reaper_call("GetSetProjectInfo", 0, "RENDER_SETTINGS", 0, False)
+        if not settings.get("ok"):
+            return settings
+        delay_seconds = 0.0
+        if int(settings.get("ret") or 0) & RENDER_DELAY_START:
+            delay = await reaper_call("GetSetProjectInfo", 0, "RENDER_DELAY", 0, False)
+            if not delay.get("ok"):
+                return delay
+            delay_seconds = max(float(delay.get("ret") or 0), 0.0)
+    if delay_seconds > 0:
+        await asyncio.sleep(delay_seconds)
     # None -> -1 sentinels: JSON nulls become Lua nils, which corrupt the bridge's
     # positional argument handling.
     # RenderProject blocks the bridge's defer loop for the whole render, and renders run
     # at roughly realtime, so the 5s transport default reports a timeout for work REAPER
     # is completing normally (#11). Give this call its own deadline instead of making the
     # user raise the global one and slow down every dead-bridge diagnosis with it.
-    return await reaper_call(
+    result = await reaper_call(
         "RenderProject",
         output_path,
         -1 if start_time is None else start_time,
@@ -2863,8 +2911,37 @@ async def render_project(
         tail_seconds or 0,
         bool(overwrite),
         bool(skip_postprocessing),
+        sound_threshold_db,
         timeout=RENDER_TIMEOUT,
     )
+    if result.get("ok"):
+        result["delay_seconds"] = delay_seconds
+        if "silent" not in result:
+            bridge = await reaper_call("GetBridgeVersion")
+            deployed = str(bridge.get("version") or "")
+            if (bridge.get("ok") and deployed
+                    and version_tuple(deployed) < version_tuple(MEASURING_BRIDGE_VERSION)):
+                result["note"] = unmeasured_render_note(deployed, bridge.get("path"))
+            return result
+        if result.get("silent"):
+            heard = "The rendered file is silent"
+        elif "sound_starts_s" in result and result["sound_starts_s"] is None:
+            heard = f"Nothing in the rendered file rises above {sound_threshold_db:g} dBFS"
+        else:
+            heard = None
+        if heard and delay_seconds > 0:
+            result["note"] = (
+                f"{heard} even after waiting {delay_seconds:g} s. If the project uses plugins that load "
+                "samples, try a longer delay_seconds; otherwise check for muted tracks or a range with "
+                "nothing in it."
+            )
+        elif heard:
+            result["note"] = (
+                f"{heard}. If the project uses plugins that load samples or take time to start, render "
+                "again with delay_seconds to give them time to load; otherwise check for muted tracks or "
+                "a range with nothing in it."
+            )
+    return result
 
 
 def _measure_args(track_index, item_index, start_time, end_time):

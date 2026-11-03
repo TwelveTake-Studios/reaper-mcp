@@ -131,6 +131,13 @@ def test_slot_claim_version_is_reachable():
     )
 
 
+def test_measuring_bridge_version_is_reachable():
+    assert srv.version_tuple(srv.MEASURING_BRIDGE_VERSION) <= srv.version_tuple(bridge_version()), (
+        f"MEASURING_BRIDGE_VERSION {srv.MEASURING_BRIDGE_VERSION} exceeds the bundled bridge "
+        f"{bridge_version()}: every render would tell the user to update a bridge that is current."
+    )
+
+
 def test_a_bridge_change_tells_users_to_redeploy():
     """REAPER runs the DEPLOYED copy, and no pip upgrade updates it.
 

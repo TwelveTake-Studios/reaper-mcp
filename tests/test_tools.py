@@ -308,26 +308,256 @@ def test_undo_state_and_time_signature(reaper):
 
 
 def test_render_project_none_becomes_sentinels(reaper):
+    reaper.response = {"ok": True, "silent": False}
     run(srv.render_project("C:/tmp/out.wav"))
-    assert reaper.last == ("RenderProject", ["C:/tmp/out.wav", -1, -1, 0, False, False])
+    assert reaper.last == ("RenderProject", ["C:/tmp/out.wav", -1, -1, 0, False, False, -60])
     run(srv.render_project("C:/tmp/out.wav", 1.0, 3.0, 0.5, overwrite=True))
-    assert reaper.last == ("RenderProject", ["C:/tmp/out.wav", 1.0, 3.0, 0.5, True, False])
+    assert reaper.last == ("RenderProject", ["C:/tmp/out.wav", 1.0, 3.0, 0.5, True, False, -60])
     run(srv.render_project("C:/tmp/out.wav", skip_postprocessing=True))
-    assert reaper.last == ("RenderProject", ["C:/tmp/out.wav", -1, -1, 0, False, True])
+    assert reaper.last == ("RenderProject", ["C:/tmp/out.wav", -1, -1, 0, False, True, -60])
 
 
 def test_render_project_with_only_an_end_starts_at_zero(reaper):
-    run(srv.render_project("C:/tmp/out.wav", end_time=8.0, tail_seconds=1.5))
-    assert reaper.calls == [("RenderProject", ["C:/tmp/out.wav", 0.0, 8.0, 1.5, False, False])]
+    reaper.response = {"ok": True, "silent": False}
+    run(srv.render_project("C:/tmp/out.wav", end_time=8.0, tail_seconds=1.5, delay_seconds=0))
+    assert reaper.calls == [("RenderProject", ["C:/tmp/out.wav", 0.0, 8.0, 1.5, False, False, -60])]
 
 
 def test_render_project_with_only_a_start_ends_at_the_project_length(reaper):
-    reaper.response = {"ok": True, "ret": 42.0}
-    run(srv.render_project("C:/tmp/out.wav", start_time=3.0, tail_seconds=1.5))
+    reaper.response = {"ok": True, "ret": 42.0, "silent": False}
+    run(srv.render_project("C:/tmp/out.wav", start_time=3.0, tail_seconds=1.5, delay_seconds=0))
     assert reaper.calls == [
         ("GetProjectLength", [0]),
-        ("RenderProject", ["C:/tmp/out.wav", 3.0, 42.0, 1.5, False, False]),
+        ("RenderProject", ["C:/tmp/out.wav", 3.0, 42.0, 1.5, False, False, -60]),
     ]
+
+
+class RenderBridge:
+    def __init__(self, settings=0, delay=0.0, render=None, bridge=None):
+        self.events = []
+        self.project = {"RENDER_SETTINGS": settings, "RENDER_DELAY": delay}
+        self.render = render or {"ok": True, "ret": True, "silent": False, "peak_dbfs": -12.0}
+        self.bridge = bridge or {"ok": True, "version": "1.9.5",
+                                 "path": r"C:\Users\u\AppData\Roaming\REAPER/Scripts/reaper_mcp_bridge.lua"}
+
+    async def call(self, func, *args, timeout=None):
+        self.events.append((func, list(args)))
+        if func == "GetSetProjectInfo":
+            return {"ok": True, "ret": self.project[args[1]]}
+        if func == "GetBridgeVersion":
+            return dict(self.bridge)
+        return dict(self.render)
+
+    async def sleep(self, seconds):
+        self.events.append(("sleep", seconds))
+
+
+@pytest.fixture
+def render_bridge(monkeypatch):
+    def _make(**kwargs):
+        bridge = RenderBridge(**kwargs)
+        monkeypatch.setattr(srv, "reaper_call", bridge.call)
+        monkeypatch.setattr(srv.asyncio, "sleep", bridge.sleep)
+        return bridge
+    return _make
+
+
+def rendered(bridge):
+    return [e for e in bridge.events if e[0] != "GetSetProjectInfo"]
+
+
+def test_render_waits_for_the_projects_render_delay_before_rendering(render_bridge):
+    bridge = render_bridge(settings=srv.RENDER_DELAY_START | 2048, delay=2.5)
+    out = run(srv.render_project("C:/tmp/out.wav"))
+    assert rendered(bridge) == [("sleep", 2.5),
+                                ("RenderProject", ["C:/tmp/out.wav", -1, -1, 0, False, False, -60])]
+    assert out["delay_seconds"] == 2.5
+
+
+def test_render_ignores_a_delay_value_the_project_has_switched_off(render_bridge):
+    bridge = render_bridge(settings=2048, delay=7.0)
+    out = run(srv.render_project("C:/tmp/out.wav"))
+    assert rendered(bridge) == [("RenderProject", ["C:/tmp/out.wav", -1, -1, 0, False, False, -60])]
+    assert out["delay_seconds"] == 0
+
+
+@pytest.mark.parametrize("project_delay", [0.0, -30.0])
+def test_render_with_the_delay_switched_on_at_zero_or_less_does_not_wait(render_bridge, project_delay):
+    bridge = render_bridge(settings=srv.RENDER_DELAY_START, delay=project_delay)
+    out = run(srv.render_project("C:/tmp/out.wav"))
+    assert [e[0] for e in rendered(bridge)] == ["RenderProject"]
+    assert out["delay_seconds"] == 0
+
+
+def test_render_reads_the_delay_only_when_the_project_switches_it_on(render_bridge):
+    bridge = render_bridge(settings=srv.RENDER_DELAY_START, delay=1.0)
+    run(srv.render_project("C:/tmp/out.wav"))
+    reads = [e for e in bridge.events if e[0] == "GetSetProjectInfo"]
+    assert reads == [("GetSetProjectInfo", [0, "RENDER_SETTINGS", 0, False]),
+                     ("GetSetProjectInfo", [0, "RENDER_DELAY", 0, False])]
+
+    bridge = render_bridge(settings=2048, delay=1.0)
+    run(srv.render_project("C:/tmp/out.wav"))
+    reads = [e for e in bridge.events if e[0] == "GetSetProjectInfo"]
+    assert reads == [("GetSetProjectInfo", [0, "RENDER_SETTINGS", 0, False])]
+
+
+@pytest.mark.parametrize("asked, project_delay", [(3.0, 0.0), (0, 9.0), (0.5, 9.0)])
+def test_an_explicit_delay_replaces_the_projects_and_skips_reading_it(render_bridge, asked, project_delay):
+    bridge = render_bridge(settings=srv.RENDER_DELAY_START, delay=project_delay)
+    out = run(srv.render_project("C:/tmp/out.wav", delay_seconds=asked))
+    waits = [e[1] for e in bridge.events if e[0] == "sleep"]
+    assert waits == ([asked] if asked else [])
+    assert not [e for e in bridge.events if e[0] == "GetSetProjectInfo"]
+    assert out["delay_seconds"] == asked
+
+
+@pytest.mark.parametrize("bad", [-1, -0.001, float("nan"), float("inf")])
+def test_render_refuses_a_delay_that_is_not_a_wait(render_bridge, bad):
+    bridge = render_bridge()
+    out = run(srv.render_project("C:/tmp/out.wav", delay_seconds=bad))
+    assert out["ok"] is False
+    assert "delay_seconds" in out["error"]
+    assert bridge.events == []
+
+
+@pytest.mark.parametrize("failing", ["RENDER_SETTINGS", "RENDER_DELAY"])
+def test_render_does_not_render_when_the_delay_setting_cannot_be_read(render_bridge, monkeypatch, failing):
+    bridge = render_bridge(settings=srv.RENDER_DELAY_START, delay=2.0)
+    failure = {"ok": False, "error": "GetSetProjectInfo timed out after 5s", "hint": "the bridge's own hint"}
+    answer = bridge.call
+
+    async def call(func, *args, timeout=None):
+        if func == "GetSetProjectInfo" and args[1] == failing:
+            bridge.events.append((func, list(args)))
+            return dict(failure)
+        return await answer(func, *args, timeout=timeout)
+
+    monkeypatch.setattr(srv, "reaper_call", call)
+    out = run(srv.render_project("C:/tmp/out.wav"))
+    assert out == failure
+    assert rendered(bridge) == []
+
+
+def test_a_silent_render_says_to_try_delay_seconds(render_bridge):
+    render_bridge(render={"ok": True, "ret": True, "silent": True})
+    out = run(srv.render_project("C:/tmp/out.wav"))
+    assert out["silent"] is True
+    assert "delay_seconds" in out["note"]
+    assert "even after" not in out["note"]
+
+
+def test_a_render_still_silent_after_a_wait_says_how_long_it_waited(render_bridge):
+    render_bridge(render={"ok": True, "ret": True, "silent": True})
+    out = run(srv.render_project("C:/tmp/out.wav", delay_seconds=4))
+    assert "even after waiting 4 s" in out["note"]
+    assert "longer delay_seconds" in out["note"]
+
+
+def test_a_render_with_sound_carries_no_note(render_bridge):
+    render_bridge()
+    out = run(srv.render_project("C:/tmp/out.wav"))
+    assert out["peak_dbfs"] == -12.0
+    assert "note" not in out
+
+
+def test_a_render_with_sound_from_the_first_sample_carries_no_note(render_bridge):
+    render_bridge(render={"ok": True, "silent": False, "peak_dbfs": -12.0, "sound_starts_s": 0})
+    out = run(srv.render_project("C:/tmp/out.wav"))
+    assert out["sound_starts_s"] == 0
+    assert "note" not in out
+
+
+def test_the_sound_threshold_is_passed_to_the_bridge(render_bridge):
+    bridge = render_bridge()
+    run(srv.render_project("C:/tmp/out.wav", delay_seconds=0, sound_threshold_db=-45.5))
+    assert rendered(bridge) == [("RenderProject", ["C:/tmp/out.wav", -1, -1, 0, False, False, -45.5])]
+
+
+@pytest.mark.parametrize("bad", [float("nan"), float("inf"), float("-inf")])
+def test_render_refuses_a_threshold_that_is_not_a_level(render_bridge, bad):
+    bridge = render_bridge()
+    out = run(srv.render_project("C:/tmp/out.wav", sound_threshold_db=bad))
+    assert out["ok"] is False
+    assert "sound_threshold_db" in out["error"]
+    assert bridge.events == []
+
+
+@pytest.mark.parametrize("delay", [0, 3])
+def test_a_render_that_starts_later_reports_when_but_carries_no_note(render_bridge, delay):
+    render_bridge(render={"ok": True, "silent": False, "peak_dbfs": -12.0, "sound_starts_s": 2.5})
+    out = run(srv.render_project("C:/tmp/out.wav", delay_seconds=delay))
+    assert out["sound_starts_s"] == 2.5
+    assert "note" not in out
+
+
+def test_a_render_that_never_rises_above_the_threshold_says_so(render_bridge):
+    render_bridge(render={"ok": True, "silent": False, "peak_dbfs": -80.0, "sound_starts_s": None})
+    out = run(srv.render_project("C:/tmp/out.wav", sound_threshold_db=-50))
+    assert out["sound_starts_s"] is None
+    assert out["note"].startswith("Nothing in the rendered file rises above -50 dBFS. ")
+    assert "render again with delay_seconds" in out["note"]
+
+
+def test_a_quiet_render_after_a_wait_says_how_long_it_waited(render_bridge):
+    render_bridge(render={"ok": True, "silent": False, "peak_dbfs": -80.0, "sound_starts_s": None})
+    out = run(srv.render_project("C:/tmp/out.wav", delay_seconds=3))
+    assert out["note"].startswith("Nothing in the rendered file rises above -60 dBFS even after waiting 3 s. ")
+    assert "longer delay_seconds" in out["note"]
+
+
+UNMEASURED = {"ok": True, "ret": True, "output": "C:/tmp/out.wav", "targets": "C:/tmp/out.wav", "processing": {}}
+
+
+def test_a_render_by_an_older_bridge_says_how_to_get_it_measured(render_bridge):
+    bridge = render_bridge(render=UNMEASURED, bridge={
+        "ok": True, "version": "1.9.4",
+        "path": r"C:\Users\u\AppData\Roaming\REAPER/Scripts/reaper_mcp_bridge.lua"})
+    out = run(srv.render_project("C:/tmp/out.wav", delay_seconds=0))
+    assert out["ok"] is True
+    assert out["note"] == (
+        "REAPER is running bridge script 1.9.4, which renders but does not measure the file. "
+        "Bridge 1.9.5 reports the file's peak level and when its sound starts. "
+        f"Run `uvx twelvetake-reaper-mcp@{srv.__version__} --install-bridge`, or "
+        "`twelvetake-reaper-mcp --install-bridge` for a pip install, then render again.")
+    assert [e[0] for e in bridge.events] == ["RenderProject", "GetBridgeVersion"]
+
+
+def test_an_older_bridge_from_reapack_is_told_to_synchronize(render_bridge):
+    render_bridge(render=UNMEASURED, bridge={
+        "ok": True, "version": "1.8.0",
+        "path": "/home/u/.config/REAPER/Scripts/TwelveTake REAPER MCP/TwelveTake/reaper_mcp_bridge.lua"})
+    out = run(srv.render_project("C:/tmp/out.wav", delay_seconds=0))
+    assert out["note"] == (
+        "REAPER is running bridge script 1.8.0 from ReaPack, which renders but does not measure the "
+        "file. Bridge 1.9.5 reports the file's peak level and when its sound starts. In REAPER, "
+        "synchronize your packages (Extensions > ReaPack > Synchronize packages), then render again.")
+
+
+@pytest.mark.parametrize("bridge", [
+    {"ok": True, "version": "1.9.5", "path": "C:/REAPER/Scripts/reaper_mcp_bridge.lua"},
+    {"ok": True, "version": "1.10.0", "path": "C:/REAPER/Scripts/reaper_mcp_bridge.lua"},
+    {"ok": False, "error": "GetBridgeVersion timed out after 5s"},
+    {"ok": True},
+])
+def test_an_unmeasured_render_from_a_current_or_unknown_bridge_carries_no_note(render_bridge, bridge):
+    render_bridge(render=UNMEASURED, bridge=bridge)
+    out = run(srv.render_project("C:/tmp/out.wav", delay_seconds=0))
+    assert out["ok"] is True
+    assert "note" not in out
+
+
+def test_a_measured_render_does_not_ask_the_bridge_its_version(render_bridge):
+    bridge = render_bridge(render={"ok": True, "silent": True}, bridge={"ok": True, "version": "1.9.4"})
+    out = run(srv.render_project("C:/tmp/out.wav", delay_seconds=0))
+    assert "GetBridgeVersion" not in [e[0] for e in bridge.events]
+    assert out["note"].startswith("The rendered file is silent.")
+
+
+def test_a_failed_render_is_returned_as_the_bridge_sent_it(render_bridge):
+    failure = {"ok": False, "error": "Render target already exists: C:/tmp/out.wav"}
+    render_bridge(render=failure)
+    assert run(srv.render_project("C:/tmp/out.wav")) == failure
 
 
 def test_render_project_reports_a_failed_length_lookup_and_does_not_render(reaper):

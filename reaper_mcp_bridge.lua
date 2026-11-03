@@ -4,7 +4,7 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.9.4"
+local BRIDGE_VERSION = "1.9.5"
 local BRIDGE_SOURCE = debug and debug.getinfo and debug.getinfo(1, "S").source or ""
 local BRIDGE_PATH = BRIDGE_SOURCE:sub(1, 1) == "@" and BRIDGE_SOURCE:sub(2) or ""
 local INSTANCE_SECTION = "TwelveTake_REAPER_MCP"
@@ -2253,10 +2253,66 @@ _G.__MIDI_TEST = {note_in_filter = note_in_filter, transpose_notes_pure = transp
                   remove_overlaps_pure = remove_overlaps_pure}
 -- ========================================================================
 
+local function first_sound_s(gain_to, length, threshold)
+    local step = 0.001
+    local lo, hi = 0, step
+    while hi < length do
+        local g = gain_to(threshold, lo, hi)
+        if not g then return nil end
+        if g < 1 then break end
+        lo, hi = hi, hi * 2
+    end
+    hi = math.min(hi, length)
+    while hi - lo > step do
+        local mid = (lo + hi) / 2
+        local g = gain_to(threshold, lo, mid)
+        if not g then return nil end
+        if g < 1 then hi = mid else lo = mid end
+    end
+    return math.floor(lo * 1000 + 0.5) / 1000
+end
+
+local function rendered_file_peak(p, threshold)
+    if not (reaper.PCM_Source_CreateFromFile and reaper.CalculateNormalization and reaper.PCM_Source_Destroy) then
+        return nil
+    end
+    local src = reaper.PCM_Source_CreateFromFile(p)
+    if not src then return nil end
+    local function usable(x) return type(x) == "number" and x == x and x > 0 and x < math.huge end
+    local function gain_to(target, s, e)
+        local ok, g = pcall(reaper.CalculateNormalization, src, 2, target, s, e)
+        if ok and usable(g) then return g end
+    end
+    local result
+    local gain = gain_to(0, 0, 0)
+    if gain and math.abs(gain - 1) < 0.01 then
+        local lower = gain_to(-6, 0, 0)
+        if not lower then
+            gain = nil
+        elseif lower > gain * 0.75 then
+            result = {silent = true}
+        end
+    end
+    if gain and not result then
+        local peak = -20 * math.log(gain, 10)
+        result = {silent = false, peak_dbfs = math.floor(peak * 100 + 0.5) / 100}
+        if threshold and peak <= threshold then
+            result.sound_starts_s = math.huge
+        elseif threshold and reaper.GetMediaSourceLength then
+            local length = reaper.GetMediaSourceLength(src)
+            if usable(length) then result.sound_starts_s = first_sound_s(gain_to, length, threshold) end
+        end
+    elseif result and threshold then
+        result.sound_starts_s = math.huge
+    end
+    reaper.PCM_Source_Destroy(src)
+    return result
+end
+
 -- Render the master mix via "render using last settings", leaving the project's
 -- render settings exactly as they were found. Extracted from the dispatcher so the
 -- lupa suite can pin its exit paths; the wire name and arguments are unchanged.
-local function RenderProject(path, start_t, end_t, tail, overwrite, skip_postprocessing)
+local function RenderProject(path, start_t, end_t, tail, overwrite, skip_postprocessing, sound_threshold)
     local dir = path:match("^(.*)[/\\]") or ""
     local file = path:match("[^/\\]+$") or path
     local base = file:gsub("%.[A-Za-z0-9]+$", "")
@@ -2450,7 +2506,14 @@ local function RenderProject(path, start_t, end_t, tail, overwrite, skip_postpro
             .. " Ask for a .wav path, or set the project's render format to match."}
     end
 
-    return {ok = true, ret = true, output = path, targets = targets, processing = processing}
+    local result = {ok = true, ret = true, output = path, targets = targets, processing = processing}
+    local peak = rendered_file_peak(path, sound_threshold)
+    if peak then
+        result.silent = peak.silent
+        result.peak_dbfs = peak.peak_dbfs
+        result.sound_starts_s = peak.sound_starts_s
+    end
+    return result
 end
 
 -- Audio measurement
@@ -6985,7 +7048,7 @@ local function dispatch_call(fname, args)
                             local result = RenderProject(args[1], tonumber(args[2]) or -1,
                                                          tonumber(args[3]) or -1,
                                                          tonumber(args[4]) or 0, args[5],
-                                                         args[6] == true)
+                                                         args[6] == true, tonumber(args[7]))
                             for k, v in pairs(result) do
                                 response[k] = v
                             end

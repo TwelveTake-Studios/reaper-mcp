@@ -57,7 +57,8 @@ def decoder_block(bridge_src):
 
 @pytest.fixture(scope="module")
 def render_block(bridge_src):
-    m = re.search(r"-- Render the master mix.*?\nend\n", bridge_src, re.S)
+    m = re.search(r"local function first_sound_s\(.*?\nend\n.*?-- Render the master mix.*?\nend\n",
+                  bridge_src, re.S)
     assert m, "could not locate RenderProject — did it move or get renamed?"
     return m.group(0)
 
@@ -240,8 +241,177 @@ def test_render_delay_value_survives_a_render_that_clears_it(render_call, lua_tm
     assert out["settings"] == out["initial"]
 
 
+def lua_value(x):
+    if x is None:
+        return "nil"
+    return "(0/0)" if x != x else repr(x)
+
+
+def peak_stub(peak_db, throws=False, starts=0.0, floor_db=None, length=10.0, fail_on=None, reported_length="same"):
+    reported = length if reported_length == "same" else reported_length
+    length_lua = ("reaper.GetMediaSourceLength = nil\n" if reported_length == "missing" else
+                  f"reaper.GetMediaSourceLength = function(_) return {lua_value(reported)}, false end\n")
+    return (
+        "measured = {}\ndestroyed = 0\npasses = 0\nscanned = 0\n"
+        "reaper.PCM_Source_CreateFromFile = function(p) measured[#measured + 1] = p return {path = p} end\n"
+        "reaper.PCM_Source_Destroy = function(_) destroyed = destroyed + 1 end\n"
+        f"{length_lua}"
+        "reaper.CalculateNormalization = function(src, mode, target, s, e)\n"
+        "    passes = passes + 1\n"
+        f"    if {'true' if throws else 'false'} or passes == {lua_value(fail_on)} then error('decoder failed') end\n"
+        f"    if s == 0 and e == 0 then e = {length!r} else scanned = scanned + (e - s) end\n"
+        f"    local level = e > {starts!r} and {lua_value(peak_db)} or {lua_value(floor_db)}\n"
+        "    if level == nil then return 1 end\n"
+        "    return 10 ^ ((target - level) / 20)\n"
+        "end\n"
+    )
+
+
+@pytest.fixture
+def measured_render(encoder_block, render_block, lua_tmp):
+    def _run(peak_db, throws=False, target_exists=False, threshold=None, **timeline):
+        target = (lua_tmp / "mix.wav").as_posix()
+        if target_exists:
+            (lua_tmp / "mix.wav").write_bytes(b"OLD")
+        lua = lupa.LuaRuntime(unpack_returned_tuples=True)
+        source = (
+            f"{stub_render_reaper(action_lua=make_file_action(target))}\n{encoder_block}\n{render_block}\n"
+            f"{peak_stub(peak_db, throws, **timeline)}\n"
+            f'local response = RenderProject("{target}", -1, -1, 0, nil, false, {lua_value(threshold)})\n'
+            "return encode_json({response = response, measured = as_array(measured),"
+            " destroyed = destroyed, passes = passes, scanned = scanned})"
+        )
+        return target, json.loads(lua.execute(source))
+    return _run
+
+
+def test_render_reports_the_rendered_files_peak(measured_render):
+    target, out = measured_render(-12.0)
+    assert out["response"]["ok"] is True
+    assert out["response"]["peak_dbfs"] == -12.0
+    assert out["response"]["silent"] is False
+    assert out["measured"] == [target]
+    assert out["destroyed"] == 1
+    assert out["passes"] == 1
+
+
+def test_render_reports_a_file_with_no_signal_as_silent(measured_render):
+    _, out = measured_render(None)
+    assert out["response"]["ok"] is True
+    assert out["response"]["silent"] is True
+    assert "peak_dbfs" not in out["response"]
+    assert out["passes"] == 2
+    assert out["destroyed"] == 1
+
+
+@pytest.mark.parametrize("peak_db", [0.0, -0.05, 0.05])
+def test_render_at_full_scale_is_not_mistaken_for_silence(measured_render, peak_db):
+    _, out = measured_render(peak_db)
+    assert out["response"]["silent"] is False
+    assert out["response"]["peak_dbfs"] == peak_db
+    assert out["passes"] == 2
+
+
+@pytest.mark.parametrize("peak_db", [-60.0, -138.47])
+def test_render_reports_quiet_files_exactly(measured_render, peak_db):
+    _, out = measured_render(peak_db)
+    assert out["response"]["silent"] is False
+    assert out["response"]["peak_dbfs"] == peak_db
+
+
+def test_render_still_succeeds_when_the_measurement_fails(measured_render):
+    _, out = measured_render(-12.0, throws=True)
+    assert out["response"]["ok"] is True
+    assert "silent" not in out["response"]
+    assert "peak_dbfs" not in out["response"]
+    assert out["destroyed"] == 1
+
+
+def test_render_measures_nothing_when_it_refuses(measured_render):
+    _, out = measured_render(-12.0, target_exists=True)
+    assert out["response"]["ok"] is False
+    assert out["measured"] == []
+
+
+@pytest.mark.parametrize("starts", [0.7, 0.0005, 3.3333, 9.9995])
+def test_render_reports_when_the_sound_starts(measured_render, starts):
+    _, out = measured_render(-12.0, threshold=-60, starts=starts)
+    assert out["response"]["peak_dbfs"] == -12.0
+    assert abs(out["response"]["sound_starts_s"] - starts) <= 0.001
+    assert out["destroyed"] == 1
+
+
+def test_sound_from_the_first_sample_takes_one_look(measured_render):
+    _, out = measured_render(-12.0, threshold=-60, starts=0.0)
+    assert out["response"]["sound_starts_s"] == 0
+    assert out["passes"] == 2
+
+
+@pytest.mark.parametrize("threshold, expected", [(-60, 2.0), (-90, 0)])
+def test_a_floor_below_the_threshold_is_not_sound(measured_render, threshold, expected):
+    _, out = measured_render(-12.0, threshold=threshold, starts=2.0, floor_db=-80.0)
+    assert abs(out["response"]["sound_starts_s"] - expected) <= 0.001
+
+
+def test_a_file_that_never_rises_above_the_threshold_has_no_start(measured_render):
+    _, out = measured_render(-70.0, threshold=-60, starts=0.0)
+    assert out["response"]["peak_dbfs"] == -70.0
+    assert "sound_starts_s" in out["response"]
+    assert out["response"]["sound_starts_s"] is None
+    assert out["passes"] == 1
+
+
+def test_a_silent_file_has_no_start(measured_render):
+    _, out = measured_render(None, threshold=-60)
+    assert out["response"]["silent"] is True
+    assert "sound_starts_s" in out["response"]
+    assert out["response"]["sound_starts_s"] is None
+
+
+def test_without_a_threshold_the_start_is_not_measured(measured_render):
+    _, out = measured_render(-12.0, starts=2.0)
+    assert "sound_starts_s" not in out["response"]
+    assert out["passes"] == 1
+
+
+@pytest.mark.parametrize("fail_on", [2, 6, 15, 20])
+def test_a_failed_scan_keeps_the_peak_and_leaves_out_the_start(measured_render, fail_on):
+    _, out = measured_render(-12.0, threshold=-60, starts=2.0, fail_on=fail_on)
+    assert out["passes"] == fail_on
+    assert out["response"]["ok"] is True
+    assert out["response"]["peak_dbfs"] == -12.0
+    assert "sound_starts_s" not in out["response"]
+    assert out["destroyed"] == 1
+
+
+@pytest.mark.parametrize("reported_length", ["missing", None, 0.0, float("nan")])
+def test_a_file_whose_length_is_unknown_leaves_out_the_start(measured_render, reported_length):
+    _, out = measured_render(-12.0, threshold=-60, starts=2.0, reported_length=reported_length)
+    assert out["response"]["ok"] is True
+    assert out["response"]["peak_dbfs"] == -12.0
+    assert "sound_starts_s" not in out["response"]
+    assert out["passes"] == 1
+    assert out["destroyed"] == 1
+
+
+def test_a_failed_second_pass_reports_no_level_at_all(measured_render):
+    _, out = measured_render(0.0, threshold=-60, fail_on=2)
+    assert out["response"]["ok"] is True
+    assert "peak_dbfs" not in out["response"]
+    assert "silent" not in out["response"]
+    assert "sound_starts_s" not in out["response"]
+    assert out["destroyed"] == 1
+
+
+def test_finding_a_late_start_reads_little_more_than_the_gap(measured_render):
+    _, out = measured_render(-12.0, threshold=-60, starts=300.0, length=600.0)
+    assert abs(out["response"]["sound_starts_s"] - 300.0) <= 0.001
+    assert out["scanned"] < 3 * 300.0
+    assert out["passes"] <= 42
+
+
 POST_OFF = 4 << 16
-EVERY_PROCESS = 1 | 4 | 256 | 64 | 128 | 512 | 1024 | 16384 | 32768 | (1 << 16) | (2 << 16)
+EVERY_PROCESS =1 | 4 | 256 | 64 | 128 | 512 | 1024 | 16384 | 32768 | (1 << 16) | (2 << 16)
 PROCESS_VALUES = (
     "numeric_settings.RENDER_NORMALIZE_TARGET = 0.281838\n"
     "numeric_settings.RENDER_BRICKWALL = 0.891251\n"
@@ -571,7 +741,7 @@ if response.ret ~= nil then out.ret = response.ret end
 if captured then
     out.n = captured.n
     out.a1, out.a2, out.a3, out.a4, out.a5 = captured[1], captured[2], captured[3], captured[4], captured[5]
-    out.a6 = captured[6]
+    out.a6, out.a7 = captured[6], captured[7]
 end
 return encode_json(out)
 """
@@ -582,11 +752,11 @@ return encode_json(out)
 def test_dispatch_positional_order_is_the_wire_contract(dispatch_render):
     """path, start, end, tail, overwrite — in that order, matching what
     test_tools.py pins on the Python side."""
-    out = dispatch_render('{"func":"RenderProject","args":["D:/out/mix.wav",2,5,1,true,true]}')
+    out = dispatch_render('{"func":"RenderProject","args":["D:/out/mix.wav",2,5,1,true,true,-45.5]}')
     assert out["ok"] is True and out["ret"] is True
-    assert (out["a1"], out["a2"], out["a3"], out["a4"], out["a5"], out["a6"]) == \
-        ("D:/out/mix.wav", 2, 5, 1, True, True)
-    assert out["n"] == 6
+    assert (out["a1"], out["a2"], out["a3"], out["a4"], out["a5"], out["a6"], out["a7"]) == \
+        ("D:/out/mix.wav", 2, 5, 1, True, True, -45.5)
+    assert out["n"] == 7
 
 
 def test_dispatch_json_false_reaches_the_handler_as_false(dispatch_render):
@@ -595,7 +765,7 @@ def test_dispatch_json_false_reaches_the_handler_as_false(dispatch_render):
     out = dispatch_render('{"func":"RenderProject","args":["D:/out/mix.wav",-1,-1,0,false,false]}')
     assert out["a5"] is False
     assert out["a6"] is False
-    assert out["n"] == 6
+    assert out["n"] == 7
 
 
 def test_dispatch_missing_args_get_the_documented_defaults(dispatch_render):
@@ -603,12 +773,13 @@ def test_dispatch_missing_args_get_the_documented_defaults(dispatch_render):
     assert (out["a2"], out["a3"], out["a4"]) == (-1, -1, 0)
     assert "a5" not in out
     assert out["a6"] is False
-    assert out["n"] == 6
+    assert "a7" not in out
+    assert out["n"] == 7
 
 
 def test_dispatch_numeric_strings_are_coerced(dispatch_render):
-    out = dispatch_render('{"func":"RenderProject","args":["D:/out/mix.wav","2","5","1"]}')
-    assert (out["a2"], out["a3"], out["a4"]) == (2, 5, 1)
+    out = dispatch_render('{"func":"RenderProject","args":["D:/out/mix.wav","2","5","1",false,false,"-60"]}')
+    assert (out["a2"], out["a3"], out["a4"], out["a7"]) == (2, 5, 1, -60)
 
 
 def test_dispatch_empty_path_is_rejected_without_calling_the_handler(dispatch_render):

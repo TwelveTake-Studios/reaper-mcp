@@ -5,6 +5,31 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.9.5] - 2026-11-03
+
+**After you update, run `twelvetake-reaper-mcp --install-bridge`.** If REAPER is running the 1.7.8
+bridge or later, you don't have to do anything in REAPER. If you installed with ReaPack,
+synchronize your packages instead.
+
+### Fixed
+- **`render_project` didn't give plugins time to load, so a render could come out silent.**
+  REAPER's "Delay render start" option waits before a render so sample libraries and slow plugins
+  can finish loading. The tool kept that setting but rendered without it, because REAPER asks how
+  long to wait and that prompt would stop the bridge. The tool now does the wait itself, without
+  the prompt. REAPER keeps working while it waits. By default the tool waits as long as your
+  project's setting says, or not at all when the option is off. Pass `delay_seconds` to choose the
+  wait for one render, or 0 for none.
+  *(Found while looking into [issue #21](https://github.com/TwelveTake-Studios/reaper-mcp/issues/21)
+  from [@Xleone1](https://github.com/Xleone1).)*
+
+### Added
+- **`render_project` reports the rendered file's peak level and when its sound starts.** The
+  response gives `peak_dbfs`, `silent: true` when the file has no signal at all, and
+  `sound_starts_s`, how far into the file the sound first rises above `sound_threshold_db`
+  (-60 dBFS unless you set it). When a render is silent, or never gets above that level, the
+  response says what to try. Your AI assistant can spot a silent render, or one whose sound starts
+  late, without opening the file.
+
 ## [1.9.4] - 2026-10-28
 
 **After you update, run `twelvetake-reaper-mcp --install-bridge`.** If REAPER is running the 1.7.8
