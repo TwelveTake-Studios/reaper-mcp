@@ -2,7 +2,7 @@
 
 A [TwelveTake Studios](https://twelvetake.com) project.
 
-[![Tools](https://img.shields.io/badge/tools-180-blue)](https://github.com/TwelveTake-Studios/reaper-mcp)
+[![Tools](https://img.shields.io/badge/tools-187-blue)](https://github.com/TwelveTake-Studios/reaper-mcp)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow)](https://buymeacoffee.com/twelvetake)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-ff5e5b)](https://ko-fi.com/twelvetake)
 
@@ -12,7 +12,7 @@ Listed in the [MCP Registry](https://registry.modelcontextprotocol.io/) as `mcp-
 
 TwelveTake REAPER MCP is a Model Context Protocol server that enables AI assistants to control REAPER for mixing, mastering, MIDI composition and music production.
 
-**Version:** 1.9.5
+**Version:** 1.10.0
 
 ## Why This Server
 
@@ -35,7 +35,7 @@ In addition to direct control of REAPER, the server includes workflow tools that
   don't install anything else in REAPER
 - Copy the script, run it, connect your AI assistant
 
-### 180 Tools Covering Real Production Needs
+### 187 Tools Covering Real Production Needs
 
 - **Full FX control** — add/remove plugins, get/set any parameter by index, manage presets, bypass
 - **FX parameter automation** — automate any plugin knob (flanger depth, filter cutoff, etc.)
@@ -45,7 +45,9 @@ In addition to direct control of REAPER, the server includes workflow tools that
 - **MIDI editing** — transpose, quantize with swing, humanize, snap to a scale, stretch, legato,
   strum, velocity ramps — each targetable by pitch range, beat window, or channel
 - **Audio items** — import, split, duplicate, fade, position, mute
-- **Markers & regions** — create, edit, navigate, render by region
+- **Markers & regions**: create, rename, delete and jump to them
+- **Session organizing**: move tracks and folders, hide tracks from the arrange view or mixer,
+  set track heights, rename takes and set the project playback rate
 - **Measurement**: loudness, loudness range, true peak, the octave-band spectrum and stereo
   correlation for the master, a track or an item. It passes the EBU's synthetic compliance signals
   for loudness, true peak and loudness range.
@@ -333,12 +335,12 @@ ever reached REAPER. `REAPER_COMM_MODE` no longer does anything.
 
 ## Tool Reference
 
-### Track Operations (23 tools)
+### Track Operations (26 tools)
 
 | Tool | Description |
 |------|-------------|
 | `get_track_count()` | Get total number of tracks (excluding master) |
-| `get_track(index)` | Get track info (name, volume, pan, mute, solo) |
+| `get_track(index)` | Get track info (name, volume, pan, mute, solo, where it is hidden) |
 | `get_all_tracks()` | Get info for all tracks |
 | `get_master_track()` | Get master track info |
 | `insert_track(index, name)` | Create a new track |
@@ -358,6 +360,8 @@ ever reached REAPER. `REAPER_COMM_MODE` no longer does anything.
 | `get_track_master_send(index)` | Get master/parent send state |
 | `set_track_master_send(index, enabled)` | Enable/disable master send |
 | `set_track_as_folder(index, depth)` | Set as folder parent/child |
+| `move_tracks(indices, before_index, into_folder?)` | Move tracks above another track or to the end (a folder takes its children); `into_folder` makes them children of the track above |
+| `set_track_display(indices, show_in_arrange?, show_in_mixer?, height?)` | Show or hide tracks in the arrange view and mixer; set track height |
 | `arm_track(index, arm)` | Arm for recording |
 | `set_track_input(index, input)` | Set record input |
 | `set_track_monitor(index, mode)` | Set monitor mode |
@@ -415,7 +419,7 @@ Per-take (per-item) FX, mirroring the track FX tools. Every take is addressed by
 | `take_fx_get_param(track, item, take, fx, param)` | Get parameter value |
 | `take_fx_set_param(track, item, take, fx, param, value)` | Set parameter value |
 
-### Take Management & Comping (7 tools)
+### Take Management & Comping (8 tools)
 
 Multi-take workflows: list/switch/delete takes, explode/crop, REAPER 7 fixed-lane comping.
 
@@ -424,6 +428,7 @@ Multi-take workflows: list/switch/delete takes, explode/crop, REAPER 7 fixed-lan
 | `get_takes(track, item)` | List all takes (name + active flag) |
 | `get_active_take(track, item)` | Get the active take index |
 | `set_active_take(track, item, take)` | Switch which take plays |
+| `set_take_name(track, item, name, take?)` | Rename a take, the active one by default (an item shows its active take's name) |
 | `explode_takes(track, item)` | Explode takes to overlapping items (in place) |
 | `crop_to_active_take(track, item)` | Keep only the active take |
 | `delete_take(track, item, take)` | Delete a specific take |
@@ -443,7 +448,7 @@ Multi-take workflows: list/switch/delete takes, explode/crop, REAPER 7 fixed-lan
 | `configure_reacomp_sidechain(index, fx_index, use)` | Configure ReaComp sidechain |
 | `setup_sidechain_compression(trigger, target, fx, db)` | Complete sidechain setup |
 
-### Transport (10 tools)
+### Transport (12 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -457,6 +462,8 @@ Multi-take workflows: list/switch/delete takes, explode/crop, REAPER 7 fixed-lan
 | `get_play_position()` | Get playback position (seconds) |
 | `toggle_repeat()` | Toggle loop mode |
 | `get_repeat_state()` | Check if looping |
+| `get_play_rate()` | Get the project playback rate |
+| `set_play_rate(rate)` | Set the project playback rate (0.25 to 4) |
 
 ### Project (15 tools)
 
@@ -539,7 +546,7 @@ what is already there. It is flagged `destructive` so a client can prompt first.
 | `copy_selected_items()` | Copy to clipboard |
 | `paste_items()` | Paste from clipboard |
 
-### Markers & Regions (8 tools)
+### Markers & Regions (10 tools)
 
 | Tool | Description |
 |------|-------------|
@@ -549,6 +556,8 @@ what is already there. It is flagged `destructive` so a client can prompt first.
 | `get_regions()` | Get all regions |
 | `delete_marker(index)` | Delete marker |
 | `delete_region(index)` | Delete region |
+| `rename_marker(index, name)` | Rename a marker, keeping its position and color |
+| `rename_region(index, name)` | Rename a region, keeping its bounds and color |
 | `go_to_marker(index)` | Jump to marker |
 | `go_to_region(index)` | Jump to region start |
 

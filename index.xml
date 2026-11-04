@@ -19,14 +19,19 @@
         <link rel="website">https://twelvetake.com/tools/reaper-mcp/</link>
         <link rel="repository">https://github.com/TwelveTake-Studios/reaper-mcp</link>
       </metadata>
-      <version name="1.9.5" author="TwelveTake Studios" time="2026-11-03T21:10:52Z">
-        <changelog><![CDATA[After you update, run twelvetake-reaper-mcp --install-bridge. If REAPER is running the 1.7.8 bridge or later, you don't have to do anything in REAPER. If you installed with ReaPack, synchronize your packages instead.
-Fixed:
-- render_project didn't give plugins time to load, so a render could come out silent. REAPER's "Delay render start" option waits before a render so sample libraries and slow plugins can finish loading. The tool kept that setting but rendered without it, because REAPER asks how long to wait and that prompt would stop the bridge. The tool now does the wait itself, without the prompt. REAPER keeps working while it waits. By default the tool waits as long as your project's setting says, or not at all when the option is off. Pass delay_seconds to choose the wait for one render, or 0 for none. *(Found while looking into issue #21 from @Xleone1.)*
+      <version name="1.10.0" author="TwelveTake Studios" time="2026-11-04T16:22:32Z">
+        <changelog><![CDATA[This release needs the 1.10.0 bridge. After you update, run uvx twelvetake-reaper-mcp@1.10.0 --install-bridge, or twelvetake-reaper-mcp --install-bridge if you installed with pip. If REAPER is running the 1.7.8 bridge or later, you don't have to do anything in REAPER. If you installed the bridge with ReaPack, synchronize your packages instead. Until the bridge is updated, every tool answers with what to do.
 Added:
-- render_project reports the rendered file's peak level and when its sound starts. The response gives peak_dbfs, silent: true when the file has no signal at all, and sound_starts_s, how far into the file the sound first rises above sound_threshold_db (-60 dBFS unless you set it). When a render is silent, or never gets above that level, the response says what to try. Your AI assistant can spot a silent render, or one whose sound starts late, without opening the file.]]></changelog>
-        <source main="main">https://github.com/TwelveTake-Studios/reaper-mcp/raw/v1.9.5/reaper_mcp_bridge.lua</source>
-        <source type="effect" file="twelvetake_mcp_analyzer.jsfx">https://github.com/TwelveTake-Studios/reaper-mcp/raw/v1.9.5/twelvetake_mcp_analyzer.jsfx</source>
+- move_tracks moves tracks to just above another track, or to the end. They keep the order they're in now, whatever order you list them in. A folder moves with its children. With into_folder, the tracks go inside the track above, which becomes a folder if it wasn't one. Your track selection stays as it was.
+- set_track_display shows or hides tracks in the arrange view and the mixer, the master track included, and sets track height in pixels. 0 returns a track to REAPER's default height, and a height below REAPER's minimum draws at the minimum. get_track, get_all_tracks, get_master_track and get_project_summary now give hidden_in for a hidden track, saying where it's hidden (["arrange"], ["mixer"] or both); a track that's showing has no hidden_in.
+- set_take_name renames a take, the active one unless you pick another. An item shows its active take's name, so this is also how you rename an item.
+- rename_marker and rename_region change only the name: a marker keeps its position and color, a region its start, end and color. An empty name clears the name.
+- get_play_rate and set_play_rate read and set the project playback rate, from 0.25 to 4 (1.0 is normal speed).
+Every change these tools make is one undo step, including showing, hiding or resizing a track and changing the playback rate.
+Fixed:
+- Undoing an edit to a MIDI item made by create_midi_item could remove the item too. Creating the item didn't always add a step to REAPER's undo history, so undoing the next edit to it removed the item as well. create_midi_item is now its own undo step.]]></changelog>
+        <source main="main">https://github.com/TwelveTake-Studios/reaper-mcp/raw/v1.10.0/reaper_mcp_bridge.lua</source>
+        <source type="effect" file="twelvetake_mcp_analyzer.jsfx">https://github.com/TwelveTake-Studios/reaper-mcp/raw/v1.10.0/twelvetake_mcp_analyzer.jsfx</source>
       </version>
     </reapack>
   </category>

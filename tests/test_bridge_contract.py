@@ -345,13 +345,9 @@ def test_startup_banner_names_the_bridge_version():
     )
 
 
-def test_windows_keeps_accepting_the_1_9_1_bridge():
-    assert srv.min_bridge_version("win32") == "1.9.1"
-
-
-@pytest.mark.parametrize("platform", ["darwin", "linux", "cygwin", "msys"])
-def test_other_platforms_require_the_bridge_that_keeps_an_empty_request(platform):
-    assert srv.min_bridge_version(platform) == "1.9.4"
+@pytest.mark.parametrize("platform", ["win32", "darwin", "linux", "cygwin", "msys"])
+def test_every_platform_requires_the_bridge_with_the_1_10_0_functions(platform):
+    assert srv.min_bridge_version(platform) == "1.10.0"
 
 
 def test_the_stale_bridge_hint_names_this_server_version():

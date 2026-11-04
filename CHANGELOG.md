@@ -5,6 +5,40 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.0] - 2026-11-04
+
+**This release needs the 1.10.0 bridge. After you update, run
+`uvx twelvetake-reaper-mcp@1.10.0 --install-bridge`, or `twelvetake-reaper-mcp --install-bridge` if
+you installed with pip.** If REAPER is running the 1.7.8 bridge or later, you don't have to do
+anything in REAPER. If you installed the bridge with ReaPack, synchronize your packages instead.
+Until the bridge is updated, every tool answers with what to do.
+
+### Added
+- **`move_tracks`** moves tracks to just above another track, or to the end. They keep the order
+  they're in now, whatever order you list them in. A folder moves with its children. With
+  `into_folder`, the tracks go inside the track above, which becomes a folder if it wasn't one.
+  Your track selection stays as it was.
+- **`set_track_display`** shows or hides tracks in the arrange view and the mixer, the master track
+  included, and sets track height in pixels. 0 returns a track to REAPER's default height, and a
+  height below REAPER's minimum draws at the minimum. `get_track`, `get_all_tracks`,
+  `get_master_track` and `get_project_summary` now give `hidden_in` for a hidden track, saying
+  where it's hidden (`["arrange"]`, `["mixer"]` or both); a track that's showing has no
+  `hidden_in`.
+- **`set_take_name`** renames a take, the active one unless you pick another. An item shows its
+  active take's name, so this is also how you rename an item.
+- **`rename_marker` and `rename_region`** change only the name: a marker keeps its position and
+  color, a region its start, end and color. An empty name clears the name.
+- **`get_play_rate` and `set_play_rate`** read and set the project playback rate, from 0.25 to 4
+  (1.0 is normal speed).
+
+Every change these tools make is one undo step, including showing, hiding or resizing a track and
+changing the playback rate.
+
+### Fixed
+- **Undoing an edit to a MIDI item made by `create_midi_item` could remove the item too.** Creating
+  the item didn't always add a step to REAPER's undo history, so undoing the next edit to it
+  removed the item as well. `create_midi_item` is now its own undo step.
+
 ## [1.9.5] - 2026-11-03
 
 **After you update, run `twelvetake-reaper-mcp --install-bridge`.** If REAPER is running the 1.7.8

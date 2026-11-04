@@ -538,7 +538,8 @@ def test_an_item_action_leaves_the_edit_cursor_where_it_was(item_action_block, c
 
 @pytest.fixture(scope="module")
 def track_info_block(bridge_src):
-    m = re.search(r"local function GetTrackInfo\(track_index\).*?\nend\n", bridge_src, re.S)
+    m = re.search(r"local function hidden_in_of\(.*?\nlocal function GetTrackInfo\(track_index\).*?\nend\n",
+                  bridge_src, re.S)
     assert m, "could not locate GetTrackInfo"
     return m.group(0)
 

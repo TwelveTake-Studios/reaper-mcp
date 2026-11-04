@@ -4,7 +4,7 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.9.5"
+local BRIDGE_VERSION = "1.10.0"
 local BRIDGE_SOURCE = debug and debug.getinfo and debug.getinfo(1, "S").source or ""
 local BRIDGE_PATH = BRIDGE_SOURCE:sub(1, 1) == "@" and BRIDGE_SOURCE:sub(2) or ""
 local INSTANCE_SECTION = "TwelveTake_REAPER_MCP"
@@ -332,6 +332,22 @@ end
 -- DSL HELPER FUNCTIONS
 -- ============================================================================
 
+local function hidden_in_of(track, is_master)
+    local in_arrange, in_mixer
+    if is_master then
+        local flags = reaper.GetMasterTrackVisibility()
+        in_arrange, in_mixer = flags & 1 ~= 0, flags & 2 == 0
+    else
+        in_arrange = reaper.GetMediaTrackInfo_Value(track, "B_SHOWINTCP") ~= 0
+        in_mixer = reaper.GetMediaTrackInfo_Value(track, "B_SHOWINMIXER") ~= 0
+    end
+    if in_arrange and in_mixer then return nil end
+    local where = as_array({})
+    if not in_arrange then where[#where + 1] = "arrange" end
+    if not in_mixer then where[#where + 1] = "mixer" end
+    return where
+end
+
 -- Get detailed track information including MIDI/audio content and FX
 local function GetTrackInfo(track_index)
     local track = nil
@@ -409,7 +425,8 @@ local function GetTrackInfo(track_index)
             volume_db = volume_db,
             pan = reaper.GetMediaTrackInfo_Value(track, "D_PAN"),
             muted = reaper.GetMediaTrackInfo_Value(track, "B_MUTE") == 1,
-            soloed = reaper.GetMediaTrackInfo_Value(track, "I_SOLO") > 0
+            soloed = reaper.GetMediaTrackInfo_Value(track, "I_SOLO") > 0,
+            hidden_in = hidden_in_of(track, track_index == -1)
         }
     }
 end
@@ -850,7 +867,8 @@ local function CreateMIDIItem(track_index, start_pos, end_pos)
     if not item then
         return {ok = false, error = "Failed to create MIDI item"}
     end
-    
+    reaper.MarkTrackItemsDirty(track, item)
+
     -- Find item index on track
     local item_index = -1
     for i = 0, reaper.CountTrackMediaItems(track) - 1 do
@@ -1243,7 +1261,8 @@ local function GetProjectSummary()
                 mute = mute,
                 solo = solo,
                 fx_count = fx_count,
-                fx_names = fx_names
+                fx_names = fx_names,
+                hidden_in = hidden_in_of(track, false)
             })
         end
     end
@@ -1263,7 +1282,8 @@ local function GetProjectSummary()
     local master_info = {
         volume_db = linear_to_db(master_vol),
         fx_count = master_fx_count,
-        fx_names = master_fx_names
+        fx_names = master_fx_names,
+        hidden_in = hidden_in_of(master, true)
     }
 
     -- Get markers and regions
@@ -2947,6 +2967,178 @@ DSL_FUNCTIONS.MeasureSpectrum = MeasureSpectrum
 _G.__MEASURE_TEST = {parse_render_stats = parse_render_stats, parse_duration = parse_duration,
                      stereo_from_sums = stereo_from_sums, spectrum_from_bins = spectrum_from_bins,
                      round_to = round_to, measure_target = measure_target}
+
+-- ============================================================================
+-- SESSION ORGANIZING
+-- ============================================================================
+
+local function whole(n)
+    return type(n) == "number" and n == math.floor(n)
+end
+
+local function listed_tracks(indices, allow_master)
+    if type(indices) ~= "table" or #indices == 0 then
+        return nil, "track_indices must list at least one track"
+    end
+    local tracks, seen = {}, {}
+    for _, index in ipairs(indices) do
+        local track = nil
+        if allow_master and index == -1 then
+            track = reaper.GetMasterTrack(0)
+        elseif whole(index) and index >= 0 then
+            track = reaper.GetTrack(0, index)
+        end
+        if not track then
+            return nil, "Track not found at index " .. tostring(index)
+        end
+        if seen[index] then
+            return nil, "Track " .. tostring(index) .. " is listed twice"
+        end
+        seen[index] = true
+        tracks[#tracks + 1] = {index = index, track = track}
+    end
+    return tracks
+end
+
+local function MoveTracks(indices, before_index, into_folder)
+    local count = reaper.CountTracks(0)
+    if not whole(before_index) or before_index < 0 or before_index > count then
+        return {ok = false, error = "before_index must be between 0 and " .. count
+            .. " (got " .. tostring(before_index) .. ")"}
+    end
+    local moving, err = listed_tracks(indices, false)
+    if not moving then return {ok = false, error = err} end
+    local previous = {}
+    for i = 0, reaper.CountSelectedTracks2(0, true) - 1 do
+        previous[#previous + 1] = reaper.GetSelectedTrack2(0, i, true)
+    end
+    for _, track in ipairs(previous) do reaper.SetTrackSelected(track, false) end
+    for _, t in ipairs(moving) do reaper.SetTrackSelected(t.track, true) end
+    local moved = reaper.ReorderSelectedTracks(before_index, into_folder == true and 1 or 0)
+    for _, t in ipairs(moving) do reaper.SetTrackSelected(t.track, false) end
+    for _, track in ipairs(previous) do
+        if reaper.ValidatePtr2(0, track, "MediaTrack*") then reaper.SetTrackSelected(track, true) end
+    end
+    if not moved then
+        return {ok = false, error = "REAPER did not move the tracks"}
+    end
+    reaper.TrackList_AdjustWindows(false)
+    local tracks = as_array({})
+    for _, t in ipairs(moving) do
+        tracks[#tracks + 1] = {from = t.index,
+            to = math.floor(reaper.GetMediaTrackInfo_Value(t.track, "IP_TRACKNUMBER")) - 1}
+    end
+    return {ok = true, tracks = tracks}
+end
+
+local function SetTrackDisplay(indices, show_in_arrange, show_in_mixer, height)
+    local settings = {show_in_arrange = show_in_arrange, show_in_mixer = show_in_mixer}
+    for name, value in pairs(settings) do
+        if value ~= -1 and value ~= 0 and value ~= 1 then
+            return {ok = false, error = name .. " must be -1 (unchanged), 0 or 1 (got " .. tostring(value) .. ")"}
+        end
+    end
+    if not whole(height) or height < -1 then
+        return {ok = false, error = "height must be a whole number of pixels, 0 for REAPER's default (got "
+            .. tostring(height) .. ")"}
+    end
+    if show_in_arrange == -1 and show_in_mixer == -1 and height == -1 then
+        return {ok = false, error = "Nothing to change: give show_in_arrange, show_in_mixer or height"}
+    end
+    local targets, err = listed_tracks(indices, true)
+    if not targets then return {ok = false, error = err} end
+    for _, t in ipairs(targets) do
+        if t.index == -1 then
+            if show_in_arrange ~= -1 or show_in_mixer ~= -1 then
+                local flags = reaper.GetMasterTrackVisibility()
+                if show_in_arrange == 1 then flags = flags | 1 elseif show_in_arrange == 0 then flags = flags & ~1 end
+                if show_in_mixer == 1 then flags = flags & ~2 elseif show_in_mixer == 0 then flags = flags | 2 end
+                reaper.SetMasterTrackVisibility(flags)
+            end
+        else
+            if show_in_arrange ~= -1 then reaper.SetMediaTrackInfo_Value(t.track, "B_SHOWINTCP", show_in_arrange) end
+            if show_in_mixer ~= -1 then reaper.SetMediaTrackInfo_Value(t.track, "B_SHOWINMIXER", show_in_mixer) end
+        end
+        if height ~= -1 then reaper.SetMediaTrackInfo_Value(t.track, "I_HEIGHTOVERRIDE", height) end
+    end
+    reaper.TrackList_AdjustWindows(false)
+    reaper.UpdateArrange()
+    local tracks = as_array({})
+    for _, t in ipairs(targets) do
+        tracks[#tracks + 1] = {index = t.index, hidden_in = hidden_in_of(t.track, t.index == -1)}
+    end
+    return {ok = true, tracks = tracks}
+end
+
+local function RenameMarker(number, is_region, name)
+    local kind = is_region and "region" or "marker"
+    if type(name) ~= "string" then
+        return {ok = false, error = "name must be text"}
+    end
+    local i = 0
+    while true do
+        local retval, isrgn, pos, rgnend, _, num = reaper.EnumProjectMarkers(i)
+        if retval == 0 then break end
+        if isrgn == is_region and num == number then
+            reaper.SetProjectMarker4(0, number, is_region, pos, rgnend, name, 0, name == "" and 1 or 0)
+            local _, _, _, _, now = reaper.EnumProjectMarkers(i)
+            return {ok = true, index = number, name = now or ""}
+        end
+        i = i + 1
+    end
+    return {ok = false, error = "No " .. kind .. " numbered " .. tostring(number)}
+end
+
+local function SetTakeName(track_index, item_index, take_index, name)
+    if type(name) ~= "string" then
+        return {ok = false, error = "name must be text"}
+    end
+    local track = whole(track_index) and track_index >= 0 and reaper.GetTrack(0, track_index) or nil
+    if not track then
+        return {ok = false, error = "Track not found at index " .. tostring(track_index)}
+    end
+    local item = whole(item_index) and reaper.GetTrackMediaItem(track, item_index) or nil
+    if not item then
+        return {ok = false, error = "Media item not found at index " .. tostring(item_index)
+            .. " on track " .. tostring(track_index)}
+    end
+    local take
+    if take_index == -1 then
+        take = reaper.GetActiveTake(item)
+        if not take then
+            return {ok = false, error = "Item " .. tostring(item_index) .. " on track "
+                .. tostring(track_index) .. " has no takes"}
+        end
+    else
+        take = whole(take_index) and reaper.GetTake(item, take_index) or nil
+        if not take then
+            return {ok = false, error = "Take not found at index " .. tostring(take_index)}
+        end
+    end
+    reaper.GetSetMediaItemTakeInfo_String(take, "P_NAME", name, true)
+    reaper.UpdateArrange()
+    return {ok = true, take_index = math.floor(reaper.GetMediaItemTakeInfo_Value(take, "IP_TAKENUMBER")),
+        name = reaper.GetTakeName(take)}
+end
+
+local function GetPlayRate()
+    return {ok = true, rate = reaper.Master_GetPlayRate(0)}
+end
+
+local function SetPlayRate(rate)
+    if type(rate) ~= "number" or rate ~= rate or rate < 0.25 or rate > 4 then
+        return {ok = false, error = "rate must be between 0.25 and 4 (got " .. tostring(rate) .. ")"}
+    end
+    reaper.CSurf_OnPlayRateChange(rate)
+    return {ok = true, rate = reaper.Master_GetPlayRate(0)}
+end
+
+DSL_FUNCTIONS.MoveTracks = MoveTracks
+DSL_FUNCTIONS.SetTrackDisplay = SetTrackDisplay
+DSL_FUNCTIONS.RenameMarker = RenameMarker
+DSL_FUNCTIONS.SetTakeName = SetTakeName
+DSL_FUNCTIONS.GetPlayRate = GetPlayRate
+DSL_FUNCTIONS.SetPlayRate = SetPlayRate
 
 -- Scan the mailbox with ONE directory enumeration per tick: collect the request
 -- slots that actually have a file on disk, plus every response file present (for

@@ -11,7 +11,7 @@ Author: TwelveTake Studios LLC
 License: MIT
 """
 
-__version__ = "1.9.5"
+__version__ = "1.10.0"
 
 import os
 import asyncio
@@ -124,7 +124,7 @@ BRIDGE_DIR_PROBLEM = bridge_dir_problem(BRIDGE_DIR)
 # its Scripts folder, deployed by hand, so the halves drift. Anything older cannot answer
 # GetBridgeVersion and is reported as out of date instead of failing in obscure ways.
 def min_bridge_version(platform: str = sys.platform) -> str:
-    return "1.9.1" if platform == "win32" else "1.9.4"
+    return "1.10.0"
 
 
 MIN_BRIDGE_VERSION = min_bridge_version()
@@ -191,8 +191,9 @@ CONVENTIONS (apply to every tool unless its own description says otherwise):
   `fields_ignored` and changes nothing.
 - Every tool call that edits the project is ONE step in REAPER's undo history, labeled
   "MCP: <tool name>", so undo() reverses one tool call at a time; get_undo_state shows
-  whether the next step is yours or the user's. Transport, view,
-  selection, run_action and project open/save/render are not undo steps.
+  whether the next step is yours or the user's. Play, stop, pause, record and repeat,
+  the edit cursor, zoom, selecting tracks, items or notes, the time selection, run_action
+  and project open/save/render are not undo steps.
 
 IMPORTANT: The REAPER bridge script must be running in REAPER for tools to work. If a tool returns a timeout error, ensure:
 1. REAPER is running
@@ -682,14 +683,15 @@ async def get_track(track_index: int) -> dict:
 
     Returns:
         Object with 'info': guid, name, volume, volume_db, pan, muted, soloed,
-        has_midi, has_audio, fx_names, role.
+        has_midi, has_audio, fx_names, role, and hidden_in (["arrange"], ["mixer"]
+        or both) only for a hidden track.
     """
     return await reaper_call("GetTrackInfo", track_index)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
 async def get_all_tracks() -> dict:
-    """Get information about all tracks in the project."""
+    """Get information about all tracks in the project, in get_track's shape plus index."""
     return await reaper_call("GetAllTracksInfo")
 
 
@@ -809,6 +811,53 @@ async def set_track_solo(track_index: int, solo: bool) -> dict:
         solo: True to solo, False to unsolo.
     """
     return await reaper_call("SetMediaTrackInfo_Value", track_index, "I_SOLO", 1 if solo else 0)
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
+async def move_tracks(track_indices: List[int], before_index: int, into_folder: bool = False) -> dict:
+    """
+    Move tracks, in their current order, to just above before_index. A folder moves with its children.
+
+    Args:
+        before_index: Counted before the move; the track count moves them to the end.
+        into_folder: Make them children of the track above the destination.
+
+    Returns:
+        tracks: [{from, to}], each listed track's index before and after.
+    """
+    if not track_indices:
+        return {"ok": False, "error": "track_indices must list at least one track"}
+    err = _validate_indices(before_index=before_index,
+                            **{f"track_indices[{n}]": i for n, i in enumerate(track_indices)})
+    if err:
+        return err
+    return await reaper_call("MoveTracks", list(track_indices), before_index, bool(into_folder))
+
+
+def _display_flag(value: Optional[bool]) -> int:
+    return -1 if value is None else int(bool(value))
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True))
+async def set_track_display(track_indices: List[int], show_in_arrange: Optional[bool] = None,
+                            show_in_mixer: Optional[bool] = None, height: Optional[int] = None) -> dict:
+    """
+    Show or hide tracks in the arrange view and the mixer, and set track height. Settings left out stay as they are.
+
+    Args:
+        height: Pixels; 0 returns to REAPER's default. REAPER draws no track below its minimum height.
+
+    Returns:
+        tracks: [{index, hidden_in}], hidden_in only for a hidden track.
+    """
+    if not track_indices:
+        return {"ok": False, "error": "track_indices must list at least one track"}
+    if show_in_arrange is None and show_in_mixer is None and height is None:
+        return {"ok": False, "error": "Nothing to change: give show_in_arrange, show_in_mixer or height"}
+    if height is not None and height < 0:
+        return {"ok": False, "error": f"height must be >= 0 (got {height})"}
+    return await reaper_call("SetTrackDisplay", list(track_indices), _display_flag(show_in_arrange),
+                             _display_flag(show_in_mixer), -1 if height is None else height)
 
 
 # --- FX OPERATIONS ---
@@ -1209,6 +1258,22 @@ async def set_active_take(track_index: int, item_index: int, take_index: int) ->
     return await reaper_call("SetActiveTakeByIndex", track_index, item_index, take_index)
 
 
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True))
+async def set_take_name(track_index: int, item_index: int, name: str, take_index: Optional[int] = None) -> dict:
+    """
+    Rename a take, the active one when take_index is left out. An item shows its active take's name.
+
+    Returns:
+        take_index, name.
+    """
+    err = _validate_indices(track_index=track_index, item_index=item_index,
+                            **({} if take_index is None else {"take_index": take_index}))
+    if err:
+        return err
+    return await reaper_call("SetTakeName", track_index, item_index,
+                             -1 if take_index is None else take_index, name)
+
+
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
 async def explode_takes(track_index: int, item_index: int) -> dict:
     """
@@ -1553,6 +1618,23 @@ async def set_cursor_position(position: float) -> dict:
     """
     # SetEditCurPos(time, moveview, seekplay)
     return await reaper_call("SetEditCurPos", position, True, False)
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def get_play_rate() -> dict:
+    """Get the project playback rate as `rate` (1.0 is normal speed)."""
+    return await reaper_call("GetPlayRate")
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True))
+async def set_play_rate(rate: float) -> dict:
+    """
+    Set the project playback rate, 0.25 to 4 (1.0 is normal speed).
+
+    """
+    if not math.isfinite(rate) or not 0.25 <= rate <= 4:
+        return {"ok": False, "error": f"rate must be between 0.25 and 4 (got {rate})"}
+    return await reaper_call("SetPlayRate", rate)
 
 
 # --- PROJECT OPERATIONS ---
@@ -3091,6 +3173,24 @@ async def delete_region(region_index: int) -> dict:
                             f"No region numbered {region_index}")
 
 
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True))
+async def rename_marker(marker_index: int, name: str) -> dict:
+    """
+    Rename the marker get_markers numbers marker_index, keeping its position and color. An empty name clears it.
+
+    """
+    return await reaper_call("RenameMarker", marker_index, False, name)
+
+
+@mcp.tool(annotations=ToolAnnotations(destructiveHint=False, idempotentHint=True))
+async def rename_region(region_index: int, name: str) -> dict:
+    """
+    Rename the region get_regions numbers region_index, keeping its bounds and color. An empty name clears it.
+
+    """
+    return await reaper_call("RenameMarker", region_index, True, name)
+
+
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=False))
 async def go_to_marker(marker_index: int) -> dict:
     """
@@ -3950,7 +4050,8 @@ async def get_project_summary() -> dict:
             - solo: Boolean solo state
             - fx_count: Number of FX plugins
             - fx_names: List of FX plugin names
-        - master: Master track info {volume_db, fx_count, fx_names}
+            - hidden_in: only for a hidden track, as in get_track
+        - master: Master track info {volume_db, fx_count, fx_names, hidden_in}
         - markers: List of {index, position, name}
         - regions: List of {index, start, end, name}
     """
