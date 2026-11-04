@@ -331,6 +331,19 @@ ever reached REAPER. `REAPER_COMM_MODE` no longer does anything.
 "Render to D:/Output/mix.wav"
 ```
 
+### Optional knowledge lookup before narration cleanup
+
+For an agent choosing an external speech-cleanup method, the
+[Veyrul narration companion](https://github.com/the-media-vampire/veyrul-integrations/tree/02ed7b7a32ecdbb87643c068f0cf562a0c854a64/workflows/reaper.md) provides an optional, anonymous
+read-only MCP connection alongside this server. Its setup keeps REAPER control
+here and adds a focused lookup for documented filter behavior, sources and limits.
+It does not process audio or need access to the project.
+
+Use only non-private task terms. Keep the original audio and check the processed
+copy for audible artifacts, timing and level in REAPER. The example has verified
+knowledge retrieval, not a live REAPER or listening test. Veyrul is a separate
+service; existing agent usage, tool permissions and source licences still apply.
+
 ## Tool Reference
 
 ### Track Operations (23 tools)
