@@ -5,6 +5,18 @@ All notable changes to TwelveTake REAPER MCP are documented here.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.10.1] - 2026-11-04
+
+This release updates the server only. If REAPER is running the 1.10.0 bridge, you don't have to do
+anything in REAPER. If you're updating from 1.9.5 or earlier, update the bridge as the 1.10.0 notes
+below describe.
+
+### Fixed
+- **`render_region` always returned an error.** It now renders the master mix over the region
+  numbered `region_index` in `get_regions`, from its start to its end. It takes `render_project`'s
+  other options and gives the same response, plus `region` with the region's number, name, start
+  and end.
+
 ## [1.10.0] - 2026-11-04
 
 **This release needs the 1.10.0 bridge. After you update, run

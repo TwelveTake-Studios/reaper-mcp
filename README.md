@@ -12,7 +12,7 @@ Listed in the [MCP Registry](https://registry.modelcontextprotocol.io/) as `mcp-
 
 TwelveTake REAPER MCP is a Model Context Protocol server that enables AI assistants to control REAPER for mixing, mastering, MIDI composition and music production.
 
-**Version:** 1.10.0
+**Version:** 1.10.1
 
 ## Why This Server
 
@@ -481,7 +481,7 @@ Multi-take workflows: list/switch/delete takes, explode/crop, REAPER 7 fixed-lan
 | `get_time_signature()` | Get time signature |
 | `set_time_signature(num, denom)` | Set time signature |
 | `render_project(path, start, end, tail, skip_postprocessing, delay_seconds, sound_threshold_db)` | Render to audio file; lists the project's normalization, fades and other processing, or skips them; waits for plugins to load first; reports the file's peak level, whether it is silent, and when its sound starts |
-| `render_region(index, path)` | Not implemented: always returns an error; use `render_project` with the region's start and end |
+| `render_region(index, path, ...)` | Render the master mix over a region to an audio file, with `render_project`'s other options |
 | `zoom_to_selection()` | Zoom to time selection |
 | `zoom_to_project()` | Zoom to show entire project |
 

@@ -11,7 +11,7 @@ Author: TwelveTake Studios LLC
 License: MIT
 """
 
-__version__ = "1.10.0"
+__version__ = "1.10.1"
 
 import os
 import asyncio
@@ -3080,20 +3080,36 @@ async def measure_spectrum(
 
 
 @mcp.tool(annotations=ToolAnnotations(destructiveHint=True))
-async def render_region(region_index: int, output_path: str) -> dict:
+async def render_region(
+    region_index: int,
+    output_path: str,
+    tail_seconds: float = 0,
+    overwrite: bool = False,
+    skip_postprocessing: bool = False,
+    delay_seconds: float = None,
+    sound_threshold_db: float = -60,
+) -> dict:
     """
-    Not implemented: this tool always returns an error. Use render_project with the
-    region's start and end from get_regions.
+    Render the master mix over the region get_regions numbers region_index, from its start to its end. render_project's other options and its response apply, plus `region` {index, name, start, end}.
     """
-    return {
-        "ok": False,
-        # No version named here on purpose: the roadmap said v1.9 in two places, the
-        # renumbering moved the render suite, and a stale promise shipped to users on
-        # every call is worse than no promise at all.
-        "error": "render_region is not implemented yet. Workaround: get the region "
-                 "bounds via get_regions, then call render_project with "
-                 "start_time/end_time.",
-    }
+    regions = await reaper_call("GetProjectRegions")
+    if not regions.get("ok"):
+        return regions
+    region = next((r for r in regions.get("regions") or [] if r.get("index") == region_index), None)
+    if region is None:
+        return {"ok": False, "error": f"No region numbered {region_index}"}
+    result = await render_project(
+        output_path,
+        start_time=region["start"],
+        end_time=region["end"],
+        tail_seconds=tail_seconds,
+        overwrite=overwrite,
+        skip_postprocessing=skip_postprocessing,
+        delay_seconds=delay_seconds,
+        sound_threshold_db=sound_threshold_db,
+    )
+    result["region"] = {k: region.get(k) for k in ("index", "name", "start", "end")}
+    return result
 
 
 # --- MARKERS AND REGIONS ---

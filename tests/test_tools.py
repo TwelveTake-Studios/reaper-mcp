@@ -4,7 +4,6 @@ These verify the two things every glue tool must get right: the REAPER function 
 argument marshalling it sends, and that it returns the bridge response unchanged.
 """
 
-import re
 import asyncio
 
 import pytest
@@ -333,8 +332,12 @@ def test_render_project_with_only_a_start_ends_at_the_project_length(reaper):
 
 
 class RenderBridge:
-    def __init__(self, settings=0, delay=0.0, render=None, bridge=None):
+    def __init__(self, settings=0, delay=0.0, render=None, bridge=None, regions=None):
         self.events = []
+        self.regions = regions if regions is not None else {"ok": True, "regions": [
+            {"index": 1, "start": 2.0, "end": 6.0, "name": "Intro"},
+            {"index": 2, "start": 12.0, "end": 14.5, "name": "Chorus"},
+        ]}
         self.project = {"RENDER_SETTINGS": settings, "RENDER_DELAY": delay}
         self.render = render or {"ok": True, "ret": True, "silent": False, "peak_dbfs": -12.0}
         self.bridge = bridge or {"ok": True, "version": "1.9.5",
@@ -346,6 +349,8 @@ class RenderBridge:
             return {"ok": True, "ret": self.project[args[1]]}
         if func == "GetBridgeVersion":
             return dict(self.bridge)
+        if func == "GetProjectRegions":
+            return dict(self.regions)
         return dict(self.render)
 
     async def sleep(self, seconds):
@@ -575,28 +580,56 @@ def test_render_project_refuses_an_end_at_or_before_the_start_without_calling_re
     assert reaper.calls == []
 
 
-@pytest.mark.parametrize("name", ["save_fx_preset", "render_region"])
+@pytest.mark.parametrize("name", ["save_fx_preset"])
 def test_a_tool_that_always_fails_says_so_in_its_description(name):
     tool = {t.name: t for t in srv.mcp._tool_manager.list_tools()}[name]
     assert "always returns an error" in " ".join(tool.description.split())
 
 
-def test_render_region_documented_error(reaper):
-    """Fails usefully without reaching the bridge, and names no version.
+def test_render_region_renders_the_regions_start_to_its_end(render_bridge):
+    bridge = render_bridge()
+    out = run(srv.render_region(2, "C:/tmp/r.wav"))
+    assert [e for e in bridge.events if e[0] in ("GetProjectRegions", "RenderProject")] == [
+        ("GetProjectRegions", []),
+        ("RenderProject", ["C:/tmp/r.wav", 12.0, 14.5, 0, False, False, -60]),
+    ]
+    assert out["ok"] is True
+    assert out["region"] == {"index": 2, "name": "Chorus", "start": 12.0, "end": 14.5}
 
-    It used to promise the render suite "for v1.9". The roadmap said v1.9 in two places,
-    the renumbering moved the render suite to a different minor, and this test pinned the
-    promise rather than the behavior, so the stale version shipped to users on every
-    call with a green suite. A roadmap slot is not a contract; the workaround is.
-    """
-    result = run(srv.render_region(0, "C:/tmp/r.wav"))
-    assert result["ok"] is False
-    assert "not implemented" in result["error"].lower()
-    assert "get_regions" in result["error"] and "render_project" in result["error"]
-    assert not re.search(r"v?\d+\.\d+", result["error"]), (
-        f"names a version that will drift: {result['error']}"
-    )
-    assert reaper.calls == []  # never reaches the bridge
+
+def test_render_region_passes_render_projects_options(render_bridge):
+    bridge = render_bridge(settings=srv.RENDER_DELAY_START, delay=3.0)
+    run(srv.render_region(1, "C:/tmp/r.wav", tail_seconds=1.5, overwrite=True,
+                          skip_postprocessing=True, delay_seconds=0, sound_threshold_db=-50))
+    assert rendered(bridge)[-1] == ("RenderProject", ["C:/tmp/r.wav", 2.0, 6.0, 1.5, True, True, -50])
+    assert ("sleep", 3.0) not in bridge.events
+
+
+def test_render_region_keeps_render_projects_notes(render_bridge):
+    render_bridge(render={"ok": True, "ret": True, "silent": True})
+    out = run(srv.render_region(1, "C:/tmp/r.wav", delay_seconds=0))
+    assert out["region"]["name"] == "Intro"
+    assert out["note"].startswith("The rendered file is silent.")
+
+
+def test_render_region_names_a_missing_region_and_renders_nothing(render_bridge):
+    bridge = render_bridge()
+    out = run(srv.render_region(9, "C:/tmp/r.wav"))
+    assert out == {"ok": False, "error": "No region numbered 9"}
+    assert [e[0] for e in bridge.events] == ["GetProjectRegions"]
+
+
+def test_render_region_passes_on_a_failed_region_read(render_bridge):
+    bridge = render_bridge(regions={"ok": False, "error": "Bridge error: boom"})
+    assert run(srv.render_region(1, "C:/tmp/r.wav")) == {"ok": False, "error": "Bridge error: boom"}
+    assert [e[0] for e in bridge.events] == ["GetProjectRegions"]
+
+
+def test_render_region_refuses_a_bad_option_before_rendering(render_bridge):
+    bridge = render_bridge()
+    out = run(srv.render_region(1, "C:/tmp/r.wav", delay_seconds=-1))
+    assert out["ok"] is False and "delay_seconds" in out["error"]
+    assert "RenderProject" not in [e[0] for e in bridge.events]
 
 
 def test_insert_audio_file_sends_track_and_position(reaper):
