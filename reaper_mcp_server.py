@@ -11,7 +11,7 @@ Author: TwelveTake Studios LLC
 License: MIT
 """
 
-__version__ = "1.10.1"
+__version__ = "1.11.0"
 
 import os
 import asyncio
@@ -124,7 +124,7 @@ BRIDGE_DIR_PROBLEM = bridge_dir_problem(BRIDGE_DIR)
 # its Scripts folder, deployed by hand, so the halves drift. Anything older cannot answer
 # GetBridgeVersion and is reported as out of date instead of failing in obscure ways.
 def min_bridge_version(platform: str = sys.platform) -> str:
-    return "1.10.0"
+    return "1.11.0"
 
 
 MIN_BRIDGE_VERSION = min_bridge_version()
@@ -536,6 +536,7 @@ def stale_bridge_hint(running_path: Optional[str]) -> str:
 
 
 MEASURING_BRIDGE_VERSION = "1.9.5"
+SILENCE_MIN_LENGTH_S = 0.05
 
 
 def unmeasured_render_note(deployed: str, running_path: Optional[str]) -> str:
@@ -3033,6 +3034,37 @@ def _measure_args(track_index, item_index, start_time, end_time):
         -1 if start_time is None else start_time,
         -1 if end_time is None else end_time,
     ]
+
+
+@mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))
+async def find_silence(
+    track_index: int,
+    item_index: Optional[int] = None,
+    threshold_db: float = -40,
+    min_length_s: float = 0.5,
+) -> dict:
+    """
+    Find the quiet stretches in one item's audio, or in every audio item on a track: where no
+    sample peaks above threshold_db (dBFS) for at least min_length_s seconds. It reads the take's
+    source before item and take volume, fades and FX; take offset, play rate, reversed takes and
+    looped items are mapped to project time, and each edge is measured to the sample. Gaps between
+    items are not audio and are not reported. min_length_s is at least 0.05.
+
+    Returns:
+        silences: [{item_index, start, end, length, at_item_start, at_item_end, beyond_source}]
+        in project seconds (beyond_source: the item runs past its source and plays nothing there);
+        items_scanned; skipped: MIDI and empty items with a reason; scan_ms.
+    """
+    err = _validate_indices(track_index=track_index,
+                            **({} if item_index is None else {"item_index": item_index}))
+    if err:
+        return err
+    if not math.isfinite(threshold_db):
+        return {"ok": False, "error": f"threshold_db must be a number of dBFS (got {threshold_db!r})"}
+    if not math.isfinite(min_length_s) or min_length_s < SILENCE_MIN_LENGTH_S:
+        return {"ok": False, "error": f"min_length_s must be at least {SILENCE_MIN_LENGTH_S} seconds (got {min_length_s!r})"}
+    return await reaper_call("FindSilence", track_index, -1 if item_index is None else item_index,
+                             threshold_db, min_length_s, timeout=RENDER_TIMEOUT)
 
 
 @mcp.tool(annotations=ToolAnnotations(readOnlyHint=True))

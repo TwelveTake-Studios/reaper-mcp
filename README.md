@@ -2,7 +2,7 @@
 
 A [TwelveTake Studios](https://twelvetake.com) project.
 
-[![Tools](https://img.shields.io/badge/tools-187-blue)](https://github.com/TwelveTake-Studios/reaper-mcp)
+[![Tools](https://img.shields.io/badge/tools-188-blue)](https://github.com/TwelveTake-Studios/reaper-mcp)
 [![Buy Me a Coffee](https://img.shields.io/badge/Buy%20Me%20a%20Coffee-support-yellow)](https://buymeacoffee.com/twelvetake)
 [![Ko-fi](https://img.shields.io/badge/Ko--fi-support-ff5e5b)](https://ko-fi.com/twelvetake)
 
@@ -12,7 +12,7 @@ Listed in the [MCP Registry](https://registry.modelcontextprotocol.io/) as `mcp-
 
 TwelveTake REAPER MCP is a Model Context Protocol server that enables AI assistants to control REAPER for mixing, mastering, MIDI composition and music production.
 
-**Version:** 1.10.1
+**Version:** 1.11.0
 
 ## Why This Server
 
@@ -35,7 +35,7 @@ In addition to direct control of REAPER, the server includes workflow tools that
   don't install anything else in REAPER
 - Copy the script, run it, connect your AI assistant
 
-### 187 Tools Covering Real Production Needs
+### 188 Tools Covering Real Production Needs
 
 - **Full FX control** — add/remove plugins, get/set any parameter by index, manage presets, bypass
 - **FX parameter automation** — automate any plugin knob (flanger depth, filter cutoff, etc.)
@@ -600,12 +600,13 @@ what is already there. It is flagged `destructive` so a client can prompt first.
 | `clear_time_selection()` | Clear time selection |
 | `delete_selected_items()` | Delete selected items |
 
-### Measurement (2 tools)
+### Measurement (3 tools)
 
 | Tool | Description |
 |------|-------------|
 | `measure_loudness(track, item, start, end)` | Integrated, short-term max and momentary max LUFS, loudness range, sample peak, true peak |
 | `measure_spectrum(track, item, start, end)` | Octave-band levels, spectral centroid, tilt, stereo correlation, side-to-mid, balance |
+| `find_silence(track, item, threshold_db, min_length_s)` | Quiet stretches of an item, or of every audio item on a track, in project seconds with edges measured to the sample |
 
 Both measure the master mix unless you give them a track or an item. The loudness figures come
 from REAPER's own loudness measurement. True peak, the spectrum and the stereo figures come from the

@@ -4,7 +4,7 @@
 -- - All DSL (Domain Specific Language) functions for natural language control
 -- Profile selection is handled by the Python MCP server, not this bridge
 
-local BRIDGE_VERSION = "1.10.0"
+local BRIDGE_VERSION = "1.11.0"
 local BRIDGE_SOURCE = debug and debug.getinfo and debug.getinfo(1, "S").source or ""
 local BRIDGE_PATH = BRIDGE_SOURCE:sub(1, 1) == "@" and BRIDGE_SOURCE:sub(2) or ""
 local INSTANCE_SECTION = "TwelveTake_REAPER_MCP"
@@ -3139,6 +3139,203 @@ DSL_FUNCTIONS.RenameMarker = RenameMarker
 DSL_FUNCTIONS.SetTakeName = SetTakeName
 DSL_FUNCTIONS.GetPlayRate = GetPlayRate
 DSL_FUNCTIONS.SetPlayRate = SetPlayRate
+
+-- Silence finder (1.11.0)
+
+local SILENCE_WINDOW_FRACTION = 0.45
+local SILENCE_MIN_LENGTH_S = 0.05
+
+local function finite(n)
+    return type(n) == "number" and n == n and n ~= math.huge and n ~= -math.huge
+end
+
+local function round6(x)
+    return math.floor(x * 1e6 + 0.5) / 1e6
+end
+
+local function quiet_runs(quiet, lo_t, hi_t, min_len, edge)
+    local h = min_len * SILENCE_WINDOW_FRACTION
+    local n = math.floor((hi_t - lo_t) / h)
+    local flags = {}
+    for k = 0, n - 1 do
+        local q = quiet(lo_t + k * h, lo_t + (k + 1) * h)
+        if q == nil then return nil end
+        flags[k] = q
+    end
+    local runs = {}
+    local k = 0
+    while k < n do
+        if flags[k] then
+            local k0 = k
+            while k + 1 < n and flags[k + 1] do k = k + 1 end
+            local k1 = k
+            local a = lo_t
+            if k0 > 0 then
+                local lo, hi = lo_t + (k0 - 1) * h, lo_t + k0 * h
+                while hi - lo > edge do
+                    local mid = (lo + hi) / 2
+                    local q = quiet(mid, lo_t + k0 * h)
+                    if q == nil then return nil end
+                    if q then hi = mid else lo = mid end
+                end
+                a = hi
+            end
+            local lo, hi = lo_t + (k1 + 1) * h, math.min(hi_t, lo_t + (k1 + 2) * h)
+            while hi - lo > edge do
+                local mid = (lo + hi) / 2
+                local q = quiet(lo_t + (k1 + 1) * h, mid)
+                if q == nil then return nil end
+                if q then lo = mid else hi = mid end
+            end
+            local b = lo
+            if b - a >= min_len - 2 * edge or a <= lo_t + edge or b >= hi_t - edge then
+                runs[#runs + 1] = {a, b}
+            end
+        end
+        k = k + 1
+    end
+    return runs
+end
+
+local function silence_in_item(item, take, src, threshold, min_len)
+    local pos = reaper.GetMediaItemInfo_Value(item, "D_POSITION")
+    local len = reaper.GetMediaItemInfo_Value(item, "D_LENGTH")
+    local offs = reaper.GetMediaItemTakeInfo_Value(take, "D_STARTOFFS")
+    local rate = reaper.GetMediaItemTakeInfo_Value(take, "D_PLAYRATE")
+    if not finite(rate) or rate <= 0 then rate = 1 end
+    local looped = reaper.GetMediaItemInfo_Value(item, "B_LOOPSRC") == 1
+    local src_len = reaper.GetMediaSourceLength(src)
+    local hz = reaper.GetMediaSourceSampleRate(src)
+    if not finite(src_len) or src_len <= 0 then return nil end
+    local edge = (finite(hz) and hz > 0) and 1 / hz or 0.0001
+    local function measure(s, e)
+        local ok, g = pcall(reaper.CalculateNormalization, src, 2, threshold, s, e)
+        if not ok or type(g) ~= "number" or g ~= g then return nil end
+        return g >= 1
+    end
+    local min_src = min_len * rate
+    local tol = 2 * edge / rate
+    local item_end = pos + len
+    local raw = {}
+    local function add(a, b, beyond)
+        a, b = math.max(a, pos), math.min(b, item_end)
+        if b > a then raw[#raw + 1] = {a, b, beyond} end
+    end
+    if looped then
+        local function quiet(s, e)
+            if e - s >= src_len then return measure(0, src_len) end
+            local base = math.floor(s / src_len) * src_len
+            s, e = s - base, e - base
+            if e <= src_len then return measure(s, e) end
+            local first = measure(s, src_len)
+            if first ~= true then return first end
+            return measure(0, e - src_len)
+        end
+        local runs = quiet_runs(quiet, 0, src_len + min_src, min_src, edge)
+        if not runs then return nil end
+        local head
+        for _, r in ipairs(runs) do
+            if r[1] <= edge then head = r end
+        end
+        for _, r in ipairs(runs) do
+            if head and r ~= head and r[1] < src_len - edge and r[2] >= src_len + min_src - edge then
+                r[2] = src_len + head[2]
+            end
+        end
+        local reps = math.ceil(len * rate / src_len) + 1
+        for _, r in ipairs(runs) do
+            for k = -1, reps do
+                add(pos + (r[1] - offs + k * src_len) / rate, pos + (r[2] - offs + k * src_len) / rate, false)
+            end
+        end
+    else
+        local function quiet(s, e)
+            if s >= src_len or e <= 0 then return true end
+            return measure(math.max(s, 0), math.min(e, src_len))
+        end
+        local runs = quiet_runs(quiet, offs, offs + len * rate, min_src, edge)
+        if not runs then return nil end
+        for _, r in ipairs(runs) do
+            add(pos + (r[1] - offs) / rate, pos + (r[2] - offs) / rate, r[2] > src_len + edge or r[1] < -edge)
+        end
+    end
+    table.sort(raw, function(x, y) return x[1] < y[1] end)
+    local merged = {}
+    for _, r in ipairs(raw) do
+        local last = merged[#merged]
+        if last and r[1] <= last[2] + tol then
+            last[2] = math.max(last[2], r[2])
+            last[3] = last[3] or r[3]
+        else
+            merged[#merged + 1] = {r[1], r[2], r[3]}
+        end
+    end
+    local out = {}
+    for _, r in ipairs(merged) do
+        if r[2] - r[1] >= min_len - tol then
+            out[#out + 1] = {start = round6(r[1]), ["end"] = round6(r[2]), length = round6(r[2] - r[1]),
+                at_item_start = r[1] <= pos + tol, at_item_end = r[2] >= item_end - tol, beyond_source = r[3]}
+        end
+    end
+    return out
+end
+
+local function FindSilence(track_index, item_index, threshold_db, min_length_s)
+    if not finite(threshold_db) then
+        return {ok = false, error = "threshold_db must be a number of dBFS (got " .. tostring(threshold_db) .. ")"}
+    end
+    if not finite(min_length_s) or min_length_s < SILENCE_MIN_LENGTH_S then
+        return {ok = false, error = "min_length_s must be at least " .. SILENCE_MIN_LENGTH_S .. " seconds (got "
+            .. tostring(min_length_s) .. ")"}
+    end
+    local track = whole(track_index) and track_index >= 0 and reaper.GetTrack(0, track_index) or nil
+    if not track then
+        return {ok = false, error = "Track not found at index " .. tostring(track_index)}
+    end
+    local targets = {}
+    if item_index == -1 then
+        for i = 0, reaper.CountTrackMediaItems(track) - 1 do
+            targets[#targets + 1] = {index = i, item = reaper.GetTrackMediaItem(track, i)}
+        end
+    else
+        local item = whole(item_index) and item_index >= 0 and reaper.GetTrackMediaItem(track, item_index) or nil
+        if not item then
+            return {ok = false, error = "Media item not found at index " .. tostring(item_index)
+                .. " on track " .. tostring(track_index)}
+        end
+        targets[1] = {index = item_index, item = item}
+    end
+    local t0 = reaper.time_precise()
+    local silences, skipped = as_array({}), as_array({})
+    local scanned = 0
+    for _, t in ipairs(targets) do
+        local take = reaper.GetActiveTake(t.item)
+        local reason
+        if not take then
+            reason = "empty item"
+        elseif reaper.TakeIsMIDI(take) then
+            reason = "MIDI item"
+        end
+        local src = (not reason) and reaper.GetMediaItemTake_Source(take) or nil
+        if not reason and not src then reason = "take has no source" end
+        local found = (not reason) and silence_in_item(t.item, take, src, threshold_db, min_length_s) or nil
+        if not reason and not found then reason = "REAPER could not measure this source" end
+        if reason then
+            skipped[#skipped + 1] = {item_index = t.index, reason = reason}
+        else
+            scanned = scanned + 1
+            for _, s in ipairs(found) do
+                s.item_index = t.index
+                silences[#silences + 1] = s
+            end
+        end
+    end
+    return {ok = true, items_scanned = scanned, skipped = skipped, silences = silences,
+        threshold_db = threshold_db, min_length_s = min_length_s,
+        scan_ms = math.floor((reaper.time_precise() - t0) * 1000 + 0.5)}
+end
+
+DSL_FUNCTIONS.FindSilence = FindSilence
 
 -- Scan the mailbox with ONE directory enumeration per tick: collect the request
 -- slots that actually have a file on disk, plus every response file present (for

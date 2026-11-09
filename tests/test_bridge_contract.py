@@ -346,8 +346,8 @@ def test_startup_banner_names_the_bridge_version():
 
 
 @pytest.mark.parametrize("platform", ["win32", "darwin", "linux", "cygwin", "msys"])
-def test_every_platform_requires_the_bridge_with_the_1_10_0_functions(platform):
-    assert srv.min_bridge_version(platform) == "1.10.0"
+def test_every_platform_requires_the_bridge_with_the_1_11_0_functions(platform):
+    assert srv.min_bridge_version(platform) == "1.11.0"
 
 
 def test_the_stale_bridge_hint_names_this_server_version():
